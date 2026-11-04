@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import stat
@@ -481,12 +482,36 @@ def _merge_week_state(
     return current
 
 
+async def _download_schedule(
+    public_url: str,
+    path: Path,
+    logger: logging.Logger,
+    *,
+    backup_manager: BackupManager | None = None,
+    **options: Any,
+) -> Path:
+    await download_public(public_url, path, logger, **options)
+    if backup_manager is not None:
+        try:
+            await backup_manager.queue_schedule_download(path)
+        except Exception as exc:
+            logger.exception("Не удалось сохранить постоянную копию Excel")
+            await backup_manager.report_failure(
+                "schedule-copy",
+                "Не удалось сохранить постоянную копию Excel: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            await backup_manager.check_storage()
+    return path
+
+
 async def _prepare_test_notification_previews(
     credentials,
     templates: dict,
     shm_dir: Path,
     tz,
     debug_logger,
+    backup_manager: BackupManager | None = None,
 ) -> dict:
     sunday_date = _next_sunday_in_tz(tz)
     debug_dir = shm_dir / "debug"
@@ -501,12 +526,13 @@ async def _prepare_test_notification_previews(
     os.close(file_fd)
     xlsx_path = Path(file_name)
     try:
-        await download_public(
+        await _download_schedule(
             credentials.yandex_public_url,
             xlsx_path,
             debug_logger,
             attempts=1,
             interval=0,
+            backup_manager=backup_manager,
         )
         schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
         people = parse_people(xlsx_path, debug_logger)
@@ -553,6 +579,7 @@ async def _load_service_task_assignments(
     registry: ServiceRegistry | None = None,
     raw_out: dict | None = None,
     own_roster_only: bool = False,
+    backup_manager: BackupManager | None = None,
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
     """Назначения служения из графика; issues пополняется предупреждениями.
 
@@ -585,12 +612,13 @@ async def _load_service_task_assignments(
     try:
         excel_read = True
         try:
-            await download_public(
+            await _download_schedule(
                 credentials.yandex_public_url,
                 xlsx_path,
                 debug_logger,
                 attempts=1,
                 interval=0,
+                backup_manager=backup_manager,
             )
             events_by_service = parse_service_events(
                 xlsx_path, sunday_date, debug_logger, services
@@ -740,6 +768,7 @@ async def _load_upcoming_service_events(
     services=None,
     until: date | None = None,
     since: date | None = None,
+    backup_manager: BackupManager | None = None,
 ) -> list:
     """Read schedule events from today (or since, if it is earlier) through
     the given number of weeks (or through until, if it is later)."""
@@ -763,12 +792,13 @@ async def _load_upcoming_service_events(
     os.close(file_fd)
     xlsx_path = Path(file_name)
     try:
-        await download_public(
+        await _download_schedule(
             credentials.yandex_public_url,
             xlsx_path,
             debug_logger,
             attempts=1,
             interval=0,
+            backup_manager=backup_manager,
         )
         events = []
         for month in months:
@@ -937,6 +967,7 @@ async def get_group_reminder_preview(
     debug_logger,
     *,
     body: str | None = None,
+    backup_manager: BackupManager | None = None,
 ) -> dict:
     """Готовит предпросмотр; body подменяет текст напоминания (объединение)."""
     reminder = registry.get_group_reminder(reminder_id)
@@ -970,6 +1001,7 @@ async def get_group_reminder_preview(
             return_event_found=True,
             services=registry.service_catalog(),
             registry=registry,
+            backup_manager=backup_manager,
         )
     except Exception:
         debug_logger.exception(
@@ -1031,6 +1063,7 @@ async def get_template_preview(
     tz,
     registry: ServiceRegistry,
     debug_logger,
+    backup_manager: BackupManager | None = None,
 ) -> dict:
     """Предпросмотр шаблона служения на ближайшее воскресенье.
 
@@ -1057,6 +1090,7 @@ async def get_template_preview(
             services=registry.service_catalog(),
             registry=registry,
             raw_out=raw,
+            backup_manager=backup_manager,
         )
     except Exception:
         debug_logger.exception(
@@ -1163,6 +1197,7 @@ async def _process_service_reminder(
     *,
     run_date: date | None = None,
     state_cache: StateCache | None = None,
+    backup_manager: BackupManager | None = None,
 ) -> None:
     service = registry.get_service(service_id)
     if service is None or not service["enabled"]:
@@ -1214,6 +1249,7 @@ async def _process_service_reminder(
             issues=schedule_issues,
             registry=registry,
             raw_out=raw_assignments,
+            backup_manager=backup_manager,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -1457,6 +1493,7 @@ async def _process_user_reminder_schedule(
     *,
     run_date: date | None = None,
     state_cache: StateCache | None = None,
+    backup_manager: BackupManager | None = None,
 ) -> None:
     schedule = registry.get_user_reminder_schedule(schedule_id)
     if (
@@ -1493,6 +1530,7 @@ async def _process_user_reminder_schedule(
             return_event_found=True,
             services=registry.service_catalog(),
             registry=registry,
+            backup_manager=backup_manager,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -1630,6 +1668,7 @@ async def _prepare_service_test_previews(
     debug_logger,
     group_template: str | None = None,
     personal_templates: dict[str, str] | None = None,
+    backup_manager: BackupManager | None = None,
 ) -> dict:
     sunday_date = _next_sunday_in_tz(tz)
     service = registry.get_service(service_id)
@@ -1644,6 +1683,7 @@ async def _prepare_service_test_previews(
         only_date=sunday_date,
         services=registry.service_catalog(),
         registry=registry,
+        backup_manager=backup_manager,
     )
     contacts = registry.list_responsible_contacts(
         credentials.admin_tg_id, service_id
@@ -1803,15 +1843,21 @@ async def _process_upcoming_sunday(
         interaction_logger.info("Рассылка для %s уже отправлена", sunday_iso)
         return
 
-    xlsx_path = shm_dir / "reminder_bot_current.xlsx"
+    directory_fd = open_private_directory(shm_dir, create=True)
+    os.close(directory_fd)
+    file_fd, file_name = tempfile.mkstemp(
+        prefix=".reminder-delivery-", suffix=".xlsx", dir=shm_dir
+    )
+    os.close(file_fd)
+    xlsx_path = Path(file_name)
     debug_logger.info("Подготовка рассылки на %s", sunday_iso)
 
     try:
-        await download_public(
+        await _download_schedule(
             credentials.yandex_public_url,
             xlsx_path,
             debug_logger,
-            on_change=backup_manager.mark_dirty if backup_manager else None,
+            backup_manager=backup_manager,
         )
         schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
         people = parse_people(xlsx_path, debug_logger)
@@ -1837,6 +1883,8 @@ async def _process_upcoming_sunday(
             debug_logger,
         )
         raise
+    finally:
+        xlsx_path.unlink(missing_ok=True)
 
     if assignment_issues:
         await _notify_admin(
@@ -1969,6 +2017,8 @@ async def _run_locked(args: CliArgs) -> None:
     bot = None
     scheduler = None
     nightly_backup_task: asyncio.Task | None = None
+    schedule_refresh_task: asyncio.Task | None = None
+    storage_check_task: asyncio.Task | None = None
     commands_task: asyncio.Task | None = None
     pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
@@ -1995,7 +2045,8 @@ async def _run_locked(args: CliArgs) -> None:
 
         async def prepare_test_previews() -> dict:
             return await _prepare_test_notification_previews(
-                credentials, templates, shm_dir, tz, debug_logger
+                credentials, templates, shm_dir, tz, debug_logger,
+                backup_manager=backup_manager,
             )
 
         async def load_service_task_assignments(
@@ -2011,6 +2062,7 @@ async def _run_locked(args: CliArgs) -> None:
                 # Сверка из бота — только состав этого служения; плановые
                 # загрузки графика обновляют состав всех служений.
                 own_roster_only=True,
+                backup_manager=backup_manager,
             )
 
         async def prepare_service_test_previews(
@@ -2029,6 +2081,7 @@ async def _run_locked(args: CliArgs) -> None:
                 debug_logger,
                 group_template,
                 personal_templates,
+                backup_manager=backup_manager,
             )
 
         async def prepare_group_reminder_preview(
@@ -2045,6 +2098,7 @@ async def _run_locked(args: CliArgs) -> None:
                 service_registry,
                 debug_logger,
                 body=body,
+                backup_manager=backup_manager,
             )
 
         context.prepare_test_previews = prepare_test_previews
@@ -2119,6 +2173,7 @@ async def _run_locked(args: CliArgs) -> None:
                     ),
                     until=max(end_of_next_month, limit),
                     since=min(month_start, start),
+                    backup_manager=backup_manager,
                 )
                 upcoming_cache.update(
                     loaded_at=time.monotonic(), events=events,
@@ -2145,6 +2200,7 @@ async def _run_locked(args: CliArgs) -> None:
                 tz,
                 service_registry,
                 debug_logger,
+                backup_manager=backup_manager,
             )
 
         context.get_template_preview = prepare_template_preview
@@ -2152,36 +2208,19 @@ async def _run_locked(args: CliArgs) -> None:
 
         if backup_manager is not None:
             async def notify_backup_failure(message: str) -> None:
-                await _notify_admin(
+                delivered = await _notify_admin(
                     bot, credentials.admin_tg_id, message, debug_logger
                 )
+                if not delivered:
+                    raise RuntimeError("Уведомление о бэкапе не доставлено администратору")
 
             backup_manager.set_failure_callback(notify_backup_failure)
 
-            async def create_startup_backup() -> None:
-                try:
-                    current_schedule = shm_dir / "reminder_bot_current.xlsx"
-                    if not current_schedule.is_file():
-                        await download_public(
-                            credentials.yandex_public_url,
-                            current_schedule,
-                            debug_logger,
-                            attempts=1,
-                            interval=0,
-                            on_change=backup_manager.mark_dirty,
-                        )
-                    await backup_manager.create_snapshot("запуск экземпляра")
-                except Exception as exc:
-                    debug_logger.exception(
-                        "Не удалось создать резервную копию при запуске"
-                    )
-                    await notify_backup_failure(
-                        "Не удалось создать резервную копию при запуске: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-        else:
-            create_startup_backup = None
+            async def download_backup_schedule(path: Path) -> None:
+                await download_public(
+                    credentials.yandex_public_url, path, debug_logger,
+                    attempts=1, interval=0,
+                )
 
         async def scheduled_job() -> None:
             task = asyncio.current_task()
@@ -2193,12 +2232,12 @@ async def _run_locked(args: CliArgs) -> None:
                     credentials=credentials,
                     templates=templates,
                     state_cache=state_cache,
+                    backup_manager=backup_manager,
                     shm_dir=shm_dir,
                     interaction_logger=interaction_logger,
                     debug_logger=debug_logger,
                     tz=tz,
                     service_registry=service_registry,
-                    backup_manager=backup_manager,
                 )
             finally:
                 if task is not None:
@@ -2249,6 +2288,7 @@ async def _run_locked(args: CliArgs) -> None:
                             debug_logger,
                             run_date=run_date,
                             state_cache=state_cache,
+                            backup_manager=backup_manager,
                         )
                 except Exception:
                     debug_logger.exception(
@@ -2320,6 +2360,7 @@ async def _run_locked(args: CliArgs) -> None:
                             debug_logger,
                             run_date=run_date,
                             state_cache=state_cache,
+                            backup_manager=backup_manager,
                         )
                 except Exception:
                     debug_logger.exception(
@@ -2571,11 +2612,14 @@ async def _run_locked(args: CliArgs) -> None:
             )
         scheduler.start()
         if backup_manager is not None:
-            if create_startup_backup is not None:
-                backup_manager.start_task(
-                    create_startup_backup(),
-                    name="reminder-bot-startup-backup",
-                )
+            schedule_refresh_task = asyncio.create_task(
+                backup_manager.run_schedule_refresh(download_backup_schedule),
+                name="reminder-bot-schedule-refresh",
+            )
+            storage_check_task = asyncio.create_task(
+                backup_manager.run_storage_checks(),
+                name="reminder-bot-storage-check",
+            )
             nightly_backup_task = asyncio.create_task(
                 backup_manager.run_nightly(),
                 name="reminder-bot-nightly-backup",
@@ -2586,7 +2630,9 @@ async def _run_locked(args: CliArgs) -> None:
         await _configure_webapp_menu(bot, PROJECT_DIR, debug_logger)
         await dp.start_polling(bot, close_bot_session=False)
     finally:
-        for background_task in (nightly_backup_task, commands_task):
+        for background_task in (
+            nightly_backup_task, schedule_refresh_task, storage_check_task, commands_task
+        ):
             if background_task is not None:
                 background_task.cancel()
                 await asyncio.gather(background_task, return_exceptions=True)
