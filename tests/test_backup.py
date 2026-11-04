@@ -204,6 +204,54 @@ class BackupManagerTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_daily_refresh_cannot_be_overwritten_by_older_pending_download(self):
+        async def scenario():
+            older = self.shm_dir / "older.xlsx"
+            newer = self.shm_dir / "newer.xlsx"
+            for path, comment in ((older, b"older"), (newer, b"newer")):
+                shutil.copyfile(self.xlsx, path)
+                with zipfile.ZipFile(path, "a") as workbook:
+                    workbook.comment = comment
+            await self.manager._backup_lock.acquire()
+            try:
+                await self.manager.queue_schedule_download(self.xlsx)
+                await asyncio.sleep(0)
+                await self.manager.queue_schedule_download(older)
+                refresh = asyncio.create_task(self.manager.record_schedule_download(newer))
+                await asyncio.sleep(0)
+            finally:
+                self.manager._backup_lock.release()
+            await refresh
+            await self.manager.close()
+            self.assertEqual(self.manager.saved_schedule.read_bytes(), newer.read_bytes())
+            self.assertEqual(self.xlsx.read_bytes(), newer.read_bytes())
+            self.assertFalse(list(self.shm_dir.glob(".schedule-queued-*")))
+
+        asyncio.run(scenario())
+
+    def test_invalid_download_keeps_last_valid_pending_copy(self):
+        async def scenario():
+            valid = self.shm_dir / "valid.xlsx"
+            shutil.copyfile(self.xlsx, valid)
+            with zipfile.ZipFile(valid, "a") as workbook:
+                workbook.comment = b"valid pending"
+            bad = self.shm_dir / "invalid.xlsx"
+            bad.write_bytes(b"not Excel")
+            await self.manager._backup_lock.acquire()
+            try:
+                await self.manager.queue_schedule_download(self.xlsx)
+                await asyncio.sleep(0)
+                await self.manager.queue_schedule_download(valid)
+                with self.assertRaises(zipfile.BadZipFile):
+                    await self.manager.queue_schedule_download(bad)
+            finally:
+                self.manager._backup_lock.release()
+            await self.manager.close()
+            self.assertEqual(self.manager.saved_schedule.read_bytes(), valid.read_bytes())
+            self.assertFalse(list(self.shm_dir.glob(".schedule-queued-*")))
+
+        asyncio.run(scenario())
+
     def test_download_cleans_up_space_before_publishing_copy(self):
         events = []
         original = self.manager._replace_schedule
