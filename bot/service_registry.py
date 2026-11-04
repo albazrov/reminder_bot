@@ -2203,20 +2203,22 @@ class ServiceRegistry:
         body: str | None = None,
         *,
         allow_duplicate: bool = False,
+        task: str | None = None,
     ) -> int:
         _validate_positive_id(actor_id, "actor_id")
-        self._validate_group_reminder_values(days, time, body)
+        self._validate_group_reminder_values(days, time, body, task)
         with self._connection() as connection:
             self._require_service(connection, service_id)
             self._require_service_editor(connection, actor_id, service_id)
+            self._require_reminder_task(connection, service_id, task)
             self._ensure_group_schedule_unique(
-                connection, service_id, days, time, allow_duplicate
+                connection, service_id, days, time, allow_duplicate, task=task
             )
             cursor = connection.execute(
                 "INSERT INTO group_reminders "
-                "(service_id, body, reminder_days, reminder_time) "
-                "VALUES (?, ?, ?, ?)",
-                (service_id, body.strip() if body else None, days, time),
+                "(service_id, body, reminder_days, reminder_time, task) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (service_id, body.strip() if body else None, days, time, task),
             )
             reminder_id = cursor.lastrowid
             self._audit(
@@ -2229,6 +2231,7 @@ class ServiceRegistry:
                     "reminder_days": days,
                     "reminder_time": time,
                     "has_custom_body": body is not None,
+                    "task": task,
                 },
             )
         return reminder_id
@@ -3211,6 +3214,17 @@ class ServiceRegistry:
             )
         return ids
 
+    @staticmethod
+    def _require_reminder_task(
+        connection: sqlite3.Connection, service_id: str, task: str | None,
+    ) -> None:
+        if task is not None and connection.execute(
+            "SELECT 1 FROM service_tasks "
+            "WHERE service_id = ? AND name = ? AND enabled = 1",
+            (service_id, task),
+        ).fetchone() is None:
+            raise ValueError(f"Задача «{task}» не из списка служения.")
+
     def set_group_reminder_task(
         self, actor_id: int, reminder_id: int, task: str | None
     ) -> None:
@@ -3226,17 +3240,7 @@ class ServiceRegistry:
             if row is None:
                 raise ValueError("Групповое напоминание больше не существует.")
             self._require_service_editor(connection, actor_id, row["service_id"])
-            if task is not None:
-                enabled_tasks = {
-                    item["name"]
-                    for item in connection.execute(
-                        "SELECT name FROM service_tasks "
-                        "WHERE service_id = ? AND enabled = 1",
-                        (row["service_id"],),
-                    )
-                }
-                if task not in enabled_tasks:
-                    raise ValueError(f"Задача «{task}» не из списка служения.")
+            self._require_reminder_task(connection, row["service_id"], task)
             if task is None:
                 body = connection.execute(
                     "SELECT body FROM group_reminders WHERE id = ?",

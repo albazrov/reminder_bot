@@ -16,6 +16,34 @@ class ServiceRegistryTest(unittest.TestCase):
         self.registry = ServiceRegistry(self.path)
         self.registry.initialize(1001, -10001)
 
+    def test_add_group_reminder_with_task_is_atomic_and_task_unique(self):
+        baseline = self.registry.list_group_reminders("sound")
+        for task in ("спевка", "несуществующая"):
+            with self.subTest(task=task), self.assertRaises(ValueError):
+                self.registry.add_group_reminder(
+                    1001, "sound", 1, "18:00", task=task
+                )
+        self.assertEqual(self.registry.list_group_reminders("sound"), baseline)
+        first = self.registry.add_group_reminder(
+            1001, "sound", 1, "18:00", "{task_responsibles}", task="звук"
+        )
+        self.assertEqual(self.registry.get_group_reminder(first)["task"], "звук")
+        with self.assertRaises(ValueError):
+            self.registry.add_group_reminder(
+                1001, "sound", 1, "18:00", task="звук"
+            )
+        second = self.registry.add_group_reminder(
+            1001, "sound", 1, "18:00", task="сборка"
+        )
+        self.assertEqual(self.registry.get_group_reminder(second)["task"], "сборка")
+        with self.assertRaises(PermissionError):
+            self.registry.add_group_reminder(
+                9999, "sound", 2, "18:00", task="звук"
+            )
+        self.assertEqual(
+            len(self.registry.list_group_reminders("sound")), len(baseline) + 2
+        )
+
     def test_change_callback_runs_only_for_committed_writes(self):
         changes = []
         registry = ServiceRegistry(
