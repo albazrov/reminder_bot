@@ -548,7 +548,9 @@ Raspberry Pi specifics:
 - Monthly limit (step 4a): `PlanInput.limits` {key: (min, max|None)} from
   `summarize` (personal `service_members.month_min/max` via
   `readiness_people` `month_limit`, else `readiness_settings.month_min/
-  max`). Max is hard in both passes and in `improve_plan` replace; min is
+  max`). Max is soft (`ABOVE_MAX_WEIGHT`): required seats may exceed it when
+  nobody else can fill them, optional seats never do; `improve_plan` replace
+  costs it through `_person_cost`; min is
   `BELOW_MIN_WEIGHT` per missing service in `_person_cost` (cheaper in
   pass-1 costs). After pass 1 `repair_gaps` augments the plan as a max
   flow (source → person [max] → (person, date) [1] → seat [needed] →

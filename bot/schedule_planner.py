@@ -485,6 +485,7 @@ def build_plan(data: PlanInput) -> Plan:
     _spread_soft_limits(plan, data)
     _prefer_bundles(plan, data)
     _spread_soft_limits(plan, data)
+    improve_plan(plan, data)
     return plan
 
 
@@ -1200,88 +1201,185 @@ def repair_gaps(plan: Plan, data: PlanInput) -> None:
 def improve_plan(plan: Plan, data: PlanInput) -> None:
     """Локальные улучшения: покрытие не меняется, стоимость падает.
 
-    Ходы — замена человека в месте на свободного и обмен двух людей
-    местами в разные даты (обмен в одну дату стоимость не меняет).
-    Ход затрагивает не больше двух людей, поэтому оценивается
-    пересчётом только их вклада; план меняется лишь лучшим ходом.
+    Ходы — замена человека и обмен назначениями двух людей. Собранные
+    связки переносятся целиком; занятость и нагрузка — по фактическим
+    дням. Превышение мягких лимитов не растёт. Ход оценивается по вкладу
+    затронутых людей; план меняется лишь лучшим ходом.
     """
-    served: dict[str, set[date]] = {}
-    for (event_date, _), people in plan.slots.items():
+    served: dict[str, set[tuple[date, str]]] = {}
+    for key, people in plan.slots.items():
         for person in people:
-            served.setdefault(person, set()).add(event_date)
+            served.setdefault(person, set()).add(key)
     people_all = sorted(data.free)
+    eligible = {
+        key: {
+            person for person in people_all
+            if _can_serve(data, person, key[0], key[1])
+        }
+        for key in plan.slots
+    }
+    costs = {}
 
-    def cost_of(person: str, dates: set[date]) -> int:
-        return _person_cost(data, person, dates)
+    def actual_day(person, key):
+        return plan.slot_dates.get((key[0], key[1], person), key[0])
+
+    def cost_of(person, positions):
+        cache_key = (person, frozenset(positions))
+        if cache_key not in costs:
+            costs[cache_key] = _person_cost(
+                data, person,
+                {actual_day(person, key) for key in positions},
+                {key[0] for key in positions},
+            )
+        return costs[cache_key]
+
+    def excess_of(person, positions):
+        high = _limit(data, person)[1]
+        if high is None:
+            return 0
+        return max(0, len({actual_day(person, key) for key in positions}) - high)
+
+    def can_take(person, key, positions):
+        if person not in eligible[key]:
+            return False
+        days = {actual_day(person, other) for other in positions}
+        return actual_day(person, key) not in days
+
+    def can_take_group(person, keys, positions):
+        if len(keys) > 1 and not {key[1] for key in keys}.issubset(
+            data.bundles.get(person, ())
+        ):
+            return False
+        taken = set(positions)
+        for key in sorted(keys):
+            if not can_take(person, key, taken):
+                return False
+            taken.add(key)
+        return True
+
+    extra_slots = {
+        key: len(assigned) - plan.needed[key[1]]
+        for key, assigned in plan.slots.items()
+        if len(assigned) > plan.needed[key[1]]
+    }
+
+    def extras_valid(changes):
+        if not extra_slots:
+            return True
+        updated = {}
+        for keys, leaver, candidate in changes:
+            updated.setdefault(leaver, set(served.get(leaver, ())))
+            updated.setdefault(candidate, set(served.get(candidate, ())))
+            updated[leaver].difference_update(keys)
+            updated[candidate].update(keys)
+        for key, required_extras in extra_slots.items():
+            assigned = set(plan.slots[key])
+            for keys, leaver, candidate in changes:
+                if key in keys:
+                    assigned.remove(leaver)
+                    assigned.add(candidate)
+            qualified = 0
+            for person in assigned:
+                positions = updated.get(person, served.get(person, set()))
+                high = _limit(data, person)[1]
+                if (
+                    person not in data.reluctant
+                    and (high is None or len({
+                        actual_day(person, other) for other in positions
+                    }) <= high)
+                    and not any(
+                        other != key and abs((other[0] - key[0]).days) <= 7
+                        for other in positions
+                    )
+                    and _gap_penalty(data.last_served.get(person), key[0])
+                    < BACK_TO_BACK_WEIGHT
+                ):
+                    qualified += 1
+            if qualified < required_extras:
+                return False
+        return True
 
     for _ in range(MAX_IMPROVE_ROUNDS):
-        positions = [
-            (key, index, person)
-            for key in sorted(plan.slots)
-            for index, person in enumerate(plan.slots[key])
-        ]
-        busy: dict[date, set[str]] = {}
-        for (event_date, _), _, person in positions:
-            busy.setdefault(event_date, set()).add(person)
+        positions = []
+        seen = set()
+        for key in sorted(plan.slots):
+            for person in plan.slots[key]:
+                bundle = data.bundles.get(person, ())
+                keys = frozenset(
+                    other for other in served[person]
+                    if other[0] == key[0] and other[1] in bundle
+                ) if key[1] in bundle else frozenset({key})
+                if (person, keys) not in seen:
+                    seen.add((person, keys))
+                    positions.append((keys, person))
         best_delta = 0
         best_move = None
-        for key, index, person in positions:
-            event_date, task = key
+        for keys, person in positions:
             mine = served[person]
             before_mine = cost_of(person, mine)
-            after_mine = cost_of(person, mine - {event_date})
+            after_mine = cost_of(person, mine - keys)
             for other in people_all:
                 theirs = served.get(other, set())
-                if other in busy[event_date] or not _can_serve(
-                    data, other, event_date, task
-                ) or (
-                    other in data.reluctant and index >= plan.needed[task]
+                if (
+                    other == person
+                    or (person not in data.reluctant and other in data.reluctant)
+                    or not can_take_group(other, keys, theirs)
+                    or excess_of(person, mine - keys) + excess_of(other, theirs | keys)
+                    > excess_of(person, mine) + excess_of(other, theirs)
                 ):
                     continue
                 delta = (
                     after_mine - before_mine
-                    + cost_of(other, theirs | {event_date})
-                    - cost_of(other, theirs)
+                    + cost_of(other, theirs | keys) - cost_of(other, theirs)
                 )
-                if delta < best_delta:
-                    best_delta, best_move = delta, ("replace", key, index, other)
-        for first in range(len(positions)):
-            key_a, index_a, a = positions[first]
-            for second in range(first + 1, len(positions)):
-                key_b, index_b, b = positions[second]
-                date_a, date_b = key_a[0], key_b[0]
-                if date_a == date_b or a == b:
+                if delta < best_delta and extras_valid([(keys, person, other)]):
+                    best_delta = delta
+                    best_move = [(keys, person, other)]
+        for first, (keys_first, person_first) in enumerate(positions):
+            for keys_second, person_second in positions[first + 1:]:
+                if person_first == person_second or keys_first & keys_second:
                     continue
+                first_positions = served[person_first]
+                second_positions = served[person_second]
                 if (
-                    b in busy[date_a] or a in busy[date_b]
-                    or not _can_serve(data, b, date_a, key_a[1])
-                    or not _can_serve(data, a, date_b, key_b[1])
-                    or (b in data.reluctant
-                        and index_a >= plan.needed[key_a[1]])
-                    or (a in data.reluctant
-                        and index_b >= plan.needed[key_b[1]])
+                    not can_take_group(
+                        person_second, keys_first,
+                        second_positions - keys_second,
+                    )
+                    or not can_take_group(
+                        person_first, keys_second,
+                        first_positions - keys_first,
+                    )
+                    or (
+                        excess_of(person_first, (first_positions - keys_first) | keys_second)
+                        + excess_of(person_second, (second_positions - keys_second) | keys_first)
+                        > excess_of(person_first, first_positions)
+                        + excess_of(person_second, second_positions)
+                    )
                 ):
                     continue
-                dates_a, dates_b = served[a], served[b]
                 delta = (
-                    cost_of(a, (dates_a - {date_a}) | {date_b})
-                    + cost_of(b, (dates_b - {date_b}) | {date_a})
-                    - cost_of(a, dates_a) - cost_of(b, dates_b)
+                    cost_of(person_first, (first_positions - keys_first) | keys_second)
+                    + cost_of(person_second, (second_positions - keys_second) | keys_first)
+                    - cost_of(person_first, first_positions)
+                    - cost_of(person_second, second_positions)
                 )
-                if delta < best_delta:
+                if delta < best_delta and extras_valid([
+                    (keys_first, person_first, person_second),
+                    (keys_second, person_second, person_first),
+                ]):
                     best_delta = delta
-                    best_move = ("swap", key_a, index_a, key_b, index_b)
+                    best_move = [
+                        (keys_first, person_first, person_second),
+                        (keys_second, person_second, person_first),
+                    ]
         if best_move is None:
-            return
-        if best_move[0] == "replace":
-            _, key, index, other = best_move
-            person = plan.slots[key][index]
-            plan.slots[key][index] = other
-            served[person].discard(key[0])
-            served.setdefault(other, set()).add(key[0])
-        else:
-            _, key_a, index_a, key_b, index_b = best_move
-            a, b = plan.slots[key_a][index_a], plan.slots[key_b][index_b]
-            plan.slots[key_a][index_a], plan.slots[key_b][index_b] = b, a
-            served[a] = (served[a] - {key_a[0]}) | {key_b[0]}
-            served[b] = (served[b] - {key_b[0]}) | {key_a[0]}
+            break
+        for keys, leaver, candidate in best_move:
+            for key in keys:
+                assigned = plan.slots[key]
+                assigned[assigned.index(leaver)] = candidate
+            served[leaver].difference_update(keys)
+            served.setdefault(candidate, set()).update(keys)
+    for assigned in plan.slots.values():
+        assigned.sort()

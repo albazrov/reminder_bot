@@ -686,6 +686,10 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertEqual(loaded["slots"]["2026-11-08"]["сборка"], ["Дмитрий"])
         self.assertEqual(loaded["slots"]["2026-11-15"]["сборка"], ["Незнакомец"])
         self.assertEqual(loaded["days"], {
+            "2026-11-08": {
+                schedule_plan.task_day_key("Алексей", "звук"): 0,
+                schedule_plan.task_day_key("Дмитрий", "сборка"): -4,
+            },
             "2026-11-15": {schedule_plan.task_day_key("Незнакомец", "сборка"): 0}
         })
         self.assertIn("Незнакомец", loaded["unbound"])
@@ -703,16 +707,14 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertEqual(back[date(2026, 11, 4)], [("сборка", "Дмитрий")])
         self.assertEqual(back[date(2026, 11, 8)], [("звук", "Алексей")])
         self.assertEqual(back[date(2026, 11, 15)], [("сборка", "Незнакомец")])
-        # День задачи в настройках переносит и утверждённый график (он
-        # публикуется заново) — напоминания как в публикации.
         self.registry.set_service_task_day(1001, "sound", "сборка", None)
         plan = self.registry.get_schedule_plan("sound", "2026-11")
         back = {
             item.event_date: sorted((a.task, a.name) for a in item.assignments)
             for item in schedule_plan.plan_events(plan, self.people())
         }
-        self.assertNotIn(date(2026, 11, 4), back)
-        self.assertIn(("сборка", "Дмитрий"), back[date(2026, 11, 8)])
+        self.assertEqual(back[date(2026, 11, 4)], [("сборка", "Дмитрий")])
+        self.assertEqual(back[date(2026, 11, 8)], [("звук", "Алексей")])
         self.registry.set_service_task_day(1001, "sound", "сборка", -4)
         # Разные дни у людей одной задачи — у каждого свой, как в файле.
         mixed = schedule_plan.excel_plan(self.registry, "sound", 2026, 11, [
@@ -723,7 +725,10 @@ class SchedulePlanTest(unittest.TestCase):
             mixed["slots"]["2026-11-22"]["сборка"], ["Дмитрий", "Алексей"]
         )
         self.assertEqual(mixed["days"], {
-            "2026-11-22": {schedule_plan.task_day_key("Алексей", "сборка"): 0}
+            "2026-11-22": {
+                schedule_plan.task_day_key("Алексей", "сборка"): 0,
+                schedule_plan.task_day_key("Дмитрий", "сборка"): -4,
+            }
         })
         # Новый опрос пересчитывает рабочую копию, итоговым остаётся Excel,
         # пока не утвердят.
@@ -753,11 +758,13 @@ class SchedulePlanTest(unittest.TestCase):
         edited = self.registry.set_schedule_slots(
             1001, "sound", "2026-11", imported["slots"],
         )
-        self.assertEqual(edited["days"]["2026-11-22"], {key: 0})
+        self.assertEqual(edited["days"]["2026-11-22"], both["days"]["2026-11-22"])
         slots = imported["slots"]
         slots["2026-11-22"]["сборка"] = []
         edited = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
-        self.assertNotIn("2026-11-22", edited["days"])
+        self.assertEqual(edited["days"]["2026-11-22"], {
+            schedule_plan.task_day_key("Алексей", "звук"): -4,
+        })
         slots["2026-11-22"]["сборка"] = ["Алексей"]
         self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
         with closing(sqlite3.connect(self.registry.path)) as connection, \
@@ -1204,13 +1211,83 @@ class SchedulePlanTest(unittest.TestCase):
             1001, "sound", "Алексей", -3
         )
         approved = self.registry.get_schedule_plan("sound", "2026-11")
-        events = schedule_plan.plan_events(approved, people)
+        events = schedule_plan.plan_events(approved, self.people())
         assignments = [
             (event.event_date, assignment.name)
             for event in events for assignment in event.assignments
         ]
         self.assertIn((date(2026, 11, 1), "Алексей"), assignments)
         self.assertNotIn((date(2026, 10, 29), "Алексей"), assignments)
+
+    def test_working_copy_excel_exports_use_edited_day_after_approval(self):
+        day = "2026-11-08"
+        plan = self.draft()
+        slots = {
+            moment: {task["name"]: [] for task in plan["tasks"]}
+            for moment in plan["dates"]
+        }
+        slots[day]["звук"] = ["Алексей"]
+        plan = self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", slots
+        )
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", plan["slots"],
+            chat_id=None, message_id=None, days=plan["days"],
+            served_offsets=schedule_plan.served_offsets(plan, people),
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+        )
+        working = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", day, "Алексей", -2
+        )
+
+        self.assertTrue(working["dirty"])
+        self.assertEqual(
+            working["approved_slot_days"][day]["звук"]["Алексей"], 0
+        )
+        self.assertEqual(
+            [
+                (item.event_date, assignment.name)
+                for item in schedule_plan.plan_events(working, people)
+                for assignment in item.assignments
+            ],
+            [(date(2026, 11, 8), "Алексей")],
+        )
+        with self.subTest(output="text"):
+            text = schedule_plan.excel_text(
+                self.registry, self.service(), working, people
+            )
+            self.assertIn("Алексей (пт 06.11)", text)
+        with self.subTest(output="xlsx"):
+            workbook = load_workbook(BytesIO(schedule_plan.excel_file(
+                self.registry, self.service(), working, people
+            )))
+            self.addCleanup(workbook.close)
+            current_day = None
+            assignments = []
+            for row in workbook.active.iter_rows(values_only=True):
+                if isinstance(row[0], datetime):
+                    current_day = row[0].date()
+                elif isinstance(row[0], date):
+                    current_day = row[0]
+                elif row[1] == "Алексей":
+                    assignments.append((current_day, row[1]))
+            self.assertEqual(assignments, [(date(2026, 11, 6), "Алексей")])
+
+        approved = self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", working["slots"],
+            chat_id=None, message_id=None, days=working["days"],
+            served_offsets=schedule_plan.served_offsets(working, people),
+            approved_slot_days=schedule_plan.approved_slot_days(working, people),
+        )
+        self.assertEqual(
+            [
+                (item.event_date, assignment.name)
+                for item in schedule_plan.plan_events(approved, people)
+                for assignment in item.assignments
+            ],
+            [(date(2026, 11, 6), "Алексей")],
+        )
 
     def test_excel_import_replaces_approved_reminder_date_snapshot(self):
         self.registry.set_service_task_day(
@@ -1253,6 +1330,36 @@ class SchedulePlanTest(unittest.TestCase):
         ]
         self.assertEqual(assignments, [(date(2026, 11, 8), "Дмитрий")])
 
+    def test_excel_import_keeps_unknown_person_date_in_snapshots(self):
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        loaded = schedule_plan.excel_plan(
+            self.registry, "sound", 2026, 11,
+            [event(date(2026, 11, 8), ("сборка", "Незнакомец"))],
+        )
+        people = self.people()
+        approved_days = schedule_plan.approved_slot_days(loaded, people)
+        offsets = schedule_plan.served_offsets(loaded, people)
+
+        self.assertEqual(approved_days["2026-11-08"]["сборка"]["Незнакомец"], 0)
+        self.assertEqual(offsets.get("2026-11-08", {}).get("Незнакомец", 0), 0)
+        self.assertEqual(
+            schedule_plan.served_days(loaded, people)["Незнакомец"],
+            {date(2026, 11, 8)},
+        )
+        plan = self.registry.import_excel_plan(
+            1001, "sound", "2026-11", dates=loaded["dates"],
+            tasks=loaded["tasks"], slots=loaded["slots"], days=loaded["days"],
+            served_offsets=offsets, approved_slot_days=approved_days,
+        )
+        self.assertEqual(
+            [
+                (item.event_date, assignment.name)
+                for item in schedule_plan.plan_events(plan, people)
+                for assignment in item.assignments
+            ],
+            [(date(2026, 11, 8), "Незнакомец")],
+        )
+
     def test_task_day_shows_plan_by_weeks(self):
         plan = self.draft()
         plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": ["Борис"]}
@@ -1283,12 +1390,13 @@ class SchedulePlanTest(unittest.TestCase):
         )
         plan = self.registry.get_schedule_plan("sound", "2026-11")
         assembly_person = plan["slots"]["2026-11-01"]["сборка"][0]
+        sound_person = plan["slots"]["2026-11-01"]["звук"][0]
         summary = readiness.summarize(self.registry, self.run, with_plan=False)
         text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
         self.assertIn(
             "🗓 Неделя 26.10–01.11\n   ср 28.10\n     🧰 сборка\n"
             f"        • {assembly_person}\n   вс 01.11\n     🎚️ звук\n"
-            "        • Алексей",
+            f"        • {sound_person}",
             text,
         )
         published = schedule_plan.publication_text(
@@ -1314,7 +1422,7 @@ class SchedulePlanTest(unittest.TestCase):
         )
         # Блок «Для Excel» — с фактическим днём задачи.
         self.assertIn(
-            f"01.11: звук — Алексей; сборка (ср 28.10) — {assembly_person}",
+            f"01.11: звук — {sound_person}; сборка (ср 28.10) — {assembly_person}",
             schedule_plan.excel_text(
                 self.registry, self.service(), plan, self.people()
             ),
@@ -1325,9 +1433,12 @@ class SchedulePlanTest(unittest.TestCase):
             ),
             -4,
         )
-        self.assertTrue(
-            {date(2026, 10, 28), date(2026, 11, 1)} <=
-            schedule_plan.served_days(plan, self.people())[assembly_person]
+        served = schedule_plan.served_days(plan, self.people())
+        self.assertIn(
+            date(2026, 10, 28), served[assembly_person]
+        )
+        self.assertIn(
+            date(2026, 11, 1), served[sound_person]
         )
         # Разовый день человека главнее дня задачи — в скобках.
         plan = self.registry.set_schedule_day(

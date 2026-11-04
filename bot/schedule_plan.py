@@ -388,7 +388,9 @@ def served_offsets(plan: dict, people: list[dict]) -> dict:
     for day, tasks in plan["slots"].items():
         for task, keys in tasks.items():
             for key in keys:
-                offset = slot_offset(plan, by_key.get(key), day, task) or 0
+                offset = slot_offset(
+                    plan, by_key.get(key) or {"key": key}, day, task
+                ) or 0
                 latest[day, key] = max(offset, latest.get((day, key), offset))
     result: dict = {}
     for (day, key), offset in latest.items():
@@ -403,7 +405,9 @@ def approved_slot_days(plan: dict, people: list[dict]) -> dict:
     return {
         day: {
             task: {
-                key: slot_offset(plan, by_key.get(key), day, task) or 0
+                key: slot_offset(
+                    plan, by_key.get(key) or {"key": key}, day, task
+                ) or 0
                 for key in keys
             }
             for task, keys in tasks.items()
@@ -420,7 +424,9 @@ def served_days(plan: dict, people: list[dict]) -> dict[str, set[date]]:
         sunday = date.fromisoformat(day)
         for task, keys in tasks.items():
             for key in keys:
-                offset = slot_offset(plan, by_key.get(key), day, task) or 0
+                offset = slot_offset(
+                    plan, by_key.get(key) or {"key": key}, day, task
+                ) or 0
                 result.setdefault(key, set()).add(
                     sunday + timedelta(days=offset)
                 )
@@ -1014,15 +1020,14 @@ def _columns(registry, service_id: str) -> list[ScheduleColumn]:
 
 
 def task_moments(plan: dict, by_key: dict, day: str,
-                 task: str) -> list[tuple[date, str]]:
-    """Люди задачи на дату и фактический день каждого для Excel: у задачи
-    со своим или сохранённым днём — фактический день задачи, иначе
-    воскресенье графика."""
+                 task: str, *, approved: bool = False) -> list[tuple[date, str]]:
+    """Фактические дни назначений рабочей копии; approved=True читает
+    сохранённые дни утверждённого графика вместо текущих настроек."""
     sunday = date.fromisoformat(day)
     approved_offset = (
         plan.get("approved_slot_days", {})
         .get(day, {}).get(task, {})
-    )
+    ) if approved else {}
     return [
         (
             sunday + timedelta(
@@ -1043,8 +1048,8 @@ def excel_plan(registry, service_id: str, year: int, month: int,
     """График месяца из событий Excel (решение 15): воскресенья месяца,
     задачи графика, люди — ключами состава (по имени; неизвестные и
     неоднозначные — именем как в файле). Задача со своим днём (среда
-    перед воскресеньем) — в его воскресенье; другой день человека —
-    разовым днём. → dates, tasks, slots, days, unbound (не привязаны),
+    перед воскресеньем) — в его воскресенье; фактический день каждого
+    назначения сохранён разовым днём. → dates, tasks, slots, days, unbound (не привязаны),
     skipped (даты не воскресенья месяца: «ср 11.11 спевка» — у задачи нет
     своего дня)."""
     people = registry.readiness_people(service_id)
@@ -1091,14 +1096,9 @@ def excel_plan(registry, service_id: str, year: int, month: int,
             if not (by_key.get(key) or {}).get("telegram_id"):
                 if assignment.name not in unbound:
                     unbound.append(assignment.name)
-            if assignment.task in own_days:
-                # Задача со своим днём не в свой день (в воскресенье) —
-                # разовый день человека в этой задаче.
-                offset = (moment - block["date"]).days
-                if offset != own_days[assignment.task]:
-                    days.setdefault(day, {})[
-                        task_day_key(key, assignment.task)
-                    ] = offset
+            days.setdefault(day, {})[
+                task_day_key(key, assignment.task)
+            ] = (moment - block["date"]).days
     return {
         "dates": dates, "tasks": tasks, "slots": slots, "days": days,
         "unbound": unbound, "skipped": list(dict.fromkeys(skipped)),
@@ -1136,7 +1136,9 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
     for day in sorted(plan["approved"]):
         events.setdefault(date.fromisoformat(day), [])
         for task in tasks:
-            for moment, key in task_moments(published, by_key, day, task["name"]):
+            for moment, key in task_moments(
+                published, by_key, day, task["name"], approved=True
+            ):
                 events.setdefault(moment, []).append(
                     ServiceAssignment(task["name"], names.get(key, key))
                 )
