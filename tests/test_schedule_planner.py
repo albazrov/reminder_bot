@@ -3,7 +3,8 @@ import unittest
 from datetime import date, timedelta
 
 from bot.schedule_planner import (
-    Plan, PlanInput, build_plan, improve_plan, open_dates, plan_cost,
+    Plan, PlanInput, _prefer_bundles, _spread_soft_limits,
+    build_plan, improve_plan, open_dates, plan_cost,
 )
 
 SUNDAYS = tuple(date(2026, 11, 1) + timedelta(weeks=week) for week in range(5))
@@ -45,6 +46,133 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.covered(), 1)
         self.assertEqual(len(plan.gaps()), 1)
+
+    def test_shared_actual_day_reassigns_an_earlier_week_to_fill_required_seat(self):
+        first, second = SUNDAYS[:2]
+        shared = first + timedelta(days=1)
+        for high in (None, 1, 0):
+            with self.subTest(month_max=high):
+                data = PlanInput(
+                    dates=(first, second), needed={"X": 1, "Y": 1},
+                    extra={"X": 1},
+                    free={person: frozenset({first, second}) for person in "AB"},
+                    tasks={"A": frozenset({"X", "Y"}), "B": frozenset({"X"})},
+                    availability={
+                        "A": frozenset({(shared, "X"), (shared, "Y")}),
+                        "B": frozenset({(shared, "X")}),
+                    },
+                    limits={person: (0, high) for person in "AB"},
+                    slot_dates={
+                        (first, "X", person): shared for person in "AB"
+                    } | {(second, "Y", "A"): shared},
+                )
+
+                plan = build_plan(data)
+
+                self.assertEqual(plan.covered_required(), 2)
+                self.assertEqual(plan.covered(), 2)
+                self.assertEqual(plan.slots[(first, "X")], ["B"])
+                self.assertEqual(plan.slots[(second, "Y")], ["A"])
+                self.assertEqual(plan.load(), {"A": 1, "B": 1})
+                self.assertIs(plan.slot_dates, data.slot_dates)
+
+    def test_shared_actual_day_repair_follows_a_chain_and_keeps_other_assignments(self):
+        first, second = SUNDAYS[:2]
+        shared = first + timedelta(days=1)
+        allowed = {"A": {"X", "Y"}, "B": {"X", "Z"}, "C": {"Z"}, "D": {"W"}}
+        data = PlanInput(
+            dates=(first, second), needed=dict.fromkeys(("X", "Y", "Z", "W"), 1),
+            free={person: frozenset({first, second}) for person in allowed},
+            tasks={person: frozenset(tasks) for person, tasks in allowed.items()},
+            availability={
+                person: frozenset((shared, task) for task in tasks)
+                for person, tasks in allowed.items()
+            },
+            limits={person: (0, 1) for person in allowed},
+            slot_dates={
+                (second if task == "Y" else first, task, person): shared
+                for person, tasks in allowed.items() for task in tasks
+            },
+        )
+
+        plan = build_plan(data)
+
+        self.assertEqual(plan.covered_required(), 4)
+        for task, person in (("X", "B"), ("Y", "A"), ("Z", "C"), ("W", "D")):
+            self.assertEqual(
+                plan.slots[(second if task == "Y" else first, task)], [person],
+            )
+        self.assertEqual(plan.load(), dict.fromkeys(allowed, 1))
+
+    def test_bundle_preference_keeps_same_day_linked_tasks_on_distinct_people(self):
+        day = SUNDAYS[0]
+        pair = frozenset({"X", "Y"})
+        data = PlanInput(
+            dates=(day,), needed={"X": 1, "Y": 1},
+            free={person: frozenset({day}) for person in "AB"},
+            tasks={person: pair for person in "AB"},
+            bundles={"A": pair},
+        )
+
+        plan = build_plan(data)
+
+        self.assertEqual(plan.covered_required(), 2)
+        self.assertEqual(sorted(plan.load().values()), [1, 1])
+
+    def test_bundle_preference_checks_collisions_in_other_weeks(self):
+        first, second = SUNDAYS[:2]
+        shared = first + timedelta(days=1)
+        data = PlanInput(
+            dates=(first, second), needed={"X": 1, "Y": 1},
+            free={person: frozenset({first, second}) for person in "AB"},
+            tasks={person: frozenset({"X", "Y"}) for person in "AB"},
+            bundles={"A": frozenset({"X", "Y"})},
+            slot_dates={
+                (first, "X", "A"): shared,
+                (second, "Y", "A"): shared,
+            },
+        )
+        slots = {
+            (first, "X"): ["A"], (first, "Y"): [],
+            (second, "X"): ["A"], (second, "Y"): ["B"],
+        }
+        plan = Plan(
+            slots={key: list(names) for key, names in slots.items()},
+            needed=data.needed, slot_dates=data.slot_dates,
+        )
+
+        _prefer_bundles(plan, data)
+
+        self.assertEqual(plan.slots, slots)
+
+    def test_soft_limit_replacement_checks_collisions_in_other_weeks(self):
+        first, second, third = SUNDAYS[:3]
+        shared = first + timedelta(days=1)
+        data = PlanInput(
+            dates=(first, second, third), needed={"X": 1, "Y": 1},
+            free={
+                "A": frozenset({first, third}),
+                "B": frozenset({first, second}),
+            },
+            tasks={"A": frozenset({"X"}), "B": frozenset({"X", "Y"})},
+            limits={"A": (0, 1), "B": (0, 3)},
+            slot_dates={
+                (first, "X", "B"): shared,
+                (second, "Y", "B"): shared,
+            },
+        )
+        slots = {
+            (first, "X"): ["A"], (second, "Y"): ["B"], (third, "X"): ["A"],
+        }
+        plan = Plan(
+            slots={key: list(names) for key, names in slots.items()},
+            needed=data.needed, slot_dates=data.slot_dates,
+        )
+
+        _spread_soft_limits(plan, data)
+
+        self.assertEqual(plan.slots, slots)
+        self.assertEqual(plan.load(), {"A": 2, "B": 1})
 
     def test_only_free_people_with_the_task_are_assigned(self):
         day = SUNDAYS[0]

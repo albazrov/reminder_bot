@@ -804,13 +804,30 @@ class SchedulePlanTest(unittest.TestCase):
         }
         self.assertEqual(flags, {"звук": True, "сборка": True, "спевка": False})
         plan = self.draft()
-        # 01.11 Алексей берёт обе задачи; 08.11 звук некому, кроме него
-        # (служил неделю назад) — сборку берёт Глеб, связка не навязывается.
+        # Связка не разрешает две задачи в один фактический день.
+        for day in plan["dates"]:
+            assigned = [
+                person for people in plan["slots"][day].values()
+                for person in people
+            ]
+            self.assertEqual(len(assigned), len(set(assigned)))
+        # В разные дни одной недели связка собирается: звук в воскресенье,
+        # сборка в среду перед ним.
+        self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+        plan = self.draft()
         self.assertEqual(
             (plan["slots"]["2026-11-01"]["звук"],
              plan["slots"]["2026-11-01"]["сборка"]),
             (["Алексей"], ["Алексей"]),
         )
+        self.assertEqual(
+            schedule_plan.slot_offset(
+                plan, None, "2026-11-01", "сборка"
+            ),
+            -4,
+        )
+        self.registry.set_service_task_day(1001, "sound", "сборка", None)
+        plan = self.draft()
         # Правка графика: убранного со второй задачи связки можно вернуть
         # — задача из его связки не «занятость».
         edited = {**plan, "slots": {

@@ -58,6 +58,67 @@ class ServiceRegistryTest(unittest.TestCase):
         registry.set_group_chat(1001, "sound", -10055, enabled=True)
         self.assertEqual(changes, ["changed"])
 
+    def test_legacy_readiness_migration_only_backfills_completion_flags(self):
+        closed = self.registry.create_readiness_run(
+            "sound", "2026-09", status="open", dates=["2026-09-06"]
+        )
+        self.registry.close_readiness_run(closed["id"])
+        opened = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open", dates=["2026-11-01"]
+        )
+        skipped = self.registry.create_readiness_run(
+            "sound", "2026-10", status="skipped"
+        )
+        columns = (
+            "poll_stopped", "result_sent", "closed_announced",
+            "options_json", "reverse_poll",
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            for column in columns:
+                connection.execute(
+                    f"ALTER TABLE readiness_runs DROP COLUMN {column}"
+                )
+
+        for _ in range(2):
+            self.registry.initialize(1001, -10001)
+            for original in (closed, opened, skipped):
+                with self.subTest(status=original["status"]):
+                    run = self.registry.get_readiness_run_by_id(original["id"])
+                    self.assertEqual(run["options"], [])
+                    self.assertFalse(run["reverse_poll"])
+                    self.assertEqual(run["dates"], original["dates"])
+                    for column in columns[:3]:
+                        self.assertEqual(
+                            run[column], int(run["status"] != "open")
+                        )
+
+    def test_readiness_migration_repairs_corrupt_options_preserving_valid_runs(self):
+        broken = self.registry.create_readiness_run(
+            "sound", "2026-10", status="open", dates=["2026-10-04"]
+        )
+        self.registry.close_readiness_run(broken["id"])
+        options = [{"date": "2026-11-01", "task": "звук"}]
+        valid = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open",
+            options=options, reverse_poll=True,
+        )
+        self.registry.close_readiness_run(valid["id"])
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "UPDATE readiness_runs SET options_json = '1', reverse_poll = 1 "
+                "WHERE id = ?", (broken["id"],)
+            )
+
+        for _ in range(2):
+            self.registry.initialize(1001, -10001)
+            repaired = self.registry.get_readiness_run_by_id(broken["id"])
+            self.assertEqual(repaired["options"], [])
+            self.assertFalse(repaired["reverse_poll"])
+            self.assertEqual(repaired["dates"], broken["dates"])
+            untouched = self.registry.get_readiness_run_by_id(valid["id"])
+            self.assertEqual(untouched["options"], options)
+            self.assertTrue(untouched["reverse_poll"])
+
     def test_bootstrap_seeds_catalog_and_configures_only_assembly(self):
         services = {service["id"]: service for service in self.registry.list_services()}
 
