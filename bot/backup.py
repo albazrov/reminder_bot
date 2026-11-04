@@ -16,7 +16,7 @@ import re
 from contextlib import closing, contextmanager
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Coroutine
+from typing import Any, Awaitable, Callable, Coroutine, TypeVar
 from zoneinfo import ZoneInfo
 
 from .config import service_registry_path
@@ -33,6 +33,12 @@ BACKUP_LOCK_FILENAME = ".backup.lock"
 MAX_SNAPSHOTS_PER_ENVIRONMENT = 14
 MIN_RETAINED_SNAPSHOTS = 7
 STALE_SNAPSHOT_STAGE_AGE = timedelta(hours=24)
+SCHEDULE_RETRY_SECONDS = 300
+SCHEDULE_REFRESH_SECONDS = 86400
+STORAGE_WARNING_PERCENT = 90
+STORAGE_CRITICAL_PERCENT = 95
+STORAGE_MIN_FREE_BYTES = 256 * 1024 * 1024
+_T = TypeVar("_T")
 
 
 @contextmanager
@@ -259,11 +265,135 @@ class BackupManager:
         self._tasks: set[asyncio.Task] = set()
         self._failure_callback: Callable[[str], Awaitable[None]] | None = None
         self._snapshot_validation_cache: dict[Path, tuple[tuple, bool]] = {}
+        self._failure_notices: set[str] = set()
+        self._storage_levels: dict[Path, str] = {}
 
     def set_failure_callback(
         self, callback: Callable[[str], Awaitable[None]]
     ) -> None:
         self._failure_callback = callback
+
+    async def report_failure(self, kind: str, message: str) -> None:
+        self.logger.error("%s", message)
+        if kind in self._failure_notices or self._failure_callback is None:
+            return
+        try:
+            await self._failure_callback(message)
+        except Exception:
+            self.logger.exception("Не удалось уведомить администратора о бэкапе")
+        else:
+            self._failure_notices.add(kind)
+
+    def clear_failure(self, kind: str) -> None:
+        self._failure_notices.discard(kind)
+
+    async def _complete_io(self, action: Callable[[], _T]) -> _T:
+        worker = asyncio.create_task(asyncio.to_thread(action))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Do not release the write lock or remove the input mid-write.
+            try:
+                await worker
+            except Exception:
+                self.logger.exception("Ошибка файловой операции при остановке бэкапа")
+            raise
+
+    @property
+    def saved_schedule(self) -> Path:
+        return self.backup_base / self.environment / "latest-schedule.xlsx"
+
+    def _replace_schedule(self, path: Path, data: bytes) -> None:
+        if path.is_symlink() or (
+            path.exists() and not _is_regular_private_file(path)
+        ):
+            raise PermissionError(f"Файл расписания небезопасен: {path}")
+        fd, name = tempfile.mkstemp(prefix=".schedule-", dir=path.parent)
+        os.close(fd)
+        stage = Path(name)
+        try:
+            stage.chmod(0o600)
+            with stage.open("wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(stage, path)
+            _fsync_directory(path.parent)
+        finally:
+            stage.unlink(missing_ok=True)
+
+    async def record_schedule_download(self, path: Path) -> None:
+        """Publish verified bytes for backups only, never for delivery fallback."""
+        async with self._backup_lock:
+            await self._complete_io(lambda: self._record_schedule_download(path))
+        self.clear_failure("schedule-copy")
+        self.mark_dirty()
+
+    def _record_schedule_download(self, path: Path) -> None:
+        self._require_external_mount()
+        for directory in (
+            self.backup_base.parent, self.backup_base,
+            self.saved_schedule.parent, self.shm_dir,
+        ):
+            _secure_directory(directory)
+        if not _is_owned_regular_file(path):
+            raise PermissionError(f"Скачанное расписание небезопасно: {path}")
+        data = path.read_bytes()
+        # Validate the exact immutable bytes that will be published.
+        fd, name = tempfile.mkstemp(
+            prefix=".schedule-check-", suffix=".xlsx", dir=self.shm_dir
+        )
+        os.close(fd)
+        stage = Path(name)
+        try:
+            stage.write_bytes(data)
+            self._parse_schedule(stage)
+            self._replace_schedule(self.saved_schedule, data)
+            current = self.shm_dir / "reminder_bot_current.xlsx"
+            self._replace_schedule(current, data)
+        finally:
+            stage.unlink(missing_ok=True)
+        self.logger.info("Проверенная копия Excel сохранена: %s", self.saved_schedule)
+
+    async def run_schedule_refresh(
+        self,
+        download: Callable[[Path], Awaitable[Any]],
+    ) -> None:
+        """Refresh after startup and daily; retry failures without blocking polling."""
+        first_attempt = True
+        while True:
+            path: Path | None = None
+            try:
+                directory_fd = open_private_directory(self.shm_dir, create=True)
+                os.close(directory_fd)
+                fd, name = tempfile.mkstemp(
+                    prefix=".schedule-refresh-", suffix=".xlsx", dir=self.shm_dir
+                )
+                os.close(fd)
+                path = Path(name)
+                await download(path)
+                await self.record_schedule_download(path)
+                await self.create_snapshot("обновление Excel")
+            except Exception as exc:
+                await self.report_failure(
+                    "schedule",
+                    "Не удалось обновить Excel и резервную копию: "
+                    f"{type(exc).__name__}: {exc}. "
+                    "Повтор через 5 минут; сохранённая копия не используется "
+                    "для отправки напоминаний.",
+                )
+                if first_attempt:
+                    await self._run_background_backup("сохранённый Excel после запуска")
+                await self.check_storage()
+                delay = SCHEDULE_RETRY_SECONDS
+            else:
+                self._failure_notices.discard("schedule")
+                delay = SCHEDULE_REFRESH_SECONDS
+            finally:
+                first_attempt = False
+                if path is not None:
+                    path.unlink(missing_ok=True)
+            await asyncio.sleep(delay)
 
     def mark_dirty(self) -> None:
         """Restart the quiet-period timer after a persistent data change."""
@@ -314,7 +444,7 @@ class BackupManager:
                 pending.cancel()
                 self._debounce_handle = None
             try:
-                snapshot = await asyncio.to_thread(self._create_snapshot)
+                snapshot = await self._complete_io(self._create_snapshot)
             except Exception:
                 # Отменённый отложенный снимок повторяется один раз до
                 # следующего успешного снимка, чтобы не спамить при отказе.
@@ -327,7 +457,9 @@ class BackupManager:
                     self.mark_dirty()
                 raise
             self._retry_armed = False
+            self._failure_notices.discard("backup")
             self.logger.info("Резервная копия создана (%s): %s", reason, snapshot)
+            await self.check_storage()
             return snapshot
 
     async def _run_background_backup(self, reason: str) -> None:
@@ -337,14 +469,48 @@ class BackupManager:
             await self.create_snapshot(reason)
         except Exception as exc:
             self.logger.exception("Не удалось создать резервную копию (%s)", reason)
-            if self._failure_callback is not None:
-                try:
-                    await self._failure_callback(
-                        f"Не удалось создать резервную копию данных ({reason}): "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                except Exception:
-                    self.logger.exception("Не удалось уведомить администратора о бэкапе")
+            await self.report_failure(
+                "backup",
+                f"Не удалось создать резервную копию данных ({reason}): "
+                f"{type(exc).__name__}: {exc}",
+            )
+            await self.check_storage()
+
+    @staticmethod
+    def _storage_level(usage) -> str:
+        percent = (usage.total - usage.free) * 100 / usage.total
+        if percent >= STORAGE_CRITICAL_PERCENT or usage.free < STORAGE_MIN_FREE_BYTES:
+            return "critical"
+        return "warning" if percent >= STORAGE_WARNING_PERCENT else "ok"
+
+    async def check_storage(self) -> None:
+        for path in (self.backup_base, self.registry_path.parent):
+            try:
+                usage = await asyncio.to_thread(shutil.disk_usage, path)
+            except OSError as exc:
+                await self.report_failure(
+                    f"storage:{path}", f"Не удалось проверить место на {path}: {exc}"
+                )
+                continue
+            self._failure_notices.discard(f"storage:{path}")
+            level = self._storage_level(usage)
+            if level == "ok":
+                self._storage_levels.pop(path, None)
+                continue
+            if self._storage_levels.get(path) == level:
+                continue
+            percent = (usage.total - usage.free) * 100 / usage.total
+            kind = f"space:{path}:{level}"
+            self._failure_notices.discard(kind)
+            await self.report_failure(
+                kind,
+                f"{'Критически мало места' if level == 'critical' else 'Мало места'} "
+                f"на носителе {path}: занято {percent:.1f}%, "
+                f"свободно {usage.free / (1024 * 1024):.0f} МиБ. "
+                f"Минимум {MIN_RETAINED_SNAPSHOTS} проверенных копий сохраняется.",
+            )
+            if kind in self._failure_notices:
+                self._storage_levels[path] = level
 
     async def run_nightly(self) -> None:
         while True:
@@ -379,6 +545,7 @@ class BackupManager:
                 raise PermissionError("Файл блокировки резервной копии небезопасен")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             self._require_external_mount()
+            self._prune_for_space(backup_dir)
             return self._create_snapshot_locked(backup_dir)
         finally:
             os.close(lock_fd)
@@ -388,6 +555,12 @@ class BackupManager:
         xlsx_path = self.shm_dir / "reminder_bot_current.xlsx"
         if not _is_regular_private_file(db_path):
             raise RuntimeError(f"SQLite-файл отсутствует или небезопасен: {db_path}")
+        if not xlsx_path.exists() and not xlsx_path.is_symlink():
+            xlsx_path = self.saved_schedule
+            self.logger.warning(
+                "Для бэкапа используется сохранённый Excel, не свежая загрузка: %s",
+                xlsx_path,
+            )
         if not _is_owned_regular_file(xlsx_path):
             raise RuntimeError(
                 f"Исходное расписание отсутствует или небезопасно: {xlsx_path}"
@@ -421,9 +594,11 @@ class BackupManager:
                 json.loads(cache_data)
                 _write_private(stage / "reminder_state_cache.json", cache_data)
 
+            schedule_saved_at = xlsx_path.stat().st_mtime
             shutil.copyfile(xlsx_path, stage / "schedule.xlsx", follow_symlinks=False)
             os.chmod(stage / "schedule.xlsx", 0o600)
             staged_xlsx = stage / "schedule.xlsx"
+            os.utime(staged_xlsx, (schedule_saved_at, schedule_saved_at))
             target_date, schedule_data, contacts = self._parse_schedule(staged_xlsx)
             schedule_json = {
                 "format_version": SNAPSHOT_FORMAT_VERSION,
@@ -452,6 +627,9 @@ class BackupManager:
                 "format_version": SNAPSHOT_FORMAT_VERSION,
                 "environment": self.environment,
                 "created_at": datetime.now(self.timezone).isoformat(),
+                "schedule_saved_at": datetime.fromtimestamp(
+                    schedule_saved_at, self.timezone
+                ).isoformat(),
                 "sqlite_user_version": sqlite_user_version,
                 "files": files,
             }
@@ -540,7 +718,8 @@ class BackupManager:
         )
         snapshots.sort(key=lambda item: (item[0], item[1]))
 
-        if len(snapshots) <= MAX_SNAPSHOTS_PER_ENVIRONMENT:
+        pressure = self._storage_level(shutil.disk_usage(backup_dir)) != "ok"
+        if len(snapshots) <= MAX_SNAPSHOTS_PER_ENVIRONMENT and not pressure:
             return
 
         validated_snapshots = []
@@ -586,27 +765,19 @@ class BackupManager:
             )
             validated_snapshots.append(item)
 
-        excess_count = max(
-            0,
-            len(validated_snapshots) - MAX_SNAPSHOTS_PER_ENVIRONMENT,
-        )
         removable = [
             item for item in validated_snapshots
             if item[2] != committed_snapshot
-        ][:excess_count]
-        if (
-            len(validated_snapshots) - len(removable)
-            < MIN_RETAINED_SNAPSHOTS
-        ):
-            self.logger.error(
-                "Очистка снимков отменена: не удалось сохранить минимум %d "
-                "проверенных копий",
-                MIN_RETAINED_SNAPSHOTS,
-            )
-            return
+        ]
 
         removed_any = False
+        retained = len(validated_snapshots)
         for _, _, old_snapshot in removable:
+            pressure = self._storage_level(shutil.disk_usage(backup_dir)) != "ok"
+            if retained <= MIN_RETAINED_SNAPSHOTS or (
+                retained <= MAX_SNAPSHOTS_PER_ENVIRONMENT and not pressure
+            ):
+                break
             try:
                 shutil.rmtree(old_snapshot)
             except OSError:
@@ -620,6 +791,7 @@ class BackupManager:
                 "Удалён старый проверенный снимок: %s", old_snapshot
             )
             removed_any = True
+            retained -= 1
 
         if removed_any:
             try:
@@ -634,6 +806,27 @@ class BackupManager:
                 self.logger.exception(
                     "Не удалось синхронизировать каталог после очистки снимков"
                 )
+
+    def _prune_for_space(self, backup_dir: Path) -> None:
+        if self._storage_level(shutil.disk_usage(backup_dir)) == "ok":
+            return
+        candidates = []
+        for path in backup_dir.iterdir():
+            if path.is_symlink() or not path.is_dir() or path.name.startswith("."):
+                continue
+            try:
+                manifest = self._read_snapshot_metadata(path, self.environment)
+                candidates.append((manifest["created_at"], path))
+            except Exception:
+                self.logger.warning("Не удаляю непроверенный снимок: %s", path)
+        for _, path in sorted(candidates, reverse=True):
+            try:
+                self._validate_snapshot(path, self.environment)
+            except Exception:
+                self.logger.warning("Не удаляю повреждённый снимок: %s", path)
+                continue
+            self._prune_old_snapshots(backup_dir, path)
+            break
 
     @staticmethod
     def _snapshot_fingerprint(snapshot: Path) -> tuple:
@@ -747,7 +940,11 @@ class BackupManager:
         return manifest
 
     def _parse_schedule(self, xlsx_path: Path):
-        today = datetime.now(self.timezone).date()
+        # A saved workbook can legitimately lack next month's sheet.
+        # Backups describe its original date, not a fresh delivery schedule.
+        today = datetime.fromtimestamp(
+            xlsx_path.stat().st_mtime, self.timezone
+        ).date()
         days_until_sunday = (6 - today.weekday()) % 7
         target = today + timedelta(days=days_until_sunday or 7)
         parser_logger = logging.Logger(
@@ -888,6 +1085,9 @@ class BackupManager:
                     shutil.copyfileobj(source, target)
                     target.flush()
                     os.fsync(target.fileno())
+                if name == "schedule.xlsx":
+                    saved_at = (snapshot / name).stat().st_mtime
+                    os.utime(temp_path, (saved_at, saved_at))
             for destination in staged:
                 if destination.exists():
                     fd, old_name = tempfile.mkstemp(

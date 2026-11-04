@@ -6,11 +6,13 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
+import zipfile
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
@@ -113,6 +115,200 @@ class BackupManagerTest(unittest.TestCase):
         data = json.loads((snapshot / "schedule.json").read_text("utf-8"))
         self.assertEqual(data["assignments"]["Ответственный"], "Алексей")
         self.assertEqual(data["contacts"]["Ответственный"]["Алексей"]["telegram_id"], 101)
+
+    def test_download_preserves_private_copy_and_supports_backup_after_ram_loss(self):
+        original = self.xlsx.read_bytes()
+        asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        saved = self.manager.saved_schedule
+        self.assertEqual(saved.read_bytes(), original)
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+        self.xlsx.unlink()
+        snapshot = asyncio.run(self.manager.create_snapshot("RAM cleared"))
+        self.assertEqual((snapshot / "schedule.xlsx").read_bytes(), original)
+        manifest = json.loads((snapshot / "manifest.json").read_text())
+        self.assertIn("schedule_saved_at", manifest)
+        self.assertFalse(self.xlsx.exists())
+
+    def test_old_saved_workbook_can_back_up_database_after_month_changes(self):
+        asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        saved_time = self.manager.saved_schedule.stat().st_mtime
+        self.xlsx.unlink()
+        future = datetime.now(self.manager.timezone) + timedelta(days=62)
+        with patch("bot.backup.datetime", wraps=datetime) as clock:
+            clock.now.return_value = future
+            snapshot = asyncio.run(self.manager.create_snapshot("offline next month"))
+        manifest = json.loads((snapshot / "manifest.json").read_text())
+        self.assertAlmostEqual(
+            datetime.fromisoformat(manifest["schedule_saved_at"]).timestamp(),
+            saved_time,
+            places=5,
+        )
+        self.assertEqual(manifest["created_at"], future.isoformat())
+
+    def test_bad_download_never_replaces_last_good_copy(self):
+        asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        original = self.manager.saved_schedule.read_bytes()
+        bad = self.shm_dir / "invalid.xlsx"
+        bad.write_bytes(b"not an Excel file")
+        with self.assertRaises(zipfile.BadZipFile):
+            asyncio.run(self.manager.record_schedule_download(bad))
+        self.assertEqual(self.manager.saved_schedule.read_bytes(), original)
+        self.assertEqual(self.xlsx.read_bytes(), original)
+        self.assertFalse(list(self.shm_dir.glob(".schedule-check-*")))
+
+    def test_interrupted_schedule_publish_keeps_previous_copy(self):
+        asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        original = self.manager.saved_schedule.read_bytes()
+        with patch("bot.backup.os.replace", side_effect=OSError("write failed")):
+            with self.assertRaises(OSError):
+                asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        self.assertEqual(self.manager.saved_schedule.read_bytes(), original)
+        self.assertFalse(list(self.manager.saved_schedule.parent.glob(".schedule-*")))
+
+    def test_missing_external_mount_prevents_schedule_copy(self):
+        self.manager.require_mount = True
+        with patch.object(Path, "is_mount", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "не смонтирован"):
+                asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        self.assertFalse(self.manager.saved_schedule.exists())
+
+    def test_cancelled_download_waits_for_file_write_before_releasing_lock(self):
+        async def scenario():
+            started = threading.Event()
+            release = threading.Event()
+
+            def write():
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release writer")
+
+            with patch.object(self.manager, "_record_schedule_download", side_effect=lambda _: write()):
+                task = asyncio.create_task(
+                    self.manager.record_schedule_download(self.xlsx)
+                )
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertTrue(self.manager._backup_lock.locked())
+                    self.assertFalse(task.done())
+                finally:
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                self.assertFalse(self.manager._backup_lock.locked())
+
+        asyncio.run(scenario())
+
+    def test_saved_copy_is_environment_specific_and_symlinks_are_rejected(self):
+        asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        original = self.xlsx.read_bytes()
+        saved = self.manager.saved_schedule
+        saved.unlink()
+        saved.symlink_to(self.xlsx)
+        with self.assertRaises(PermissionError):
+            asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        self.assertEqual(self.xlsx.read_bytes(), original)
+        self.assertFalse((self.backup_base / "prod" / "latest-schedule.xlsx").exists())
+        self.xlsx.unlink()
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self.manager.create_snapshot("broken link"))
+
+    def test_refresh_retries_then_saves_and_switches_to_daily_interval(self):
+        async def scenario():
+            good = self.xlsx.read_bytes()
+            notices = AsyncMock()
+            self.manager.set_failure_callback(notices)
+            calls = 0
+
+            async def download(path):
+                nonlocal calls
+                calls += 1
+                if calls <= 2:
+                    raise OSError("network unavailable")
+                path.write_bytes(good)
+
+            delays = []
+
+            async def sleep(delay):
+                delays.append(delay)
+                if len(delays) == 3:
+                    raise asyncio.CancelledError
+
+            self.xlsx.unlink()
+            with patch("bot.backup.asyncio.sleep", side_effect=sleep):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.manager.run_schedule_refresh(download)
+            self.assertEqual(delays, [300, 300, 86400])
+            self.assertEqual(self.xlsx.read_bytes(), good)
+            self.assertEqual(self.manager.saved_schedule.read_bytes(), good)
+            schedule_notices = [
+                call for call in notices.await_args_list
+                if "Не удалось обновить Excel" in call.args[0]
+            ]
+            self.assertEqual(len(schedule_notices), 1)
+            self.assertFalse(list(self.shm_dir.glob(".schedule-refresh-*")))
+            await self.manager.close()
+
+        asyncio.run(scenario())
+
+    def test_storage_thresholds_and_notice_deduplication(self):
+        usage = shutil._ntuple_diskusage
+        gib = 1024 ** 3
+        self.assertEqual(
+            self.manager._storage_level(usage(10*gib, 9*gib, gib)), "warning"
+        )
+        self.assertEqual(
+            self.manager._storage_level(usage(20*gib, 19*gib, gib)), "critical"
+        )
+        self.assertEqual(
+            self.manager._storage_level(usage(gib, 800*1024**2, 224*1024**2)),
+            "critical",
+        )
+        self.assertEqual(
+            self.manager._storage_level(usage(10*gib, 8*gib, 2*gib)), "ok"
+        )
+
+        async def scenario():
+            notices = AsyncMock()
+            self.manager.set_failure_callback(notices)
+            for free in (gib, gib, gib // 2, gib // 2, 3*gib, gib):
+                with patch(
+                    "bot.backup.shutil.disk_usage",
+                    return_value=usage(10*gib, 10*gib-free, free),
+                ):
+                    await self.manager.check_storage()
+            # Two paths: warn once, escalate once, then warn after recovery.
+            self.assertEqual(notices.await_count, 6)
+
+        asyncio.run(scenario())
+
+    def test_failed_notice_is_retried_until_delivery_then_deduplicated(self):
+        async def scenario():
+            notices = AsyncMock(side_effect=[RuntimeError("offline"), None])
+            self.manager.set_failure_callback(notices)
+            for _ in range(3):
+                await self.manager.report_failure("schedule", "failed download")
+            self.assertEqual(notices.await_count, 2)
+            self.assertIn("schedule", self.manager._failure_notices)
+
+        asyncio.run(scenario())
+
+    def test_disk_pressure_prunes_only_valid_snapshots_and_keeps_seven(self):
+        snapshot = asyncio.run(self.manager.create_snapshot("seed"))
+        paths = [snapshot]
+        for index in range(9):
+            path = snapshot.parent / f"copy-{index}"
+            shutil.copytree(snapshot, path)
+            paths.append(path)
+        invalid = snapshot.parent / "invalid"
+        shutil.copytree(snapshot, invalid)
+        (invalid / "database.sql").write_bytes(b"corrupt")
+        usage = shutil._ntuple_diskusage(1024**3, 1000*1024**2, 24*1024**2)
+        with patch("bot.backup.shutil.disk_usage", return_value=usage):
+            self.manager._prune_for_space(snapshot.parent)
+        self.assertEqual(sum(path.exists() for path in paths), 7)
+        self.assertTrue(invalid.exists())
 
     def test_snapshot_parses_and_hashes_the_staged_workbook(self):
         from datetime import date
