@@ -970,13 +970,21 @@ class ServiceRegistry:
                     connection.execute(
                         f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
                     )
-                    if table == "readiness_runs":
+                    if table == "readiness_runs" and column in {
+                        "poll_stopped", "result_sent", "closed_announced"
+                    }:
                         # Закрытые до миграции опросы уже подведены — без
                         # повторного итога админам.
                         connection.execute(
                             f"UPDATE readiness_runs SET {column} = 1 "
                             "WHERE status != 'open'"
                         )
+            # Ранняя миграция ошибочно записывала флаг завершения и в
+            # новые поля вариантов/режима старых закрытых опросов.
+            connection.execute(
+                "UPDATE readiness_runs SET options_json = '[]', reverse_poll = 0 "
+                "WHERE status != 'open' AND options_json = '1'"
+            )
             # Утверждённые до снимка задач — снимок из рабочей копии, пока
             # её не поправили: дальше напоминания не идут за черновиком.
             connection.execute(

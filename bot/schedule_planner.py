@@ -9,9 +9,9 @@
    место не закрыть: интервал важнее ответа на опрос.
 
 Алгоритм:
-1. Покрытие: даты независимы, поэтому на каждую дату ищется
-   паросочетание «человек → место в задаче» максимального размера —
-   задача остаётся пустой, только если закрыть её действительно некем.
+1. Покрытие: на каждую неделю ищется паросочетание «человек → место
+   в задаче», затем поток по фактическим дням устраняет недобор из-за
+   пересечений дней соседних недель.
 2. Справедливость: даты идут по порядку, на каждой берётся
    паросочетание минимальной стоимости среди максимальных; стоимость
    человека — прирост общей стоимости плана от ещё одного служения.
@@ -522,7 +522,7 @@ def _spread_soft_limits(plan: Plan, data: PlanInput) -> None:
                             (week, other_task, candidate), week
                         )
                         for (week, other_task), names in plan.slots.items()
-                        if week == event_date and candidate in names
+                        if candidate in names
                     ):
                         continue
                     candidate_high = _limit(data, candidate)[1]
@@ -642,7 +642,7 @@ def _prefer_bundles(plan: Plan, data: PlanInput) -> None:
             for task in sorted(bundle - set(linked_slots)):
                 if not _can_serve(data, person, event_date, task):
                     continue
-                service_day = data.slot_dates.get(
+                service_day = plan.slot_dates.get(
                     (event_date, task, person), event_date
                 )
                 current_days = {
@@ -652,18 +652,8 @@ def _prefer_bundles(plan: Plan, data: PlanInput) -> None:
                 }
                 high = _limit(data, person)[1]
                 if (
-                    service_day not in current_days
-                    and high is not None
-                    and len(current_days) >= high
-                ):
-                    continue
-                if any(
-                    other_task not in bundle
-                    and service_day == data.slot_dates.get(
-                        (week, other_task, person), week
-                    )
-                    for (week, other_task), names in plan.slots.items()
-                    if week == event_date and person in names
+                    service_day in current_days
+                    or (high is not None and len(current_days) >= high)
                 ):
                     continue
                 target = plan.slots.get((event_date, task), [])
@@ -1092,6 +1082,19 @@ def _build_plan(data: PlanInput) -> Plan:
     # могут назначаться одному человеку, только если это разные фактические дни.
     for event_date in sorted(set(data.dates)):
         assign_week(event_date, required, required_pass=True)
+    if plan.gaps():
+        repair_gaps(plan, data)
+        used_days.clear()
+        served_weeks.clear()
+        last = dict(data.last_served)
+        for (event_date, task), people in sorted(plan.slots.items()):
+            for person in people:
+                used_days.setdefault(person, set()).add(
+                    plan.slot_dates.get((event_date, task, person), event_date)
+                )
+                served_weeks.setdefault(person, set()).add(event_date)
+                last[person] = event_date
+        load = plan.load()
     for event_date in sorted(set(data.dates)):
         optional_seats = [
             task for task, extra in data.extra.items() if task in data.needed
@@ -1128,13 +1131,14 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date],
 
 
 def repair_gaps(plan: Plan, data: PlanInput) -> None:
-    """Обязательные места, оставшиеся пустыми из-за месячного максимума,
-    закрываются перестановками по всему месяцу: план — поток «исток →
-    человек (до его максимума) → (человек, дата) → место (до минимума
-    задачи) → сток», и он дополняется увеличивающими путями (Форд —
-    Фалкерсон) до максимального. Путь переставляет только людей своей
-    цепочки (другая задача в ту же дату, другая дата), остальные остаются
-    на местах; поиск в ширину — кратчайшие цепочки."""
+    """Дополняет обязательное покрытие перестановками по всему месяцу.
+
+    Поток: исток → человек → (человек, фактический день) → место → сток.
+    Сначала сохраняется месячный максимум (или уже имеющаяся нагрузка),
+    затем мягкий максимум снимается, если иначе остаются пустые места.
+    Увеличивающие пути меняют только назначения своей цепочки.
+    Вызывается до заполнения необязательных мест.
+    """
     source, sink = ("source",), ("sink",)
     capacity: dict[tuple, int] = {}
     edges: dict[tuple, list[tuple]] = {}
@@ -1147,45 +1151,57 @@ def repair_gaps(plan: Plan, data: PlanInput) -> None:
         capacity[(start, end)] = capacity.get((start, end), 0) + amount
 
     seats = sorted(plan.slots)
+    total = sum(plan.needed[key[1]] for key in seats)
+    loads = plan.load()
     for person in sorted(data.free):
         high = _limit(data, person)[1]
-        add(source, ("person", person), len(seats) if high is None else high)
-        for event_date in sorted(data.free[person]):
-            add(("person", person), ("day", person, event_date), 1)
-            for key in seats:
-                if key[0] == event_date and _can_serve(
-                    data, person, event_date, key[1]
-                ):
-                    add(("day", person, event_date), ("seat", key), 1)
+        add(
+            source, ("person", person),
+            total if high is None else max(high, loads.get(person, 0)),
+        )
+        days = set()
+        for key in seats:
+            if not _can_serve(data, person, key[0], key[1]):
+                continue
+            service_day = plan.slot_dates.get((*key, person), key[0])
+            if service_day not in days:
+                add(("person", person), ("day", person, service_day), 1)
+                days.add(service_day)
+            add(("day", person, service_day), ("seat", key), 1)
     for key in seats:
         add(("seat", key), sink, plan.needed[key[1]])
     # Текущий план — уже пущенный поток.
     for key in seats:
         for person in plan.slots[key]:
+            service_day = plan.slot_dates.get((*key, person), key[0])
             for start, end in (
                 (source, ("person", person)),
-                (("person", person), ("day", person, key[0])),
-                (("day", person, key[0]), ("seat", key)),
+                (("person", person), ("day", person, service_day)),
+                (("day", person, service_day), ("seat", key)),
                 (("seat", key), sink),
             ):
                 capacity[(start, end)] -= 1
                 capacity[(end, start)] += 1
-    while True:
-        came: dict[tuple, tuple | None] = {source: None}
-        queue = [source]
-        for node in queue:
-            for end in edges.get(node, ()):
-                if end not in came and capacity[(node, end)] > 0:
-                    came[end] = node
-                    queue.append(end)
-        if sink not in came:
-            break
-        node = sink
-        while came[node] is not None:
-            start = came[node]
-            capacity[(start, node)] -= 1
-            capacity[(node, start)] += 1
-            node = start
+    for unlimited in (False, True):
+        if unlimited:
+            for person in sorted(data.free):
+                add(source, ("person", person), total)
+        while True:
+            came: dict[tuple, tuple | None] = {source: None}
+            queue = [source]
+            for node in queue:
+                for end in edges.get(node, ()):
+                    if end not in came and capacity[(node, end)] > 0:
+                        came[end] = node
+                        queue.append(end)
+            if sink not in came:
+                break
+            node = sink
+            while came[node] is not None:
+                start = came[node]
+                capacity[(start, node)] -= 1
+                capacity[(node, start)] += 1
+                node = start
     # Назначение — поток по ребру (человек, дата) → место; уже стоявшие
     # остаются в прежнем порядке, новые — в конце.
     for key in seats:
