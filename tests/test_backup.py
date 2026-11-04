@@ -156,6 +156,50 @@ class BackupManagerTest(unittest.TestCase):
         self.assertEqual(self.xlsx.read_bytes(), original)
         self.assertFalse(list(self.shm_dir.glob(".schedule-check-*")))
 
+    def test_downloads_never_postpone_pending_database_backup(self):
+        async def scenario():
+            self.manager.mark_dirty()
+            pending = self.manager._debounce_handle
+            await self.manager.record_schedule_download(self.xlsx)
+            self.assertIs(self.manager._debounce_handle, pending)
+            await self.manager.record_schedule_download(self.xlsx)
+            self.assertIs(self.manager._debounce_handle, pending)
+            pending.cancel()
+            self.manager._debounce_handle = None
+            await self.manager.record_schedule_download(self.xlsx)
+            self.assertIsNone(self.manager._debounce_handle)
+            await self.manager.close()
+
+        asyncio.run(scenario())
+
+    def test_download_cleans_up_space_before_publishing_copy(self):
+        events = []
+        original = self.manager._replace_schedule
+
+        def replace(path, data):
+            events.append("write")
+            return original(path, data)
+
+        with patch.object(
+            self.manager, "_prune_for_space", side_effect=lambda _: events.append("prune")
+        ), patch.object(self.manager, "_replace_schedule", side_effect=replace):
+            asyncio.run(self.manager.record_schedule_download(self.xlsx))
+        self.assertEqual(events, ["prune", "write", "write"])
+
+    def test_partial_publish_retry_arms_backup_when_current_copy_is_missing(self):
+        async def scenario():
+            await self.manager.record_schedule_download(self.xlsx)
+            self.manager._debounce_handle.cancel()
+            self.manager._debounce_handle = None
+            source = self.shm_dir / "fresh.xlsx"
+            source.write_bytes(self.xlsx.read_bytes())
+            self.xlsx.unlink()
+            await self.manager.record_schedule_download(source)
+            self.assertIsNotNone(self.manager._debounce_handle)
+            await self.manager.close()
+
+        asyncio.run(scenario())
+
     def test_interrupted_schedule_publish_keeps_previous_copy(self):
         asyncio.run(self.manager.record_schedule_download(self.xlsx))
         original = self.manager.saved_schedule.read_bytes()

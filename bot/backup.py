@@ -325,11 +325,12 @@ class BackupManager:
     async def record_schedule_download(self, path: Path) -> None:
         """Publish verified bytes for backups only, never for delivery fallback."""
         async with self._backup_lock:
-            await self._complete_io(lambda: self._record_schedule_download(path))
+            changed = await self._complete_io(lambda: self._record_schedule_download(path))
         self.clear_failure("schedule-copy")
-        self.mark_dirty()
+        if changed and self._debounce_handle is None:
+            self.mark_dirty()
 
-    def _record_schedule_download(self, path: Path) -> None:
+    def _record_schedule_download(self, path: Path) -> bool:
         self._require_external_mount()
         for directory in (
             self.backup_base.parent, self.backup_base,
@@ -348,12 +349,20 @@ class BackupManager:
         try:
             stage.write_bytes(data)
             self._parse_schedule(stage)
-            self._replace_schedule(self.saved_schedule, data)
-            current = self.shm_dir / "reminder_bot_current.xlsx"
-            self._replace_schedule(current, data)
+            with self._locked_backup_directory() as backup_dir:
+                self._prune_for_space(backup_dir)
+                current = self.shm_dir / "reminder_bot_current.xlsx"
+                changed = any(
+                    not _is_regular_private_file(copy)
+                    or copy.read_bytes() != data
+                    for copy in (self.saved_schedule, current)
+                )
+                self._replace_schedule(self.saved_schedule, data)
+                self._replace_schedule(current, data)
         finally:
             stage.unlink(missing_ok=True)
         self.logger.info("Проверенная копия Excel сохранена: %s", self.saved_schedule)
+        return changed
 
     async def run_schedule_refresh(
         self,
@@ -522,6 +531,12 @@ class BackupManager:
             await self._run_background_backup("ежедневное ночное резервирование")
 
     def _create_snapshot(self) -> Path:
+        with self._locked_backup_directory() as backup_dir:
+            self._prune_for_space(backup_dir)
+            return self._create_snapshot_locked(backup_dir)
+
+    @contextmanager
+    def _locked_backup_directory(self):
         self._require_external_mount()
 
         backup_dir = self.backup_base / self.environment
@@ -545,8 +560,7 @@ class BackupManager:
                 raise PermissionError("Файл блокировки резервной копии небезопасен")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             self._require_external_mount()
-            self._prune_for_space(backup_dir)
-            return self._create_snapshot_locked(backup_dir)
+            yield backup_dir
         finally:
             os.close(lock_fd)
 

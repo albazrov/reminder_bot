@@ -1845,7 +1845,13 @@ async def _process_upcoming_sunday(
         interaction_logger.info("Рассылка для %s уже отправлена", sunday_iso)
         return
 
-    xlsx_path = shm_dir / "reminder_bot_current.xlsx"
+    directory_fd = open_private_directory(shm_dir, create=True)
+    os.close(directory_fd)
+    file_fd, file_name = tempfile.mkstemp(
+        prefix=".reminder-delivery-", suffix=".xlsx", dir=shm_dir
+    )
+    os.close(file_fd)
+    xlsx_path = Path(file_name)
     debug_logger.info("Подготовка рассылки на %s", sunday_iso)
 
     try:
@@ -1879,6 +1885,8 @@ async def _process_upcoming_sunday(
             debug_logger,
         )
         raise
+    finally:
+        xlsx_path.unlink(missing_ok=True)
 
     if assignment_issues:
         await _notify_admin(

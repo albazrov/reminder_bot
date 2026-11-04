@@ -29,6 +29,46 @@ NEEDS_PROC = unittest.skipUnless(
 
 
 class ReminderBotEntrypointTest(unittest.TestCase):
+    def test_legacy_delivery_parses_own_download_not_shared_backup_file(self):
+        from bot import app
+
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                shared = root / "reminder_bot_current.xlsx"
+                manager = MagicMock()
+
+                async def download(url, path, logger, **options):
+                    path.write_bytes(b"fresh assignments")
+
+                async def record(path):
+                    shared.write_bytes(b"older backup download")
+
+                def parse(path, *args):
+                    self.assertNotEqual(path, shared)
+                    self.assertEqual(path.read_bytes(), b"fresh assignments")
+                    raise ValueError("stop after verifying input")
+
+                manager.record_schedule_download = AsyncMock(side_effect=record)
+                cache = MagicMock()
+                cache.matches_week.return_value = False
+                credentials = SimpleNamespace(
+                    group_chat_id=-100, admin_tg_id=1001,
+                    yandex_public_url="https://example.invalid/schedule",
+                )
+                with patch.object(app, "download_public", side_effect=download), \
+                        patch.object(app, "parse_schedule", side_effect=parse), \
+                        patch.object(app, "_notify_admin", new=AsyncMock()), \
+                        self.assertRaisesRegex(ValueError, "stop after verifying"):
+                    await app._process_upcoming_sunday(
+                        MagicMock(), credentials, {}, cache, root,
+                        MagicMock(), MagicMock(), ZoneInfo("UTC"),
+                        backup_manager=manager,
+                    )
+                self.assertFalse(list(root.glob(".reminder-delivery-*")))
+
+        asyncio.run(scenario())
+
     def test_schedule_download_records_fresh_bytes_before_returning(self):
         from bot import app
 
