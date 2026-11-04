@@ -6551,11 +6551,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
     def test_section_shows_missed_autostart(self):
         handler = self.callback_handler("on_readiness")
-        today = datetime.now(ZoneInfo("UTC")).date()
-        year, month = (
-            (today.year + 1, 1) if today.month == 12
-            else (today.year, today.month + 1)
-        )
+        year, month = 2026, 12
         from bot import readiness as readiness_module
 
         start, deadline = readiness_module.schedule(
@@ -6590,9 +6586,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             after = await open_at(deadline + timedelta(hours=1))
             self.assertIn("Автозапуск выключен", after)
             self.assertIn("❗ Сейчас нужно запустить опрос вручную", after)
-            self.registry.set_readiness_settings(67890, "sound", enabled=True)
+            enabled_at = deadline + timedelta(hours=1)
+            with patch(
+                "bot.service_registry._utc_now",
+                return_value=enabled_at.isoformat(),
+            ):
+                self.registry.set_readiness_settings(
+                    67890, "sound", enabled=True
+                )
             # Включён только что (после окна) — не «ожидался».
-            late = await open_at(deadline + timedelta(hours=1))
+            late = await open_at(enabled_at)
             self.assertIn("Автозапуск включён после времени запуска", late)
             with closing(sqlite3.connect(self.registry.path)) as connection:
                 connection.execute(
