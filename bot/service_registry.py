@@ -5726,6 +5726,24 @@ class ServiceRegistry:
             if (new["day_from"], new["day_to"]) != (
                 current["day_from"], current["day_to"]
             ):
+                plans = connection.execute(
+                    "SELECT month, tasks_json FROM schedule_plans "
+                    "WHERE service_id = ? AND month >= ?",
+                    (service_id, _current_month()),
+                ).fetchall()
+                for plan in plans:
+                    tasks = json.loads(plan["tasks_json"])
+                    for task in tasks:
+                        if new["day_from"]:
+                            task["default_day"] = new["day_from"]
+                        else:
+                            task.pop("default_day", None)
+                    connection.execute(
+                        "UPDATE schedule_plans SET tasks_json = ?, updated_at = ? "
+                        "WHERE service_id = ? AND month = ?",
+                        (json.dumps(tasks, ensure_ascii=False), now,
+                         service_id, plan["month"]),
+                    )
                 self._mark_days_changed(connection, service_id)
             self._audit(
                 connection, actor_id, "readiness_settings_updated", service_id,

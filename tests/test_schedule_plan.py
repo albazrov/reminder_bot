@@ -6,7 +6,7 @@ import logging
 import tempfile
 import unittest
 import unittest.mock
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -1202,6 +1202,55 @@ class SchedulePlanTest(unittest.TestCase):
             schedule_plan.excel_text(
                 self.registry, self.service(), plan, self.people()
             ),
+        )
+
+    def test_service_window_updates_working_fallback_but_not_approved_dates(self):
+        self.registry.set_readiness_settings(
+            1001, "sound", day_from=-1, day_to=1
+        )
+        plan = self.draft()
+        plan["slots"]["2026-11-08"] = {"звук": ["Алексей"], "сборка": []}
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", plan["slots"],
+            chat_id=None, message_id=None, days=plan["days"],
+            served_offsets=schedule_plan.served_offsets(plan, people),
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+        )
+        for offset, end in ((0, 0), (-2, 1)):
+            self.registry.set_readiness_settings(
+                1001, "sound", day_from=offset, day_to=end
+            )
+            changed = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertTrue(changed["dirty"])
+            if offset == 0:
+                self.assertTrue(all(
+                    "default_day" not in task for task in changed["tasks"]
+                ))
+            self.assertEqual(
+                schedule_plan.task_moments(
+                    changed, {}, "2026-11-08", "звук"
+                )[0][0],
+                date(2026, 11, 8) + timedelta(days=offset),
+            )
+            self.assertEqual(
+                schedule_plan.task_moments(
+                    changed, {}, "2026-11-08", "звук", approved=True
+                )[0][0],
+                date(2026, 11, 7),
+            )
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", changed["slots"],
+            chat_id=None, message_id=None, days=changed["days"],
+            served_offsets=schedule_plan.served_offsets(changed, people),
+            approved_slot_days=schedule_plan.approved_slot_days(changed, people),
+        )
+        published = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertEqual(
+            schedule_plan.task_moments(
+                published, {}, "2026-11-08", "звук", approved=True
+            )[0][0],
+            date(2026, 11, 6),
         )
 
     def test_approved_reminder_keeps_published_personal_day(self):
