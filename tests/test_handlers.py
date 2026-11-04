@@ -1246,20 +1246,21 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             result_markup = close_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
-            self.assertEqual(
-                len(result_markup.inline_keyboard),
-                2,
+            self.assertIn(
+                "svc_tasks:open:sound",
+                [button.callback_data for row in result_markup.inline_keyboard
+                 for button in row],
             )
-            # Последнее 501 — подсказка навигации (тот же мок ответа, что у
-            # корня настройки): итоговый экран без «⬅️ …» убирает нижнюю
-            # клавиатуру вместе с ней.
+            self.assertIn(
+                "⚙️ ЗВУК", close_callback.message.answer.await_args.args[0]
+            )
             self.assertEqual(
                 [
                     call.kwargs["message_id"]
                     for call in self.context.bot.delete_message.await_args_list
                     if isinstance(call.kwargs["message_id"], int)
                 ],
-                [501, 502, 502, 503, 503, 501],
+                [501, 502, 502, 503, 503],
             )
 
         asyncio.run(run())
@@ -2023,6 +2024,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             handler_name = "on_notification_edit_back"
         elif button.callback_data.startswith("svc_tasks:"):
             handler_name = "on_service_tasks"
+        elif button.callback_data.startswith("notify_cancel:"):
+            handler_name = "on_notification_setting_cancel"
         elif button.callback_data.startswith("rdy:"):
             handler_name = "on_readiness"
         else:
@@ -2069,6 +2072,222 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             key=lambda slot: (slot[0], slot[1], slot[2] or ""),
         )
 
+    async def _open_task_notifications(self, task=None):
+        self.registry.add_service_admin(67890, "sound", 12345)
+        opened = SimpleNamespace(
+            data="svc_tasks:open:sound",
+            from_user=SimpleNamespace(id=12345),
+            message=self.message(12345, ""),
+            answer=AsyncMock(),
+        )
+        await self.callback_handler("on_service_tasks")(opened)
+        if task is None:
+            return await self._click(
+                opened.message, lambda button: button.text == "⏰ Всё служение"
+            )
+        card = await self._click(
+            opened.message, lambda button: button.text == f"🟢 {task}"
+        )
+        return await self._click(
+            card.message,
+            lambda button: button.text == "⏰ Напоминания и шаблоны",
+        )
+
+    def test_task_reminders_filter_weekday_status_and_empty_list(self):
+        async def run():
+            self.registry.set_service_task_day(67890, "sound", "звук", -4)
+            self.registry.set_service_default_template(
+                67890, "sound", "Общий шаблон {service_name}"
+            )
+            task_id = self.registry.add_group_reminder(
+                67890, "sound", 1, "10:30", "Текст задачи\nВторая строка",
+                task="звук",
+            )
+            self.registry.update_group_reminder(
+                67890, task_id, enabled=False
+            )
+            root = await self._open_task_notifications("звук")
+            menu = await self._click(
+                root.message, lambda button: button.text.startswith("⏰ Напоминания")
+            )
+            text = menu.message.answer.await_args.args[0]
+            self.assertIn("звук · напоминания", text)
+            self.assertIn("1. ⏸ вт · 10:30 · Текст задачи", text)
+            self.assertNotIn("Общий шаблон", text)
+            self.assertNotIn("Вторая строка", text)
+            card = await self._click(menu.message, lambda button: button.text == "1")
+            self.assertIn("дня задачи — ср", card.message.answer.await_args.args[0])
+
+            root = await self._open_task_notifications()
+            menu = await self._click(
+                root.message, lambda button: button.text.startswith("⏰ Напоминания")
+            )
+            text = menu.message.answer.await_args.args[0]
+            self.assertIn("Всё служение · напоминания", text)
+            self.assertIn("1. ✅ сб · 18:00 · Общий шаблон", text)
+            self.assertNotIn("Текст задачи", text)
+
+            root = await self._open_task_notifications("сборка")
+            menu = await self._click(
+                root.message, lambda button: button.text.startswith("⏰ Напоминания")
+            )
+            self.assertIn("Напоминаний нет", menu.message.answer.await_args.args[0])
+            self.assertTrue(any(
+                data.startswith("group_reminder:add:")
+                for data in self.callback_data_list(menu.message)
+            ))
+            self.context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_task_reminder_creation_keeps_scope_and_same_task_merge(self):
+        async def run():
+            self._preview_with_data()
+            async def add(menu, body):
+                await self._click(
+                    menu, lambda button: button.text == "➕ Добавить напоминание"
+                )
+                await self._type("1")
+                prompt = await self._type("18:00")
+                self.assertIn("{task_responsibles}", prompt.answer.await_args.args[0])
+                return await self._type(body)
+
+            root = await self._open_task_notifications("звук")
+            menu = await self._click(
+                root.message, lambda button: button.text.startswith("⏰ Напоминания")
+            )
+            card = await add(menu.message, "Звук: {task_responsibles}")
+            self.assertIn("📌 Задача: «звук»", card.answer.await_args.args[0])
+            # Same time as the general reminder is not a duplicate.
+            self.assertEqual(len(self.registry.list_group_reminders("sound")), 2)
+            menu = await self._click(
+                card, lambda button: button.text == "⬅️ К напоминаниям"
+            )
+            offer = await add(menu.message, "Второй текст")
+            self.assertIn("🔗 Объединить", [
+                button.text for row in offer.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+            ])
+            separate = await self._click(
+                offer, lambda button: button.text == "➕ Отдельным сообщением"
+            )
+            reminders = self.registry.list_group_reminders("sound")
+            self.assertEqual(
+                [item["task"] for item in reminders], [None, "звук", "звук"]
+            )
+            self.assertIn("«звук»", separate.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_scoped_reminder_task_change_moves_list_to_new_task(self):
+        async def run():
+            self.registry.add_group_reminder(
+                67890, "sound", 2, "10:00", task="звук"
+            )
+            root = await self._open_task_notifications("звук")
+            menu = await self._click(
+                root.message, lambda button: button.text.startswith("⏰ Напоминания")
+            )
+            card = await self._click(menu.message, lambda button: button.text == "1")
+            choices = await self._click(
+                card.message, lambda button: button.text == "📌 Задача"
+            )
+            moved = await self._click(
+                choices.message, lambda button: button.text.endswith(" сборка")
+            )
+            back = await self._click(
+                moved.message, lambda button: button.text == "⬅️ К напоминаниям"
+            )
+            self.assertIn("сборка · напоминания", back.message.answer.await_args.args[0])
+            self.assertEqual(len(self.callback_data_list(back.message)), 3)
+
+        asyncio.run(run())
+
+    def test_taskless_service_has_general_notifications_entry(self):
+        async def run():
+            self.registry.add_service_admin(67890, "books", 12345)
+            opened = SimpleNamespace(
+                data="svc_tasks:open:books",
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""), answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            root = await self._click(
+                opened.message, lambda button: button.text == "⏰ Всё служение"
+            )
+            self.assertIn("Всё служение", root.message.answer.await_args.args[0])
+            menu = await self._click(
+                root.message, lambda button: button.text.startswith("⏰ Напоминания")
+            )
+            self.assertTrue(any(
+                data.startswith("group_reminder:add:books:")
+                for data in self.callback_data_list(menu.message)
+            ))
+
+        asyncio.run(run())
+
+    def test_reminder_list_pages_match_numbers_and_reject_old_page_buttons(self):
+        async def run():
+            for index in range(1, 8):
+                self.registry.add_group_reminder(
+                    67890, "sound", 1, f"{index:02}:00",
+                    f"Текст {index} " + "длинный " * 20,
+                )
+            menu = await self._open_sound_reminders()
+            labels = [
+                button.text for row in menu.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+            ]
+            self.assertEqual([x for x in labels if x.isdecimal()],
+                             ["1", "2", "3", "4", "5", "6"])
+            self.assertIn("Страница 1/2", menu.message.answer.await_args.args[0])
+            self.assertIn("…", menu.message.answer.await_args.args[0])
+            page = await self._click(menu.message, lambda button: button.text == "➡️ Далее")
+            self.assertIn("7. ✅", page.message.answer.await_args.args[0])
+            stale = await self._click(menu.message, lambda button: button.text == "1")
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            stale.message.answer.assert_not_awaited()
+            card = await self._click(page.message, lambda button: button.text == "7")
+            self.assertIn("Текст 7", card.message.answer.await_args.args[0])
+            back = await self._click(
+                card.message, lambda button: button.text == "⬅️ К напоминаниям"
+            )
+            self.assertIn("Страница 2/2", back.message.answer.await_args.args[0])
+            previous = await self._click(
+                back.message, lambda button: button.text == "⬅️ Предыдущая"
+            )
+            self.assertIn("Страница 1/2", previous.message.answer.await_args.args[0])
+            for callback in self.callback_data_list(previous.message):
+                self.assertLessEqual(len(callback.encode("utf-8")), 64)
+
+        asyncio.run(run())
+
+    def test_notification_close_returns_card_rejects_stale_and_revoked_admin(self):
+        async def run():
+            old = await self._open_task_notifications("звук")
+            current = await self._open_task_notifications()
+            stale = await self._click(
+                old.message, lambda button: button.text == "✖️ Закрыть настройку"
+            )
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            stale.message.answer.assert_not_awaited()
+            closed = await self._click(
+                current.message, lambda button: button.text == "✖️ Закрыть настройку"
+            )
+            self.assertIn("⚙️ ЗВУК", closed.message.answer.await_args.args[0])
+            self.assertIn("svc_tasks:open:sound", self.callback_data_list(closed.message))
+            root = await self._open_task_notifications()
+            self.registry.remove_service_admin(67890, "sound", 12345)
+            denied = await self._click(
+                root.message, lambda button: button.text == "✖️ Закрыть настройку"
+            )
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+            denied.message.answer.assert_not_awaited()
+
+        asyncio.run(run())
+
     def test_guided_notification_setup_adds_independent_reminder(self):
         async def run():
             menu = await self._open_sound_reminders()
@@ -2113,7 +2332,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             })
             menu = await self._open_sound_reminders()
             card = await self._click(
-                menu.message, lambda button: button.text.startswith("📝 1 дн.")
+                menu.message, lambda button: button.text == "1"
             )
             confirm = await self._click(
                 card.message, lambda button: button.text == "📤 Отправить сейчас"
@@ -2151,7 +2370,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.registry.add_group_reminder(67890, "sound", 3, "10:30")
             menu = await self._open_sound_reminders()
             first = await self._click(
-                menu.message, lambda button: button.text.startswith("📝 1 дн.")
+                menu.message, lambda button: button.text == "1"
             )
             text = first.message.answer.await_args.args[0]
             self.assertIn("📋 Напоминание 1 из 2", text)
@@ -2187,7 +2406,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         async def run():
             menu = await self._open_sound_reminders()
             card = await self._click(
-                menu.message, lambda button: button.text.startswith("📝 1 дн.")
+                menu.message, lambda button: button.text == "1"
             )
             self.assertIn("📌 Задача: все задачи", card.message.answer.await_args.args[0])
             tasks = await self._click(
@@ -4933,9 +5152,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 selection_message
             )
             keyboard = selection_message.answer.await_args.kwargs["reply_markup"]
-            edit_button = keyboard.inline_keyboard[0][0]
+            edit_button = next(
+                button for row in keyboard.inline_keyboard for button in row
+                if button.callback_data == "svc_tasks:open:sound"
+            )
             self.assertEqual(
-                edit_button.callback_data, "service:edit_notify:sound"
+                edit_button.callback_data, "svc_tasks:open:sound"
             )
             self.assertIn(
                 "выберите параметр для изменения",
@@ -4966,7 +5188,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ),
                 answer=AsyncMock(),
             )
-            await self.callback_handler("on_service_selected")(callback)
+            await self.callback_handler("on_service_tasks")(callback)
+            task_card = await self._click(
+                callback.message, lambda button: button.text == "🟢 звук",
+                actor_id=24680,
+            )
+            callback = await self._click(
+                task_card.message,
+                lambda button: button.text == "⏰ Напоминания и шаблоны",
+                actor_id=24680,
+            )
             menu = callback.message.answer.await_args.kwargs["reply_markup"]
             self.assertIn(
                 "ℹ️ выберите, что изменить",
@@ -5882,7 +6113,6 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(message),
                 [
-                    "service:edit_notify:sound",
                     "service:service_contact:sound",
                     "service:service_excel:sound",
                     "rdy:open:sound",
@@ -5953,9 +6183,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("ЗВУК · задачи", screen)
             self.assertIn("🔴 🎶 спевка · выключена", screen)
 
-            toggle = await self._click(
+            task_card = await self._click(
                 opened.message,
                 lambda button: button.text == "🔴 спевка",
+                actor_id=67890,
+            )
+            toggle = await self._click(
+                task_card.message,
+                lambda button: button.text == "▶️ Включить задачу",
                 actor_id=67890,
             )
             self.assertTrue(
@@ -6551,11 +6786,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
     def test_section_shows_missed_autostart(self):
         handler = self.callback_handler("on_readiness")
-        today = datetime.now(ZoneInfo("UTC")).date()
-        year, month = (
-            (today.year + 1, 1) if today.month == 12
-            else (today.year, today.month + 1)
-        )
+        year, month = 2026, 12
         from bot import readiness as readiness_module
 
         start, deadline = readiness_module.schedule(
@@ -6590,9 +6821,16 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             after = await open_at(deadline + timedelta(hours=1))
             self.assertIn("Автозапуск выключен", after)
             self.assertIn("❗ Сейчас нужно запустить опрос вручную", after)
-            self.registry.set_readiness_settings(67890, "sound", enabled=True)
+            enabled_at = deadline + timedelta(hours=1)
+            with patch(
+                "bot.service_registry._utc_now",
+                return_value=enabled_at.isoformat(),
+            ):
+                self.registry.set_readiness_settings(
+                    67890, "sound", enabled=True
+                )
             # Включён только что (после окна) — не «ожидался».
-            late = await open_at(deadline + timedelta(hours=1))
+            late = await open_at(enabled_at)
             self.assertIn("Автозапуск включён после времени запуска", late)
             with closing(sqlite3.connect(self.registry.path)) as connection:
                 connection.execute(
@@ -6845,7 +7083,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             # Всё по служению, кроме назначения и снятия админов.
             self.assertEqual(
                 self.callback_data_list(callback.message),
-                ["service:edit_notify:sound", "service:service_contact:sound",
+                ["service:service_contact:sound",
                  "service:service_excel:sound",
                  "rdy:open:sound", "svc_tasks:open:sound",
                  "service:service_setup:sound", "service:service_help:sound",
