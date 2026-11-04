@@ -49,7 +49,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), b"fresh assignments")
                     raise ValueError("stop after verifying input")
 
-                manager.record_schedule_download = AsyncMock(side_effect=record)
+                manager.queue_schedule_download = AsyncMock(side_effect=record)
                 cache = MagicMock()
                 cache.matches_week.return_value = False
                 credentials = SimpleNamespace(
@@ -76,7 +76,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "schedule.xlsx"
                 manager = MagicMock()
-                manager.record_schedule_download = AsyncMock()
+                manager.queue_schedule_download = AsyncMock()
 
                 async def download(url, target, logger, **options):
                     target.write_bytes(b"fresh workbook")
@@ -87,8 +87,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                         backup_manager=manager, attempts=1, interval=0,
                     )
                 self.assertEqual(result.read_bytes(), b"fresh workbook")
-                manager.record_schedule_download.assert_awaited_once_with(path)
-                manager.clear_failure.assert_called_once_with("schedule-copy")
+                manager.queue_schedule_download.assert_awaited_once_with(path)
 
         asyncio.run(scenario())
 
@@ -97,7 +96,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         async def scenario():
             manager = MagicMock()
-            manager.record_schedule_download = AsyncMock(
+            manager.queue_schedule_download = AsyncMock(
                 side_effect=OSError("disk full")
             )
             manager.report_failure = AsyncMock()
@@ -121,7 +120,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         async def scenario():
             manager = MagicMock()
-            manager.record_schedule_download = AsyncMock()
+            manager.queue_schedule_download = AsyncMock()
             with patch.object(
                 app, "download_public", new=AsyncMock(side_effect=OSError("offline"))
             ), self.assertRaises(OSError):
@@ -129,7 +128,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     "https://example.invalid/schedule", Path("fresh.xlsx"),
                     MagicMock(), backup_manager=manager,
                 )
-            manager.record_schedule_download.assert_not_awaited()
+            manager.queue_schedule_download.assert_not_awaited()
 
         asyncio.run(scenario())
 

@@ -267,6 +267,9 @@ class BackupManager:
         self._snapshot_validation_cache: dict[Path, tuple[tuple, bool]] = {}
         self._failure_notices: set[str] = set()
         self._storage_levels: dict[Path, str] = {}
+        self._schedule_copy_task: asyncio.Task | None = None
+        self._pending_schedule_copy: Path | None = None
+        self._closing = False
 
     def set_failure_callback(
         self, callback: Callable[[str], Awaitable[None]]
@@ -329,6 +332,50 @@ class BackupManager:
         self.clear_failure("schedule-copy")
         if changed and self._debounce_handle is None:
             self.mark_dirty()
+
+    async def queue_schedule_download(self, source: Path) -> None:
+        """Retain a RAM copy; external disk work never blocks reminder rendering."""
+        fd, name = tempfile.mkstemp(
+            prefix=".schedule-queued-", suffix=".xlsx", dir=self.shm_dir
+        )
+        os.close(fd)
+        retained = Path(name)
+        queued = False
+        try:
+            await self._complete_io(lambda: shutil.copyfile(source, retained))
+            if self._pending_schedule_copy is not None:
+                self._pending_schedule_copy.unlink(missing_ok=True)
+            self._pending_schedule_copy = retained
+            queued = True
+            if self._schedule_copy_task is None or self._schedule_copy_task.done():
+                self._schedule_copy_task = self.start_task(
+                    self._drain_schedule_copies(), name="reminder-bot-schedule-copy"
+                )
+        finally:
+            if not queued:
+                retained.unlink(missing_ok=True)
+
+    async def _drain_schedule_copies(self) -> None:
+        while self._pending_schedule_copy is not None:
+            path = self._pending_schedule_copy
+            self._pending_schedule_copy = None
+            try:
+                await self.record_schedule_download(path)
+            except Exception as exc:
+                self.logger.exception("Не удалось сохранить постоянную копию Excel")
+                await self.report_failure(
+                    "schedule-copy",
+                    "Не удалось сохранить постоянную копию Excel: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                await self.check_storage()
+            finally:
+                path.unlink(missing_ok=True)
+
+    async def run_storage_checks(self) -> None:
+        while True:
+            await self.check_storage()
+            await asyncio.sleep(SCHEDULE_RETRY_SECONDS)
 
     def _record_schedule_download(self, path: Path) -> bool:
         self._require_external_mount()
@@ -406,6 +453,8 @@ class BackupManager:
 
     def mark_dirty(self) -> None:
         """Restart the quiet-period timer after a persistent data change."""
+        if self._closing:
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -440,6 +489,7 @@ class BackupManager:
         self.start_background_backup("изменение данных")
 
     async def close(self) -> None:
+        self._closing = True
         if self._debounce_handle is not None:
             self._debounce_handle.cancel()
             self._debounce_handle = None

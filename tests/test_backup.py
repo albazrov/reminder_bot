@@ -172,6 +172,38 @@ class BackupManagerTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_queued_download_returns_while_snapshot_lock_is_busy_and_keeps_input(self):
+        async def scenario():
+            good = self.xlsx.read_bytes()
+            await self.manager._backup_lock.acquire()
+            try:
+                await asyncio.wait_for(
+                    self.manager.queue_schedule_download(self.xlsx), timeout=1
+                )
+                self.xlsx.unlink()
+                self.assertFalse(self.manager.saved_schedule.exists())
+            finally:
+                self.manager._backup_lock.release()
+            await self.manager.close()
+            self.assertEqual(self.manager.saved_schedule.read_bytes(), good)
+            self.assertFalse(list(self.shm_dir.glob(".schedule-queued-*")))
+            self.assertIsNone(self.manager._debounce_handle)
+
+        asyncio.run(scenario())
+
+    def test_storage_checks_repeat_every_five_minutes_while_idle(self):
+        async def scenario():
+            checks = AsyncMock()
+            pauses = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+            with patch.object(self.manager, "check_storage", checks), \
+                    patch("bot.backup.asyncio.sleep", pauses):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.manager.run_storage_checks()
+            self.assertEqual(checks.await_count, 2)
+            self.assertEqual([call.args[0] for call in pauses.await_args_list], [300, 300])
+
+        asyncio.run(scenario())
+
     def test_download_cleans_up_space_before_publishing_copy(self):
         events = []
         original = self.manager._replace_schedule
