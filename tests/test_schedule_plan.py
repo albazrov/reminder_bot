@@ -1204,7 +1204,12 @@ class SchedulePlanTest(unittest.TestCase):
             ),
         )
 
-    def test_service_window_updates_working_fallback_but_not_approved_dates(self):
+    @unittest.mock.patch(
+        "bot.service_registry._current_month", return_value="2026-10"
+    )
+    def test_service_window_updates_working_fallback_but_not_approved_dates(
+        self, _month,
+    ):
         self.registry.set_readiness_settings(
             1001, "sound", day_from=-1, day_to=1
         )
