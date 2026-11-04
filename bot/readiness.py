@@ -1045,6 +1045,7 @@ async def replay_early_answers(registry, poll_id: str,
 
 _POLL_GONE = (
     "poll has already been closed",
+    "message with poll to stop not found",
     "message to stop not found",
     "message not found",
     "message_id_invalid",

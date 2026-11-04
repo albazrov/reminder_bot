@@ -830,6 +830,59 @@ class ReadinessFlowTest(unittest.TestCase):
         ))
         bot.send_message.assert_not_awaited()
 
+    def test_missing_poll_completes_close_without_retry(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        bot = fake_bot()
+        run = self.launch(bot)
+        bot.stop_poll.side_effect = TelegramBadRequest(
+            method=SimpleNamespace(),
+            message="Bad Request: message with poll to stop not found",
+        )
+
+        asyncio.run(readiness.close_run(
+            bot, self.registry, run, self.service(), TZ, 1001, LOG, 4096,
+        ))
+
+        closed = self.registry.get_readiness_run_by_id(run["id"])
+        self.assertEqual(closed["status"], "closed")
+        self.assertTrue(closed["result_sent"])
+        with self.subTest(step="poll_stopped"):
+            self.assertTrue(closed["poll_stopped"])
+        with self.subTest(step="closed_announced"):
+            self.assertTrue(closed["closed_announced"])
+        with self.subTest(step="unfinished_runs"):
+            self.assertEqual(
+                [item["id"] for item in self.registry.list_unfinished_readiness_runs()],
+                [],
+            )
+
+        bot.stop_poll.reset_mock()
+        bot.send_message.reset_mock()
+        self.tick(bot, datetime.now(TZ))
+        with self.subTest(step="stop_not_retried"):
+            bot.stop_poll.assert_not_awaited()
+        with self.subTest(step="messages_not_repeated"):
+            bot.send_message.assert_not_awaited()
+
+    def test_stop_poll_preserves_retry_for_other_errors(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        run = {"id": 7, "chat_id": -1005555, "message_id": 12}
+        for error in (
+            TimeoutError("network timeout"),
+            TelegramBadRequest(
+                method=SimpleNamespace(),
+                message="Bad Request: not enough rights to stop poll",
+            ),
+        ):
+            with self.subTest(error=type(error).__name__):
+                bot = fake_bot()
+                bot.stop_poll.side_effect = error
+                self.assertFalse(asyncio.run(
+                    readiness.stop_run_poll(bot, run, LOG)
+                ))
+
     def test_close_retries_stop_and_result(self):
         bot = fake_bot()
         run = self.launch(bot)

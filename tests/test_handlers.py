@@ -7337,6 +7337,76 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_excel_import_preserves_source_date_over_personal_day(self):
+        from bot import schedule_plan
+        from bot.excel_parser import RosterMember, ServiceAssignment, ServiceEvent
+
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            self.registry.sync_service_rosters({
+                "sound": [RosterMember("Алексей", ("звук",))],
+            })
+            self.registry.set_responsible_contact(
+                67890, "sound", "звук", "Алексей", 11111, "alex"
+            )
+            self.registry.set_service_member_day(
+                67890, "sound", "Алексей", -3
+            )
+            self.context.load_upcoming_service_events = AsyncMock(return_value=[
+                ServiceEvent("sound", date(2026, 11, 8), (
+                    ServiceAssignment("звук", "Алексей"),
+                )),
+            ])
+
+            def callback(data):
+                return SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=24680),
+                    message=self.message(24680, ""), answer=AsyncMock(),
+                )
+
+            load = callback("xls:load:sound:202611")
+            await self.callback_handler("on_excel_schedule")(load)
+            with self.subTest(stage="preview"):
+                preview = load.message.answer.await_args.args[0]
+                self.assertIn("08.11: звук — Алексей;", preview)
+            confirm = next(
+                button.callback_data
+                for row in load.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("xls:ok:sound:")
+            )
+            await self.callback_handler("on_excel_schedule")(callback(confirm))
+
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan["source"], "excel")
+            self.assertEqual(plan["approved"], plan["slots"])
+            with self.subTest(stage="approved_day"):
+                self.assertEqual(
+                    plan["approved_slot_days"]["2026-11-08"]["звук"]["Алексей"],
+                    0,
+                )
+            with self.subTest(stage="history_day"):
+                self.assertEqual(
+                    plan["served_offsets"].get("2026-11-08", {}).get("Алексей", 0),
+                    0,
+                )
+            with self.subTest(stage="reminder_events"):
+                self.assertEqual(
+                    [
+                        (item.event_date, assignment.name)
+                        for item in schedule_plan.plan_events(
+                            plan, self.registry.readiness_people("sound")
+                        )
+                        for assignment in item.assignments
+                    ],
+                    [(date(2026, 11, 8), "Алексей")],
+                )
+
+        asyncio.run(run())
+
     def test_member_week_tasks(self):
         async def run():
             members = await self.open_members()
