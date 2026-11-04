@@ -267,6 +267,11 @@ class BackupManager:
         self._snapshot_validation_cache: dict[Path, tuple[tuple, bool]] = {}
         self._failure_notices: set[str] = set()
         self._storage_levels: dict[Path, str] = {}
+        self._schedule_copy_task: asyncio.Task | None = None
+        self._pending_schedule_copy: tuple[int, Path] | None = None
+        self._schedule_generation = 0
+        self._published_schedule_generation = 0
+        self._closing = False
 
     def set_failure_callback(
         self, callback: Callable[[str], Awaitable[None]]
@@ -324,11 +329,80 @@ class BackupManager:
 
     async def record_schedule_download(self, path: Path) -> None:
         """Publish verified bytes for backups only, never for delivery fallback."""
+        self._schedule_generation += 1
+        await self._publish_schedule_download(path, self._schedule_generation)
+
+    async def _publish_schedule_download(self, path: Path, generation: int) -> None:
         async with self._backup_lock:
-            changed = await self._complete_io(lambda: self._record_schedule_download(path))
+            if generation < self._published_schedule_generation:
+                return
+
+            def publish() -> bool:
+                changed = self._record_schedule_download(path)
+                self._published_schedule_generation = generation
+                return changed
+
+            changed = await self._complete_io(publish)
         self.clear_failure("schedule-copy")
         if changed and self._debounce_handle is None:
             self.mark_dirty()
+
+    async def queue_schedule_download(self, source: Path) -> None:
+        """Retain a RAM copy; external disk work never blocks reminder rendering."""
+        self._schedule_generation += 1
+        generation = self._schedule_generation
+        fd, name = tempfile.mkstemp(
+            prefix=".schedule-queued-", suffix=".xlsx", dir=self.shm_dir
+        )
+        os.close(fd)
+        retained = Path(name)
+        queued = False
+        try:
+            def retain_valid_download() -> None:
+                if not _is_owned_regular_file(source):
+                    raise PermissionError(f"Скачанное расписание небезопасно: {source}")
+                shutil.copyfile(source, retained)
+                self._parse_schedule(retained)
+
+            await self._complete_io(retain_valid_download)
+            if generation < self._published_schedule_generation:
+                return
+            if self._pending_schedule_copy is not None:
+                previous_generation, previous_path = self._pending_schedule_copy
+                if generation < previous_generation:
+                    return
+                previous_path.unlink(missing_ok=True)
+            self._pending_schedule_copy = (generation, retained)
+            queued = True
+            if self._schedule_copy_task is None or self._schedule_copy_task.done():
+                self._schedule_copy_task = self.start_task(
+                    self._drain_schedule_copies(), name="reminder-bot-schedule-copy"
+                )
+        finally:
+            if not queued:
+                retained.unlink(missing_ok=True)
+
+    async def _drain_schedule_copies(self) -> None:
+        while self._pending_schedule_copy is not None:
+            generation, path = self._pending_schedule_copy
+            self._pending_schedule_copy = None
+            try:
+                await self._publish_schedule_download(path, generation)
+            except Exception as exc:
+                self.logger.exception("Не удалось сохранить постоянную копию Excel")
+                await self.report_failure(
+                    "schedule-copy",
+                    "Не удалось сохранить постоянную копию Excel: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                await self.check_storage()
+            finally:
+                path.unlink(missing_ok=True)
+
+    async def run_storage_checks(self) -> None:
+        while True:
+            await self.check_storage()
+            await asyncio.sleep(SCHEDULE_RETRY_SECONDS)
 
     def _record_schedule_download(self, path: Path) -> bool:
         self._require_external_mount()
@@ -406,6 +480,8 @@ class BackupManager:
 
     def mark_dirty(self) -> None:
         """Restart the quiet-period timer after a persistent data change."""
+        if self._closing:
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -440,6 +516,7 @@ class BackupManager:
         self.start_background_backup("изменение данных")
 
     async def close(self) -> None:
+        self._closing = True
         if self._debounce_handle is not None:
             self._debounce_handle.cancel()
             self._debounce_handle = None

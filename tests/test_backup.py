@@ -172,6 +172,86 @@ class BackupManagerTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_queued_download_returns_while_snapshot_lock_is_busy_and_keeps_input(self):
+        async def scenario():
+            good = self.xlsx.read_bytes()
+            await self.manager._backup_lock.acquire()
+            try:
+                await asyncio.wait_for(
+                    self.manager.queue_schedule_download(self.xlsx), timeout=1
+                )
+                self.xlsx.unlink()
+                self.assertFalse(self.manager.saved_schedule.exists())
+            finally:
+                self.manager._backup_lock.release()
+            await self.manager.close()
+            self.assertEqual(self.manager.saved_schedule.read_bytes(), good)
+            self.assertFalse(list(self.shm_dir.glob(".schedule-queued-*")))
+            self.assertIsNone(self.manager._debounce_handle)
+
+        asyncio.run(scenario())
+
+    def test_storage_checks_repeat_every_five_minutes_while_idle(self):
+        async def scenario():
+            checks = AsyncMock()
+            pauses = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+            with patch.object(self.manager, "check_storage", checks), \
+                    patch("bot.backup.asyncio.sleep", pauses):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.manager.run_storage_checks()
+            self.assertEqual(checks.await_count, 2)
+            self.assertEqual([call.args[0] for call in pauses.await_args_list], [300, 300])
+
+        asyncio.run(scenario())
+
+    def test_daily_refresh_cannot_be_overwritten_by_older_pending_download(self):
+        async def scenario():
+            older = self.shm_dir / "older.xlsx"
+            newer = self.shm_dir / "newer.xlsx"
+            for path, comment in ((older, b"older"), (newer, b"newer")):
+                shutil.copyfile(self.xlsx, path)
+                with zipfile.ZipFile(path, "a") as workbook:
+                    workbook.comment = comment
+            await self.manager._backup_lock.acquire()
+            try:
+                await self.manager.queue_schedule_download(self.xlsx)
+                await asyncio.sleep(0)
+                await self.manager.queue_schedule_download(older)
+                refresh = asyncio.create_task(self.manager.record_schedule_download(newer))
+                await asyncio.sleep(0)
+            finally:
+                self.manager._backup_lock.release()
+            await refresh
+            await self.manager.close()
+            self.assertEqual(self.manager.saved_schedule.read_bytes(), newer.read_bytes())
+            self.assertEqual(self.xlsx.read_bytes(), newer.read_bytes())
+            self.assertFalse(list(self.shm_dir.glob(".schedule-queued-*")))
+
+        asyncio.run(scenario())
+
+    def test_invalid_download_keeps_last_valid_pending_copy(self):
+        async def scenario():
+            valid = self.shm_dir / "valid.xlsx"
+            shutil.copyfile(self.xlsx, valid)
+            with zipfile.ZipFile(valid, "a") as workbook:
+                workbook.comment = b"valid pending"
+            bad = self.shm_dir / "invalid.xlsx"
+            bad.write_bytes(b"not Excel")
+            await self.manager._backup_lock.acquire()
+            try:
+                await self.manager.queue_schedule_download(self.xlsx)
+                await asyncio.sleep(0)
+                await self.manager.queue_schedule_download(valid)
+                with self.assertRaises(zipfile.BadZipFile):
+                    await self.manager.queue_schedule_download(bad)
+            finally:
+                self.manager._backup_lock.release()
+            await self.manager.close()
+            self.assertEqual(self.manager.saved_schedule.read_bytes(), valid.read_bytes())
+            self.assertFalse(list(self.shm_dir.glob(".schedule-queued-*")))
+
+        asyncio.run(scenario())
+
     def test_download_cleans_up_space_before_publishing_copy(self):
         events = []
         original = self.manager._replace_schedule

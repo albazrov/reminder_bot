@@ -493,7 +493,7 @@ async def _download_schedule(
     await download_public(public_url, path, logger, **options)
     if backup_manager is not None:
         try:
-            await backup_manager.record_schedule_download(path)
+            await backup_manager.queue_schedule_download(path)
         except Exception as exc:
             logger.exception("Не удалось сохранить постоянную копию Excel")
             await backup_manager.report_failure(
@@ -502,8 +502,6 @@ async def _download_schedule(
                 f"{type(exc).__name__}: {exc}",
             )
             await backup_manager.check_storage()
-        else:
-            backup_manager.clear_failure("schedule-copy")
     return path
 
 
@@ -2020,6 +2018,7 @@ async def _run_locked(args: CliArgs) -> None:
     scheduler = None
     nightly_backup_task: asyncio.Task | None = None
     schedule_refresh_task: asyncio.Task | None = None
+    storage_check_task: asyncio.Task | None = None
     commands_task: asyncio.Task | None = None
     pid_created = False
     active_jobs: set[asyncio.Task[None]] = set()
@@ -2617,6 +2616,10 @@ async def _run_locked(args: CliArgs) -> None:
                 backup_manager.run_schedule_refresh(download_backup_schedule),
                 name="reminder-bot-schedule-refresh",
             )
+            storage_check_task = asyncio.create_task(
+                backup_manager.run_storage_checks(),
+                name="reminder-bot-storage-check",
+            )
             nightly_backup_task = asyncio.create_task(
                 backup_manager.run_nightly(),
                 name="reminder-bot-nightly-backup",
@@ -2628,7 +2631,7 @@ async def _run_locked(args: CliArgs) -> None:
         await dp.start_polling(bot, close_bot_session=False)
     finally:
         for background_task in (
-            nightly_backup_task, schedule_refresh_task, commands_task
+            nightly_backup_task, schedule_refresh_task, storage_check_task, commands_task
         ):
             if background_task is not None:
                 background_task.cancel()
