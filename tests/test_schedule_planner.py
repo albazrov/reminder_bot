@@ -2,7 +2,10 @@ import time
 import unittest
 from datetime import date, timedelta
 
-from bot.schedule_planner import PlanInput, build_plan, open_dates, plan_cost
+from bot.schedule_planner import (
+    Plan, PlanInput, _prefer_bundles, _spread_soft_limits,
+    build_plan, improve_plan, open_dates, plan_cost,
+)
 
 SUNDAYS = tuple(date(2026, 11, 1) + timedelta(weeks=week) for week in range(5))
 
@@ -44,6 +47,133 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.covered(), 1)
         self.assertEqual(len(plan.gaps()), 1)
 
+    def test_shared_actual_day_reassigns_an_earlier_week_to_fill_required_seat(self):
+        first, second = SUNDAYS[:2]
+        shared = first + timedelta(days=1)
+        for high in (None, 1, 0):
+            with self.subTest(month_max=high):
+                data = PlanInput(
+                    dates=(first, second), needed={"X": 1, "Y": 1},
+                    extra={"X": 1},
+                    free={person: frozenset({first, second}) for person in "AB"},
+                    tasks={"A": frozenset({"X", "Y"}), "B": frozenset({"X"})},
+                    availability={
+                        "A": frozenset({(shared, "X"), (shared, "Y")}),
+                        "B": frozenset({(shared, "X")}),
+                    },
+                    limits={person: (0, high) for person in "AB"},
+                    slot_dates={
+                        (first, "X", person): shared for person in "AB"
+                    } | {(second, "Y", "A"): shared},
+                )
+
+                plan = build_plan(data)
+
+                self.assertEqual(plan.covered_required(), 2)
+                self.assertEqual(plan.covered(), 2)
+                self.assertEqual(plan.slots[(first, "X")], ["B"])
+                self.assertEqual(plan.slots[(second, "Y")], ["A"])
+                self.assertEqual(plan.load(), {"A": 1, "B": 1})
+                self.assertIs(plan.slot_dates, data.slot_dates)
+
+    def test_shared_actual_day_repair_follows_a_chain_and_keeps_other_assignments(self):
+        first, second = SUNDAYS[:2]
+        shared = first + timedelta(days=1)
+        allowed = {"A": {"X", "Y"}, "B": {"X", "Z"}, "C": {"Z"}, "D": {"W"}}
+        data = PlanInput(
+            dates=(first, second), needed=dict.fromkeys(("X", "Y", "Z", "W"), 1),
+            free={person: frozenset({first, second}) for person in allowed},
+            tasks={person: frozenset(tasks) for person, tasks in allowed.items()},
+            availability={
+                person: frozenset((shared, task) for task in tasks)
+                for person, tasks in allowed.items()
+            },
+            limits={person: (0, 1) for person in allowed},
+            slot_dates={
+                (second if task == "Y" else first, task, person): shared
+                for person, tasks in allowed.items() for task in tasks
+            },
+        )
+
+        plan = build_plan(data)
+
+        self.assertEqual(plan.covered_required(), 4)
+        for task, person in (("X", "B"), ("Y", "A"), ("Z", "C"), ("W", "D")):
+            self.assertEqual(
+                plan.slots[(second if task == "Y" else first, task)], [person],
+            )
+        self.assertEqual(plan.load(), dict.fromkeys(allowed, 1))
+
+    def test_bundle_preference_keeps_same_day_linked_tasks_on_distinct_people(self):
+        day = SUNDAYS[0]
+        pair = frozenset({"X", "Y"})
+        data = PlanInput(
+            dates=(day,), needed={"X": 1, "Y": 1},
+            free={person: frozenset({day}) for person in "AB"},
+            tasks={person: pair for person in "AB"},
+            bundles={"A": pair},
+        )
+
+        plan = build_plan(data)
+
+        self.assertEqual(plan.covered_required(), 2)
+        self.assertEqual(sorted(plan.load().values()), [1, 1])
+
+    def test_bundle_preference_checks_collisions_in_other_weeks(self):
+        first, second = SUNDAYS[:2]
+        shared = first + timedelta(days=1)
+        data = PlanInput(
+            dates=(first, second), needed={"X": 1, "Y": 1},
+            free={person: frozenset({first, second}) for person in "AB"},
+            tasks={person: frozenset({"X", "Y"}) for person in "AB"},
+            bundles={"A": frozenset({"X", "Y"})},
+            slot_dates={
+                (first, "X", "A"): shared,
+                (second, "Y", "A"): shared,
+            },
+        )
+        slots = {
+            (first, "X"): ["A"], (first, "Y"): [],
+            (second, "X"): ["A"], (second, "Y"): ["B"],
+        }
+        plan = Plan(
+            slots={key: list(names) for key, names in slots.items()},
+            needed=data.needed, slot_dates=data.slot_dates,
+        )
+
+        _prefer_bundles(plan, data)
+
+        self.assertEqual(plan.slots, slots)
+
+    def test_soft_limit_replacement_checks_collisions_in_other_weeks(self):
+        first, second, third = SUNDAYS[:3]
+        shared = first + timedelta(days=1)
+        data = PlanInput(
+            dates=(first, second, third), needed={"X": 1, "Y": 1},
+            free={
+                "A": frozenset({first, third}),
+                "B": frozenset({first, second}),
+            },
+            tasks={"A": frozenset({"X"}), "B": frozenset({"X", "Y"})},
+            limits={"A": (0, 1), "B": (0, 3)},
+            slot_dates={
+                (first, "X", "B"): shared,
+                (second, "Y", "B"): shared,
+            },
+        )
+        slots = {
+            (first, "X"): ["A"], (second, "Y"): ["B"], (third, "X"): ["A"],
+        }
+        plan = Plan(
+            slots={key: list(names) for key, names in slots.items()},
+            needed=data.needed, slot_dates=data.slot_dates,
+        )
+
+        _spread_soft_limits(plan, data)
+
+        self.assertEqual(plan.slots, slots)
+        self.assertEqual(plan.load(), {"A": 2, "B": 1})
+
     def test_only_free_people_with_the_task_are_assigned(self):
         day = SUNDAYS[0]
         plan = build_plan(plan_input(
@@ -74,6 +204,21 @@ class SchedulePlannerTest(unittest.TestCase):
         order = [plan.slots[(day, "звук")][0] for day in SUNDAYS[:4]]
         self.assertTrue(all(a != b for a, b in zip(order, order[1:])))
 
+    def test_month_wide_reassignment_avoids_consecutive_weeks(self):
+        first, second, third = SUNDAYS[:3]
+        plan = build_plan(plan_input(
+            {"Алексей": {first, second}, "Борис": {first, third}},
+            {"Алексей": {"звук"}, "Борис": {"звук"}},
+            needed={"звук": 1}, dates=(first, second, third),
+        ))
+
+        self.assertEqual(plan.covered_required(), 3)
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(
+            [plan.slots[(day, "звук")] for day in (first, second, third)],
+            [["Борис"], ["Алексей"], ["Борис"]],
+        )
+
     def test_previous_month_counts_for_interval(self):
         plan = build_plan(plan_input(
             {"Алексей": {SUNDAYS[0], SUNDAYS[1]}, "Борис": {SUNDAYS[0], SUNDAYS[1]}},
@@ -84,6 +229,142 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.slots[(SUNDAYS[0], "звук")], ["Борис"])
         self.assertEqual(plan.slots[(SUNDAYS[1], "звук")], ["Алексей"])
+
+    def test_month_wide_improvement_keeps_linked_tasks_together(self):
+        first, second, third = SUNDAYS[:3]
+        bundle = frozenset({"звук", "спевка"})
+        data = PlanInput(
+            dates=(first, second, third),
+            needed={"звук": 1, "спевка": 1},
+            free={
+                "Алексей": frozenset({first, second}),
+                "Борис": frozenset({first, third}),
+            },
+            tasks={"Алексей": bundle, "Борис": bundle},
+            bundles={"Алексей": bundle, "Борис": bundle},
+            slot_dates={
+                (day, task, person): day - timedelta(
+                    days=3 if task == "спевка" else 0
+                )
+                for day in (first, second, third) for task in bundle
+                for person in ("Алексей", "Борис")
+            },
+        )
+        plan = build_plan(data)
+
+        self.assertEqual(plan.covered_required(), 6)
+        for day, person in zip((first, second, third), ("Борис", "Алексей", "Борис")):
+            for task in bundle:
+                self.assertEqual(plan.slots[(day, task)], [person])
+        self.assertEqual(plan.load(), {"Алексей": 2, "Борис": 4})
+
+    def test_improvement_checks_actual_day_collisions_across_weeks(self):
+        dates = SUNDAYS[:4]
+        shared_day = dates[0] + timedelta(days=6)
+        data = PlanInput(
+            dates=dates, needed={"звук": 1, "спевка": 1},
+            free={"Алексей": frozenset(dates), "Борис": frozenset(dates[:2])},
+            tasks={
+                "Алексей": frozenset({"звук"}),
+                "Борис": frozenset({"звук", "спевка"}),
+            },
+            availability={"Борис": frozenset({
+                (shared_day, "звук"), (shared_day, "спевка"),
+            })},
+            slot_dates={
+                (dates[0], "звук", "Борис"): shared_day,
+                (dates[1], "спевка", "Борис"): shared_day,
+            },
+        )
+        slots = {(day, "звук"): ["Алексей"] for day in dates}
+        slots[(dates[1], "спевка")] = ["Борис"]
+        plan = Plan(
+            slots={key: list(people) for key, people in slots.items()},
+            needed=data.needed, slot_dates=data.slot_dates,
+        )
+        before = plan_cost(plan, data)
+
+        improve_plan(plan, data)
+
+        self.assertEqual(plan.slots, slots)
+        self.assertLessEqual(plan_cost(plan, data), before)
+
+    def test_improvement_does_not_exceed_avoidable_month_max(self):
+        first, second, third = SUNDAYS[:3]
+        plan = build_plan(plan_input(
+            {"Алексей": {first, second}, "Борис": {first, third}},
+            {"Алексей": {"звук"}, "Борис": {"звук"}},
+            needed={"звук": 1}, dates=(first, second, third),
+            limits={"Алексей": (0, 2), "Борис": (0, 1)},
+        ))
+
+        self.assertEqual(plan.covered_required(), 3)
+        self.assertEqual(plan.load(), {"Алексей": 2, "Борис": 1})
+
+    def test_improvement_preserves_eligible_holder_of_extra_seat(self):
+        dates = (SUNDAYS[0], SUNDAYS[2], SUNDAYS[4])
+        data = PlanInput(
+            dates=dates, needed={"звук": 1, "сборка": 2}, extra={"звук": 1},
+            free={
+                "Анна": frozenset(dates),
+                "Борис": frozenset({dates[0]}),
+                "Вера": frozenset({dates[0]}),
+            },
+            tasks={
+                "Анна": frozenset({"звук"}),
+                "Борис": frozenset({"звук", "сборка"}),
+                "Вера": frozenset({"звук", "сборка"}),
+            },
+            slot_dates={
+                (dates[0], "сборка", person): dates[0] - timedelta(days=4)
+                for person in ("Борис", "Вера")
+            },
+        )
+        plan = Plan(
+            slots={
+                (dates[0], "звук"): ["Анна", "Борис"],
+                (dates[0], "сборка"): ["Борис", "Вера"],
+                (dates[1], "звук"): ["Анна"],
+                (dates[2], "звук"): ["Анна"],
+            },
+            needed=data.needed, slot_dates=data.slot_dates,
+        )
+
+        improve_plan(plan, data)
+
+        self.assertIn("Анна", plan.slots[(dates[0], "звук")])
+        self.assertEqual(len(plan.slots[(dates[0], "звук")]), 2)
+
+    def test_improvement_rechecks_existing_extra_after_required_swap(self):
+        dates = (SUNDAYS[0], SUNDAYS[2], SUNDAYS[4])
+        data = PlanInput(
+            dates=dates, needed={"звук": 1, "сборка": 1}, extra={"звук": 1},
+            free={person: frozenset(dates) for person in ("Анна", "Борис", "Вера")},
+            tasks={
+                "Анна": frozenset({"звук"}),
+                "Борис": frozenset({"сборка"}),
+                "Вера": frozenset({"звук", "сборка"}),
+            },
+            reluctant=frozenset({"Анна"}), limits={"Борис": (0, 1)},
+            slot_dates={
+                (day, "сборка", person): day - timedelta(days=4)
+                for day in dates for person in ("Борис", "Вера")
+            },
+        )
+        plan = Plan(
+            slots={
+                (dates[0], "звук"): ["Анна", "Вера"],
+                (dates[0], "сборка"): ["Борис"],
+                (dates[1], "сборка"): ["Вера"],
+                (dates[2], "сборка"): ["Вера"],
+            },
+            needed=data.needed, slot_dates=data.slot_dates,
+        )
+
+        improve_plan(plan, data)
+
+        self.assertIn("Вера", plan.slots[(dates[0], "звук")])
+        self.assertNotIn("Вера", plan.slots[(dates[0], "сборка")])
 
     def test_people_needed_two(self):
         day = SUNDAYS[0]
@@ -153,9 +434,9 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.slots[(day, "звук")], ["Алексей"])
 
-    def test_interval_before_response(self):
-        # Ответивший свободен все воскресенья, но служить подряд хуже,
-        # чем поставить не ответившего (решение 12).
+    def test_silent_is_used_only_after_respondents(self):
+        # Ответивший доступен во все недели; молчун остаётся резервом,
+        # даже если распределение ответившего создаёт служения подряд.
         plan = build_plan(plan_input(
             {"Алексей": set(SUNDAYS[:4]), "Борис": set(SUNDAYS[:4])},
             {"Алексей": {"звук"}, "Борис": {"звук"}},
@@ -163,7 +444,7 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(
             [plan.slots[(day, "звук")] for day in SUNDAYS[:4]],
-            [["Алексей"], ["Борис"], ["Алексей"], ["Борис"]],
+            [["Алексей"]] * 4,
         )
         # Служила в последнее воскресенье октября — 01.11 не ставится,
         # хотя отметила больше дат.
@@ -212,23 +493,230 @@ class SchedulePlannerTest(unittest.TestCase):
             plan.slots[(dates[0], "звук")], plan.slots[(dates[1], "звук")]
         )
 
-    def test_month_max_is_hard_even_if_all_dates_marked(self):
-        # Анна отметила всё, но максимум 1 — остальное закрывает Вера,
-        # а где закрыть некем — место пустое.
+    def test_extra_seat_can_use_person_serving_later_in_month(self):
+        first, later = SUNDAYS[0], SUNDAYS[3]
+        plan = build_plan(plan_input(
+            {"А": {first}, "Б": {first, later}},
+            {"А": {"звук"}, "Б": {"звук"}},
+            needed={"звук": 1}, extra={"звук": 1},
+            dates=(first, later),
+        ))
+        self.assertEqual(len(plan.slots[(first, "звук")]), 2)
+        self.assertEqual(plan.slots[(later, "звук")], ["Б"])
+
+    def test_month_max_is_soft_when_coverage_needs_it(self):
+        # Желательный максимум распределяет места, но не блокирует
+        # обязательные назначения, когда других кандидатов нет.
         plan = build_plan(plan_input(
             {"Анна": set(SUNDAYS), "Вера": {SUNDAYS[1], SUNDAYS[3]}},
             {"Анна": {"звук"}, "Вера": {"звук"}},
             needed={"звук": 1}, limits={"Анна": (0, 1)},
         ))
-        self.assertEqual(plan.load()["Анна"], 1)
-        self.assertEqual(plan.load()["Вера"], 2)
-        self.assertEqual(len(plan.gaps()), 2)
-        # Максимум 0 — человек в этом месяце не ставится.
+        self.assertEqual(plan.load()["Анна"] + plan.load()["Вера"], 5)
+        self.assertEqual(plan.gaps(), [])
+        # Максимум 0 тоже не запрещает закрыть необходимое место.
         plan = build_plan(plan_input(
             {"Анна": set(SUNDAYS)}, {"Анна": {"звук"}},
             needed={"звук": 1}, limits={"Анна": (0, 0)},
         ))
-        self.assertEqual(plan.load(), {})
+        self.assertEqual(plan.load()["Анна"], 5)
+
+    def test_load_counts_actual_days_not_tasks_or_weeks(self):
+        day = SUNDAYS[0]
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1, "сборка": 1},
+            free={"Анна": frozenset({day}), "Борис": frozenset({day})},
+            tasks={
+                "Анна": frozenset({"звук", "спевка"}),
+                "Борис": frozenset({"сборка"}),
+            },
+            slot_dates={
+                (day, "звук", "Анна"): day,
+                (day, "спевка", "Анна"): day - timedelta(days=3),
+                (day, "сборка", "Борис"): day,
+            },
+        ))
+        self.assertEqual(plan.load(), {"Анна": 2, "Борис": 1})
+
+    def test_separate_task_availability_is_not_copied_across_dates(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"А": frozenset({day})},
+            tasks={"А": frozenset({"звук", "спевка"})},
+            availability={"А": frozenset({day})},
+            slot_dates={
+                (day, "звук", "А"): day,
+                (day, "спевка", "А"): rehearsal,
+            },
+        ))
+        self.assertEqual(plan.slots[(day, "звук")], ["А"])
+        self.assertEqual(plan.slots[(day, "спевка")], [])
+
+    def test_linked_task_is_a_fallback_only_without_an_exact_candidate(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        linked = PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"Связка": frozenset({day}), "Кандидат": frozenset({day})},
+            tasks={
+                "Связка": frozenset({"звук", "спевка"}),
+                "Кандидат": frozenset({"спевка"}),
+            },
+            availability={
+                "Связка": frozenset({day}),
+                "Кандидат": frozenset({rehearsal}),
+            },
+            bundles={"Связка": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "Связка"): day,
+                (day, "спевка", "Связка"): rehearsal,
+                (day, "спевка", "Кандидат"): rehearsal,
+            },
+        )
+        plan = build_plan(linked)
+        self.assertEqual(plan.slots[(day, "звук")], ["Связка"])
+        self.assertEqual(plan.slots[(day, "спевка")], ["Кандидат"])
+
+        fallback = PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"Связка": frozenset({day})},
+            tasks={"Связка": frozenset({"звук", "спевка"})},
+            availability={"Связка": frozenset({day})},
+            bundles={"Связка": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "Связка"): day,
+                (day, "спевка", "Связка"): rehearsal,
+            },
+        )
+        plan = build_plan(fallback)
+        self.assertEqual(plan.slots[(day, "звук")], ["Связка"])
+        self.assertEqual(plan.slots[(day, "спевка")], ["Связка"])
+        self.assertEqual(plan.load()["Связка"], 2)
+
+    def test_linked_fallback_only_goes_from_later_to_earlier_task(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"Связка": frozenset({day})},
+            tasks={"Связка": frozenset({"звук", "спевка"})},
+            availability={"Связка": frozenset({(rehearsal, "спевка")})},
+            bundles={"Связка": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "Связка"): day,
+                (day, "спевка", "Связка"): rehearsal,
+            },
+        ))
+        self.assertEqual(plan.slots[(day, "звук")], [])
+        self.assertEqual(plan.slots[(day, "спевка")], ["Связка"])
+
+    def test_linked_fallback_does_not_override_explicit_exclusion(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"Связка": frozenset({day})},
+            tasks={"Связка": frozenset({"звук", "спевка"})},
+            availability={"Связка": frozenset({(day, "звук")})},
+            unavailable={"Связка": frozenset({(rehearsal, "спевка")})},
+            bundles={"Связка": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "Связка"): day,
+                (day, "спевка", "Связка"): rehearsal,
+            },
+        ))
+        self.assertEqual(plan.slots[(day, "звук")], ["Связка"])
+        self.assertEqual(plan.slots[(day, "спевка")], [])
+
+    def test_linked_fallback_is_kept_when_the_exact_candidate_is_needed_elsewhere(self):
+        # Б свободен в среду на спевку и сборку, но сборку кроме него некому
+        # вести: спевку закрывает А по связке со звуком.
+        day = SUNDAYS[0]
+        wednesday = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1, "сборка": 1},
+            free={"А": frozenset({day}), "Б": frozenset({day})},
+            tasks={
+                "А": frozenset({"звук", "спевка"}),
+                "Б": frozenset({"спевка", "сборка"}),
+            },
+            availability={
+                "А": frozenset({day}),
+                "Б": frozenset({wednesday}),
+            },
+            bundles={"А": frozenset({"звук", "спевка"})},
+            slot_dates={
+                (day, "звук", "А"): day,
+                (day, "спевка", "А"): wednesday,
+                (day, "спевка", "Б"): wednesday,
+                (day, "сборка", "Б"): wednesday,
+            },
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(plan.slots[(day, "звук")], ["А"])
+        self.assertEqual(plan.slots[(day, "спевка")], ["А"])
+        self.assertEqual(plan.slots[(day, "сборка")], ["Б"])
+
+    def test_optional_matching_respects_month_max_across_task_days(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 0, "спевка": 0},
+            extra={"звук": 1, "спевка": 1},
+            free={"А": frozenset({day})},
+            tasks={"А": frozenset({"звук", "спевка"})},
+            limits={"А": (0, 1)},
+            slot_dates={
+                (day, "звук", "А"): day,
+                (day, "спевка", "А"): rehearsal,
+            },
+        ))
+        self.assertEqual(plan.load(), {"А": 1})
+        self.assertEqual(plan.covered(), 1)
+
+    def test_optional_assignment_respects_last_month_consecutive_week(self):
+        day = SUNDAYS[0]
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 0},
+            extra={"звук": 1},
+            free={"А": frozenset({day})},
+            tasks={"А": frozenset({"звук"})},
+            last_served={"А": day - timedelta(weeks=1)},
+        ))
+        self.assertEqual(plan.slots[(day, "звук")], [])
+
+    def test_soft_month_limit_counts_separate_days(self):
+        day = SUNDAYS[0]
+        rehearsal = day - timedelta(days=3)
+        plan = build_plan(PlanInput(
+            dates=(day,),
+            needed={"звук": 1, "спевка": 1},
+            free={"А": frozenset({day}), "Б": frozenset({day})},
+            tasks={
+                "А": frozenset({"звук", "спевка"}),
+                "Б": frozenset({"звук", "спевка"}),
+            },
+            limits={"А": (0, 1), "Б": (0, 1)},
+            slot_dates={
+                (day, task, person): day + (
+                    timedelta(days=-3) if task == "спевка" else timedelta()
+                )
+                for task in ("звук", "спевка") for person in ("А", "Б")
+            },
+        ))
+        self.assertEqual(plan.covered_required(), 2)
+        self.assertEqual(sorted(plan.load().values()), [1, 1])
 
     def test_month_max_does_not_leave_avoidable_gap(self):
         # Анна (максимум 1) свободна 01 и 15, Вера — только 01: Анна
@@ -243,6 +731,43 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.slots[(SUNDAYS[0], "звук")], ["Вера"])
         self.assertEqual(plan.slots[(SUNDAYS[2], "звук")], ["Анна"])
 
+    def test_month_max_rearranges_chain_of_assignments(self):
+        # Лимит 1 у всех: А свободна 01 и 15, Б — 01 и 08, В — только 08.
+        # Прямой замены нет (Б уже на пределе), но цепочка Б→01, В→08,
+        # А→15 укладывается во все лимиты.
+        dates = SUNDAYS[:3]
+        names = ("А", "Б", "В")
+        plan = build_plan(plan_input(
+            {
+                "А": {dates[0], dates[2]},
+                "Б": {dates[0], dates[1]},
+                "В": {dates[1]},
+            },
+            {name: {"звук"} for name in names},
+            needed={"звук": 1}, dates=dates,
+            limits={name: (0, 1) for name in names},
+            last_served={"В": date(2026, 10, 25)},
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(
+            [plan.slots[(day, "звук")] for day in dates],
+            [["Б"], ["В"], ["А"]],
+        )
+        self.assertEqual(plan.load(), {"А": 1, "Б": 1, "В": 1})
+
+    def test_month_max_chain_is_not_applied_without_a_free_end(self):
+        # Все трое на пределе и других нет: превышение остаётся, покрытие
+        # не теряется.
+        dates = SUNDAYS[:3]
+        plan = build_plan(plan_input(
+            {"А": {dates[0], dates[2]}, "Б": {dates[0], dates[1]}},
+            {name: {"звук"} for name in ("А", "Б")},
+            needed={"звук": 1}, dates=dates,
+            limits={"А": (0, 1), "Б": (0, 1)},
+        ))
+        self.assertEqual(plan.gaps(), [])
+        self.assertEqual(sum(plan.load().values()), 3)
+
     def test_month_min_preferred(self):
         # Трое на 3 даты: без лимита — по одному; у Глеба минимум 2 —
         # он получает два служения (не подряд).
@@ -256,8 +781,8 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.load()["Глеб"], 2)
 
     def test_respondent_before_non_respondent(self):
-        # Ответивший не может 15.11 — там не ответивший; служить подряд
-        # никому не приходится, не ответивший ставится и 01.11.
+        # Ответивший не может 15.11; во все остальные недели он остаётся
+        # приоритетнее молчуна.
         plan = build_plan(plan_input(
             {
                 "Алексей": {SUNDAYS[0], SUNDAYS[1], SUNDAYS[3]},
@@ -268,7 +793,7 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(
             [plan.slots[(day, "звук")] for day in SUNDAYS[:4]],
-            [["Борис"], ["Алексей"], ["Борис"], ["Алексей"]],
+            [["Алексей"], ["Алексей"], ["Борис"], ["Алексей"]],
         )
 
     def test_range_fills_minimum_first_then_up_to_maximum(self):
@@ -321,6 +846,34 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(plan.covered(), 150)
 
+    def test_dense_schedule_with_linked_fallbacks_is_fast(self):
+        # Связки и ответы только по части дней: проверка запасной связки
+        # в _can_serve не должна пересчитываться на каждый вызов.
+        people = [f"Человек {index}" for index in range(30)]
+        slot_dates = {}
+        for day in SUNDAYS:
+            for person in people:
+                slot_dates[(day, "звук", person)] = day
+                slot_dates[(day, "спевка", person)] = day - timedelta(days=3)
+        data = PlanInput(
+            dates=SUNDAYS,
+            needed={"звук": 15, "спевка": 15},
+            free={person: frozenset(SUNDAYS) for person in people},
+            tasks={person: frozenset({"звук", "спевка"}) for person in people},
+            availability={
+                person: frozenset(SUNDAYS) | (
+                    frozenset(day - timedelta(days=3) for day in SUNDAYS)
+                    if index % 3 == 0 else frozenset()
+                )
+                for index, person in enumerate(people)
+            },
+            bundles={person: frozenset({"звук", "спевка"}) for person in people},
+            slot_dates=slot_dates,
+        )
+        started = time.monotonic()
+        plan = build_plan(data)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(plan.covered(), 150)
 
     def test_rotation_when_more_people_than_seats(self):
         # 4 воскресенья, нужен один: кто служил в прошлом месяце позже,
@@ -355,7 +908,7 @@ class SchedulePlannerTest(unittest.TestCase):
         ))
         self.assertEqual(plan.slots[(dates[0], "звук")], ["Вера"])
 
-    def test_bundled_tasks_go_to_one_person_and_count_once(self):
+    def test_linked_tasks_prefer_one_person_and_count_actual_days(self):
         dates = tuple(date(2026, 11, 1) + timedelta(weeks=i) for i in range(5))
         needed = {"звук": 1, "сборка": 1, "спевка": 1}
         tasks = {
@@ -363,16 +916,22 @@ class SchedulePlannerTest(unittest.TestCase):
         } | {"E": frozenset({"сборка"}), "F": frozenset({"сборка"})}
         free = {name: frozenset(dates) for name in tasks}
         bundle = frozenset({"звук", "спевка"})
+        slot_dates = {
+            (day, task, name): day + timedelta(days=-3 if task == "спевка" else 0)
+            for day in dates for task in needed for name in tasks
+            if task in tasks[name]
+        }
         plan = build_plan(PlanInput(
             dates, needed, free, tasks,
             bundles={name: bundle for name in "ABCD"},
+            slot_dates=slot_dates,
         ))
         for day in dates:
             self.assertEqual(plan.slots[(day, "звук")], plan.slots[(day, "спевка")])
         load = plan.load()
-        # Связка в дату — одно служение; связавшие — по очереди.
-        self.assertEqual(sum(load[name] for name in "ABCD"), 5)
-        self.assertLessEqual(max(load[name] for name in "ABCD"), 2)
+        # Спевка и звук в разные дни — две единицы нагрузки.
+        self.assertEqual(sum(load[name] for name in "ABCD"), 10)
+        self.assertLessEqual(max(load[name] for name in "ABCD"), 4)
         self.assertEqual(plan.covered_required(), 15)
 
     def test_single_bundled_person_is_not_forced_every_week(self):
@@ -380,9 +939,14 @@ class SchedulePlannerTest(unittest.TestCase):
         needed = {"звук": 1, "спевка": 1}
         tasks = {name: frozenset({"звук", "спевка"}) for name in "ABCD"}
         free = {name: frozenset(dates) for name in tasks}
+        slot_dates = {
+            (day, task, name): day + timedelta(days=-3 if task == "спевка" else 0)
+            for day in dates for task in needed for name in tasks
+        }
         plan = build_plan(PlanInput(
             dates, needed, free, tasks,
             bundles={"A": frozenset({"звук", "спевка"})},
+            slot_dates=slot_dates,
         ))
         self.assertEqual(plan.covered_required(), 8)
         # Не каждую неделю и не две недели подряд.
@@ -402,6 +966,10 @@ class SchedulePlannerTest(unittest.TestCase):
             {"X": frozenset(), "Y": frozenset({day})},
             {"X": frozenset({"a", "b"}), "Y": frozenset({"b", "c"})},
             bundles={"X": frozenset({"a", "b"}), "Y": frozenset({"b", "c"})},
+            slot_dates={
+                (day, "b", "Y"): day,
+                (day, "c", "Y"): day - timedelta(days=2),
+            },
         ))
         # Y закрывает обе задачи своей связки.
         self.assertEqual(plan.slots[(day, "b")], ["Y"])
@@ -425,8 +993,8 @@ class SchedulePlannerTest(unittest.TestCase):
             reluctant=frozenset({"Q"}),
             bundles={"L": frozenset({"звук", "спевка"})},
         ))
-        # A служил 25.10 — на 01.11 лучше не ответивший Q.
-        self.assertEqual(plan.slots[(dates[0], "спевка")], ["Q"])
+        # Ответивший A доступен — молчун Q не используется вместо него.
+        self.assertEqual(plan.slots[(dates[0], "спевка")], ["A"])
 
     def test_optional_seat_does_not_force_consecutive_bundle_weeks(self):
         d1, d2, d3 = (date(2026, 11, 1) + timedelta(weeks=i) for i in range(3))
@@ -485,7 +1053,7 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertIn("Q", plan.slots[(day, "a")] + plan.slots[(day, "b")])
 
     def test_single_day_competition_and_loser_placed_instead_of_silent(self):
-        # Решение 16: Марк и Игорь отметили только 22.11, Елисей не ответил.
+        # Марк и Игорь отметили только 22.11, Елисей не ответил.
         dates = SUNDAYS
         both = frozenset({"звук", "спевка"})
         data = PlanInput(
@@ -508,17 +1076,23 @@ class SchedulePlannerTest(unittest.TestCase):
                 "Игорь": date(2026, 10, 18), "Марк": date(2026, 10, 25),
                 "Елисей": date(2026, 10, 28),
             },
+            slot_dates={
+                (day, task, person): day + timedelta(
+                    days=-3 if task == "спевка" else 0
+                )
+                for day in dates for task in ("звук", "спевка")
+                for person in ("Игорь", "Марк", "Елисей", "Василий")
+            },
         )
         plan = build_plan(data)
         self.assertEqual(plan.slots[(dates[3], "звук")], ["Игорь"])
-        # Марк — вместо не ответившего, Елисей — без служения подряд.
-        self.assertEqual(plan.load()["Марк"], 1)
-        self.assertEqual(plan.load()["Елисей"], 1)
-        mark = next(day for (day, _), people in plan.slots.items()
-                    if "Марк" in people)
+        # Игорь получает связку в обе фактические даты; молчун остаётся
+        # резервом для недель, где ответивших на эти задачи нет.
+        self.assertEqual(plan.load()["Игорь"], 2)
+        self.assertEqual(plan.load()["Елисей"], 4)
         self.assertEqual(
-            plan.slots[(mark, "звук")] + plan.slots[(mark, "спевка")],
-            ["Марк", "Марк"],
+            plan.slots[(dates[3], "звук")] + plan.slots[(dates[3], "спевка")],
+            ["Игорь", "Игорь"],
         )
         # Раньше ответивший выигрывает при прочих равных.
         tie = build_plan(PlanInput(
@@ -556,7 +1130,7 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.slots[(dates[0], "звук")], ["А"])
         self.assertEqual(plan.slots[(dates[1], "звук")], ["Тихий"])
 
-    def test_open_dates_ignore_silent_and_count_bundles(self):
+    def test_open_dates_ignore_silent_and_use_task_dates(self):
         both = frozenset({"звук", "спевка"})
         data = PlanInput(
             dates=SUNDAYS[:3], needed={"звук": 1, "спевка": 1},
@@ -568,6 +1142,11 @@ class SchedulePlannerTest(unittest.TestCase):
             tasks={"Связка": both, "Звук": frozenset({"звук"}), "Тихий": both},
             reluctant=frozenset({"Тихий"}),
             bundles={"Связка": both},
+            slot_dates={
+                (SUNDAYS[0], "звук", "Связка"): SUNDAYS[0],
+                (SUNDAYS[0], "спевка", "Связка"): SUNDAYS[0]
+                - timedelta(days=3),
+            },
         )
         self.assertEqual(open_dates(data), list(SUNDAYS[1:3]))
         # Связка не даёт одному человеку два места в одной задаче.

@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^gh pr create --repo albazrov/reminder_bot_fork --base test --head dev --title \"Тестовый PR: dev → test\" --body \\$'## Назначение\\\\nПроверка PR и CI/CD в форке albazrov/reminder_bot_fork\\.\\\\n\\\\n## Изменения\\\\n- В README добавлено примечание о каталоге reminder_bot_fork и потоке dev → test\\.\\\\n- Код и поведение бота не меняются\\.\\\\n\\\\n## Проверки\\\\n- Независимое ревью: замечаний нет\\.\\\\n- git diff --check: успешно\\.\\\\n- Локальные тесты не запускались: изменение только документации\\.\\\\n\\\\nОбычный PR запускает модульные тесты и настроенное развертывание в test\\. PR не сливать автоматически\\.'$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
