@@ -29,6 +29,110 @@ NEEDS_PROC = unittest.skipUnless(
 
 
 class ReminderBotEntrypointTest(unittest.TestCase):
+    def test_legacy_delivery_parses_own_download_not_shared_backup_file(self):
+        from bot import app
+
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                shared = root / "reminder_bot_current.xlsx"
+                manager = MagicMock()
+
+                async def download(url, path, logger, **options):
+                    path.write_bytes(b"fresh assignments")
+
+                async def record(path):
+                    shared.write_bytes(b"older backup download")
+
+                def parse(path, *args):
+                    self.assertNotEqual(path, shared)
+                    self.assertEqual(path.read_bytes(), b"fresh assignments")
+                    raise ValueError("stop after verifying input")
+
+                manager.record_schedule_download = AsyncMock(side_effect=record)
+                cache = MagicMock()
+                cache.matches_week.return_value = False
+                credentials = SimpleNamespace(
+                    group_chat_id=-100, admin_tg_id=1001,
+                    yandex_public_url="https://example.invalid/schedule",
+                )
+                with patch.object(app, "download_public", side_effect=download), \
+                        patch.object(app, "parse_schedule", side_effect=parse), \
+                        patch.object(app, "_notify_admin", new=AsyncMock()), \
+                        self.assertRaisesRegex(ValueError, "stop after verifying"):
+                    await app._process_upcoming_sunday(
+                        MagicMock(), credentials, {}, cache, root,
+                        MagicMock(), MagicMock(), ZoneInfo("UTC"),
+                        backup_manager=manager,
+                    )
+                self.assertFalse(list(root.glob(".reminder-delivery-*")))
+
+        asyncio.run(scenario())
+
+    def test_schedule_download_records_fresh_bytes_before_returning(self):
+        from bot import app
+
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "schedule.xlsx"
+                manager = MagicMock()
+                manager.record_schedule_download = AsyncMock()
+
+                async def download(url, target, logger, **options):
+                    target.write_bytes(b"fresh workbook")
+
+                with patch.object(app, "download_public", side_effect=download):
+                    result = await app._download_schedule(
+                        "https://example.invalid/schedule", path, MagicMock(),
+                        backup_manager=manager, attempts=1, interval=0,
+                    )
+                self.assertEqual(result.read_bytes(), b"fresh workbook")
+                manager.record_schedule_download.assert_awaited_once_with(path)
+                manager.clear_failure.assert_called_once_with("schedule-copy")
+
+        asyncio.run(scenario())
+
+    def test_schedule_backup_failure_is_reported_without_hiding_fresh_download(self):
+        from bot import app
+
+        async def scenario():
+            manager = MagicMock()
+            manager.record_schedule_download = AsyncMock(
+                side_effect=OSError("disk full")
+            )
+            manager.report_failure = AsyncMock()
+            manager.check_storage = AsyncMock()
+            path = Path("fresh.xlsx")
+            with patch.object(app, "download_public", new=AsyncMock()) as download:
+                result = await app._download_schedule(
+                    "https://example.invalid/schedule", path, MagicMock(),
+                    backup_manager=manager,
+                )
+            download.assert_awaited_once()
+            self.assertEqual(result, path)
+            manager.report_failure.assert_awaited_once()
+            manager.check_storage.assert_awaited_once()
+            manager.clear_failure.assert_not_called()
+
+        asyncio.run(scenario())
+
+    def test_failed_live_download_does_not_read_backup_copy(self):
+        from bot import app
+
+        async def scenario():
+            manager = MagicMock()
+            manager.record_schedule_download = AsyncMock()
+            with patch.object(
+                app, "download_public", new=AsyncMock(side_effect=OSError("offline"))
+            ), self.assertRaises(OSError):
+                await app._download_schedule(
+                    "https://example.invalid/schedule", Path("fresh.xlsx"),
+                    MagicMock(), backup_manager=manager,
+                )
+            manager.record_schedule_download.assert_not_awaited()
+
+        asyncio.run(scenario())
+
     def test_webapp_menu_button_uses_configured_https_url(self):
         from bot.app import _configure_webapp_menu
 
