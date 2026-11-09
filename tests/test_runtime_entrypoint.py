@@ -326,6 +326,47 @@ class ReminderBotEntrypointTest(unittest.TestCase):
 
         asyncio.run(process())
 
+    def test_personal_reminder_skips_weekday_in_approved_month_without_warning(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_responsible_contact(
+                    1001, "sound", "Микшер", "Алексей", 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.ensure_user_text(2002, "sound", "Микшер")
+                schedule = registry.add_schedule(text_id, 0, "18:00")
+                self.approve_plan(
+                    registry, "sound", date(2026, 10, 18), "Микшер", "Алексей"
+                )
+                # Restore the real approval check, normally mocked by setUp.
+                self._approved_schedule.stop()
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_load_service_task_assignments", new=AsyncMock()
+                ) as load:
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], logger, logger,
+                        run_date=date(2026, 10, 20),
+                    )
+                load.assert_not_awaited()
+                bot.send_message.assert_not_awaited()
+                logger.warning.assert_not_called()
+                self.assertFalse(registry.has_readiness_notice(
+                    "sound", "2026-10", "schedule-unapproved"
+                ))
+                self.assertFalse(registry.is_user_reminder_delivered(
+                    schedule["id"], "2026-10-20"
+                ))
+
+        asyncio.run(process())
+
     def test_personal_reminder_preparation_failure_is_logged_not_sent_to_admin(self):
         from bot import app
         from bot.service_registry import ServiceRegistry

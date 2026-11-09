@@ -1763,6 +1763,16 @@ async def _process_user_reminder_schedule(
         approved_state = _approved_assignments_state(
             registry, schedule["service_id"], event_date
         )
+        if not approved_plan:
+            month_plan = registry.get_schedule_plan(
+                schedule["service_id"], event_date.strftime("%Y-%m")
+            )
+            if month_plan is not None and month_plan["approved"] is not None:
+                debug_logger.debug(
+                    "Личное расписание %s пропущено: в утверждённом "
+                    "графике нет события на %s", schedule_id, event_iso,
+                )
+                return
     except Exception:
         debug_logger.exception(
             "Не удалось проверить утверждённый график для личного "
