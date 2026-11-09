@@ -101,6 +101,27 @@ class ReportTextTest(unittest.TestCase):
         self.assertIn("✅ подтвердил(а) — Алексей (звук)", text)
         self.assertIn("⏳ нет ответа — Борис (сборка)", text)
 
+    def test_senior_precedes_shift_in_admin_report(self):
+        assignments = {
+            "в смене": {"names": ["Алексей"]},
+            "старший": {"names": ["Борис"]},
+        }
+        text = build_report_text(
+            None,
+            "Орг. команда",
+            FUTURE,
+            assignments,
+            {},
+            lambda telegram_id: True,
+            {},
+        )
+
+        self.assertLess(text.index("⭐ старший"), text.index("👥 в смене"))
+        self.assertLess(
+            text.index("Борис (старший)"),
+            text.index("Алексей (в смене)"),
+        )
+
     def test_custom_template_and_muted_person(self):
         text = build_report_text(
             "{service_name}: {confirmation_status} | {delivery_status}",

@@ -14,6 +14,7 @@ from datetime import date
 from .presentation import (
     apply_replacements,
     format_task_assignments,
+    ordered_task_assignments,
     task_assignment_names,
     task_is_informational,
 )
@@ -42,7 +43,7 @@ class _Values(dict):
 def _people(assignments: dict) -> list[tuple[str, str]]:
     return [
         (task, name)
-        for task, task_info in assignments.items()
+        for task, task_info in ordered_task_assignments(assignments)
         if not task_is_informational(task_info)
         for name in task_assignment_names(task_info)
     ]

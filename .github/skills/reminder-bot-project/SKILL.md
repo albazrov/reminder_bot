@@ -6,12 +6,13 @@ user-invocable: true
 
 # reminder_bot project workflow
 
-Use this skill for project-wide work in `tunmonitor/reminder_bot`, including
+Use this skill for project-wide work in `albazrov/reminder_bot_fork`, including
 code changes, reviews, tests, operational diagnosis, and documentation.
 Project requirements and examples are also recorded in `README.md`, `TZ2.txt`,
 and `UI_SKETCHES.md` (v1, current); check the relevant section when behavior
-is ambiguous. Plans: `PLAN.md` (customer decisions, stage status),
-`EXECUTION_PLAN.md` (technical tasks), `BACKLOG.md`, `UI_SKETCHES_V2.md`
+is ambiguous. Planning docs: `PLAN.md` (agreed decisions and open product
+requirements), `EXECUTION_PLAN.md` (implementation status and verification),
+`BACKLOG.md` (unfinished technical tasks), `UI_SKETCHES_V2.md`
 (menu redesign proposal, not approved until the user says so).
 
 This file is the single source for Claude Code and Codex/Copilot:
@@ -27,7 +28,7 @@ current environment.
 
 | | Mac (development) | Raspberry Pi (test / prod) |
 |---|---|---|
-| Checkout | `/Users/alex/projects/app/reminder_bot/dev`, branch `dev` | `/mnt/external_data/reminder_bot/test`, prod in its own directory |
+| Checkout | `/Users/alex/projects/app/reminder_bot_fork`, branch `dev` | `/mnt/external_data/reminder_bot/test`; prod: `/home/pi/app/reminder_bot/prod` |
 | `$PY` | `/Users/alex/projects/.venv/bin/python` (shared venv; never create a new one; install with `$PY -m pip install -r requirements.txt`) | `/home/pi/.venv/bin/python` |
 | Temp files, test `TMPDIR`, scratch worktrees | `/Users/alex/projects/.tmp/reminder_bot` (not `/tmp`, not the project folder) | `/dev/shm/app/reminder_bot/src/.tmp` (RAM, not the SD card) |
 | Diagnostic workbooks/logs | `/Users/alex/projects/.tmp/reminder_bot/debug/` (dir 700, files 600) | `/dev/shm/reminder_bot/debug/` (dir 700, files 600) |
@@ -47,33 +48,45 @@ Mac specifics:
 Raspberry Pi specifics:
 
 - Test and prod have separate directories, configs, databases and tokens.
-- `.github/workflows/deploy.yml` runs on the self-hosted runner
-  `[self-hosted, tunmonitor]`: a push to a PR with head `dev` and base `test`
-  deploys to **test**; a push to `main` deploys to **prod**. A PR from any
-  other head into `test` does not deploy.
+- `.github/workflows/deploy.yml` uses the self-hosted runner
+  `[self-hosted, raspberry]`: a PR with head `dev` and base `test` deploys to
+  **test**; a push to `main` deploys to **prod**. A PR from another head into
+  `test` does not trigger the test deployment.
 - Never edit files on the Pi by hand; fix in `dev` and ship through a PR.
 
 ## Git flow and the local `dev` branch
 
 - Work and commit **only on `dev`**; `test` and `main` change only through PRs.
   Never force-push, never push to `test`/`main` directly.
-- `dev` also receives PRs from other agents (`copilot/*` → `dev`, e.g. #91,
-  #92). Before starting work run `git fetch` and `git status -sb`; if `dev` is
-  behind `origin/dev`, merge it (`git merge origin/dev`) **before** editing, so
-  docs such as `EXECUTION_PLAN.md` are not overwritten.
-- Flow: `dev` → PR to `test` (deploys to test) → comment `/review` after the
-  PR is opened and after every push → wait for greptile
-  (`/Users/alex/projects/bin/greptile_watch.sh <PR> <ISO time before push>` in
-  the background; one updating comment «Confidence Score: N/5» plus line
-  comments) → fix findings, repeat until 5/5 with no new findings → merge to
-  `test` → give the user a checklist of buttons/screens to verify in the test
-  bot. The `test` → `main` PR is merged **only by the user**.
-- Before every commit or push: review the diff by a separate model (Agent,
-  `model: "sonnet"`), correctness bugs only, each with `file:line` and a failure
-  scenario; verify findings against the code, fix the real ones, tell the user
-  what was found and fixed.
-- Commit only when the user asks. Do not open new PRs or start new PLAN steps
-  while the user has paused them (check project memory).
+- Before editing, run `git status -sb`; preserve all pre-existing changes.
+  Fetch and integrate `origin/dev` if the local branch is behind. Do not
+  overwrite another contributor's work.
+- Release path: `dev` → PR to `test` → verify checks, review summary and inline
+  findings → test deployment/manual verification → PR `test` → `main` →
+  production deployment. A successful Greptile check alone does not mean there
+  are no findings. Do not rely on watcher scripts that may target a different
+  repository.
+- Commit, push, open/merge PRs, and deploy only when the user explicitly asks.
+  Approval for a previous release is not standing approval for future releases.
+  Never assume who must merge a PR; follow the current user instruction.
+- Before a requested commit/push, review the complete diff independently for
+  correctness issues, verify any findings, and report confirmed fixes.
+- Do not begin another PLAN/backlog task unless the user asks.
+
+## Status snapshot (09.11.2026)
+
+- The backup reliability work is released to prod. Latest prod commit:
+  `e46d6c8607c519c7321f19908d70cd82e0715757`; workflow `41918073648` passed.
+- Backup instructions are in `README.md`; release status is in
+  `EXECUTION_PLAN.md`. A successful deploy does not prove a
+  new archive exists on prod; that file was not independently checked.
+- Local, not-yet-released changes enforce schedule approval for reminders
+  and monthly summaries, provide an admin summary of enabled personal
+  reminders, suppress personal-reminder preparation alerts to service
+  admins, and improve reminder navigation and assignment ordering. Safe
+  Excel refresh remains in progress; other pending work includes the
+  deferred step 5д, Web App stage 6 (requires discussion), and editable
+  reminder headings. See `EXECUTION_PLAN.md`, `PLAN.md`, and `BACKLOG.md`.
 
 ## UI principles (every screen you add or change)
 
@@ -495,6 +508,13 @@ Raspberry Pi specifics:
   `_load_service_task_assignments`; `schedule_plan.plan_events` turns an
   approved plan into ServiceEvents (own-day tasks on their date).
   `plan_current` treats an Excel plan as current.
+  **Agreed policy:** Excel for a month is only a candidate until the admin
+  explicitly approves and saves the graph in the bot database; reminders
+  must not be sent for that month without an approved graph. The saved
+  approved graph is authoritative; changed Excel is not an automatic source
+  switch. Approval enforcement for group/personal reminders and monthly
+  summaries is implemented locally but not yet released. Safe Excel refresh
+  remains in `BACKLOG.md`.
 - Week bundles: `service_tasks.same_week` (`set_service_task_same_week`,
   UI `svc_tasks:week|wtog`) and `service_members.week_tasks_json`
   (`set_service_member_week_tasks`, None = as service, [] = never,
@@ -721,6 +741,10 @@ Raspberry Pi specifics:
   schematic screens). Update them together with UI changes.
 - Customer decision 5 (24.10): Excel may stop being filled — step 4 adds a
   per-service source switch and «📥 Загрузить график из Excel».
+  Later clarification supersedes live-Excel fallback for reminders: no
+  approved graph saved in the bot for a service/month means no reminders for
+  that schedule. Enforcement is implemented locally; safe Excel refresh is
+  still planned in `BACKLOG.md`.
 
 ### Rich text, mentions, and message length
 
@@ -914,5 +938,5 @@ Raspberry Pi specifics:
   requirements.
 - `UI_SKETCHES.md` — representative Telegram screen layouts (v1, current);
   `UI_SKETCHES_V2.md` — menu redesign proposal (pending approval).
-- `PLAN.md`, `EXECUTION_PLAN.md`, `BACKLOG.md` — customer decisions, status,
-  technical tasks.
+- `PLAN.md`, `EXECUTION_PLAN.md`, `BACKLOG.md` — open product requirements,
+  implementation status, and unfinished technical tasks respectively.

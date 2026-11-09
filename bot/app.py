@@ -88,7 +88,7 @@ if __package__:
     )
     from .service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from .state import StateCache
-    from .yandex_disk import download_public
+    from .yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public
     from .backup import (
         BackupManager,
         application_instance_lock,
@@ -154,7 +154,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from bot.state import StateCache
-    from bot.yandex_disk import download_public
+    from bot.yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public
     from bot.backup import (
         BackupManager,
         application_instance_lock,
@@ -565,6 +565,42 @@ async def _prepare_test_notification_previews(
         xlsx_path.unlink(missing_ok=True)
 
 
+async def _download_backup_schedule(
+    public_url: str,
+    path: Path,
+    logger: logging.Logger,
+) -> None:
+    await download_public(
+        public_url,
+        path,
+        logger,
+        attempts=RETRY_ATTEMPTS,
+        interval=RETRY_INTERVAL,
+    )
+
+
+async def _notify_super_admins(
+    bot: Bot,
+    service_registry: ServiceRegistry,
+    message: str,
+    debug_logger: logging.Logger,
+) -> None:
+    super_admin_ids = sorted(
+        telegram_id
+        for telegram_id, is_super_admin in service_registry.list_admin_ids().items()
+        if is_super_admin
+    )
+    if not super_admin_ids:
+        raise RuntimeError("В реестре не настроены суперадминистраторы")
+
+    failed = False
+    for telegram_id in super_admin_ids:
+        if not await _notify_admin(bot, telegram_id, message, debug_logger):
+            failed = True
+    if failed:
+        raise RuntimeError("Не удалось уведомить всех суперадминистраторов")
+
+
 async def _load_service_task_assignments(
     credentials,
     shm_dir: Path,
@@ -580,6 +616,7 @@ async def _load_service_task_assignments(
     raw_out: dict | None = None,
     own_roster_only: bool = False,
     backup_manager: BackupManager | None = None,
+    require_approved_plan: bool = False,
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
     """Назначения служения из графика; issues пополняется предупреждениями.
 
@@ -587,6 +624,27 @@ async def _load_service_task_assignments(
     уже привязанные к Telegram, получают привязки к новым задачам графика.
     """
     sunday_date = only_date or _next_sunday_in_tz(tz)
+    planned: list = []
+    covered: set = set()
+    if registry is not None and only_date is not None:
+        try:
+            planned, covered = _bot_plan_events(
+                registry, only_date, only_date, service_id=service_id
+            )
+        except Exception:
+            if require_approved_plan:
+                raise
+            debug_logger.exception("Не удалось прочитать график бота")
+    bot_plan = _covered(
+        SimpleNamespace(service_id=service_id, event_date=only_date),
+        covered,
+    ) if only_date is not None else False
+    if require_approved_plan and not bot_plan:
+        # Нельзя заменять отсутствующий или недоступный утверждённый график
+        # живым Excel при подготовке доставки.
+        if return_event_found:
+            return {}, False
+        return {}
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
     os.close(directory_fd)
@@ -598,17 +656,6 @@ async def _load_service_task_assignments(
     os.fchmod(file_fd, 0o600)
     os.close(file_fd)
     xlsx_path = Path(file_name)
-    planned: list = []
-    covered: set = set()
-    if registry is not None and only_date is not None:
-        try:
-            planned, covered = _bot_plan_events(registry, only_date, only_date)
-        except Exception:  # noqa: BLE001
-            debug_logger.exception("Не удалось прочитать график бота")
-    bot_plan = _covered(
-        SimpleNamespace(service_id=service_id, event_date=only_date),
-        covered,
-    ) if only_date is not None else False
     try:
         excel_read = True
         try:
@@ -830,7 +877,9 @@ async def _load_upcoming_service_events(
         xlsx_path.unlink(missing_ok=True)
 
 
-def _bot_plan_events(registry, first: date, last: date) -> tuple[list, set]:
+def _bot_plan_events(
+    registry, first: date, last: date, *, service_id: str | None = None
+) -> tuple[list, set]:
     """Утверждённые графики бота (решение 15) на месяцы окна: события и
     (служение, месяц) / (служение, дата), которые они заменяют в Excel."""
     if registry is None:
@@ -843,7 +892,10 @@ def _bot_plan_events(registry, first: date, last: date) -> tuple[list, set]:
         months.append(f"{month:%Y-%m}")
         month = (month + timedelta(days=32)).replace(day=1)
     events, covered = [], set()
-    for service in registry.list_services():
+    services = registry.list_services()
+    if service_id is not None:
+        services = [item for item in services if item["id"] == service_id]
+    for service in services:
         people = None
         for key in months:
             plan = registry.get_schedule_plan(service["id"], key)
@@ -868,6 +920,19 @@ def _bot_plan_events(registry, first: date, last: date) -> tuple[list, set]:
     return events, covered
 
 
+def _has_approved_schedule_for_event(
+    registry, service_id: str, event_date: date
+) -> bool:
+    """Whether an approved DB plan owns this Sunday or shifted task date."""
+    _, covered = _bot_plan_events(
+        registry, event_date, event_date, service_id=service_id
+    )
+    return _covered(
+        SimpleNamespace(service_id=service_id, event_date=event_date),
+        covered,
+    )
+
+
 def _covered(event, covered: set) -> bool:
     """Событие Excel заменено графиком бота: воскресенье утверждённого
     месяца, дата, которая есть в графике бота, или свой день задачи
@@ -879,13 +944,22 @@ def _covered(event, covered: set) -> bool:
     )
 
 
-def _apply_bot_plans(events: list, registry, first: date, last: date) -> list:
+def _apply_bot_plans(
+    events: list, registry, first: date, last: date, *,
+    approved_only: bool = False,
+) -> list:
     """События Excel, где на месяц есть утверждённый график бота, заменяются
     его событиями: дальше график живёт в боте (решение 15)."""
     try:
         planned, covered = _bot_plan_events(registry, first, last)
-    except Exception:  # noqa: BLE001 — сбой базы не должен ломать Excel
+    except Exception:
+        if approved_only:
+            raise
+        # Для не-доставочных экранов сохраняем прежнее поведение при
+        # недоступности БД; доставка запрашивает approved_only и fail-closed.
         return events
+    if approved_only:
+        events = [event for event in events if _covered(event, covered)]
     if not covered:
         return events
     kept, notes = [], {}
@@ -1184,6 +1258,33 @@ def _same_reminder_slot(registry: ServiceRegistry, reminder: dict) -> bool:
     ) == (reminder["reminder_days"], reminder["reminder_time"])
 
 
+async def _notify_unapproved_schedule(
+    bot, credentials, registry: ServiceRegistry, service_id: str,
+    event_date: date, debug_logger,
+) -> None:
+    month = f"{event_date:%Y-%m}"
+    if not registry.claim_readiness_notice(
+        service_id, month, "schedule-unapproved"
+    ):
+        return
+    service = registry.get_service(service_id)
+    service_name = service["name"] if service else service_id
+    delivered = await _notify_admin(
+        bot,
+        credentials.admin_tg_id,
+        f"Напоминания для служения «{service_name}» на "
+        f"{event_date:%m.%Y} не отправляются: администратор ещё не "
+        "утвердил график и не сохранил его в БД бота. Откройте "
+        "«📊 График Excel» или «📅 График», проверьте назначения и "
+        "утвердите график.",
+        debug_logger,
+    )
+    if not delivered:
+        registry.release_readiness_notice(
+            service_id, month, "schedule-unapproved"
+        )
+
+
 async def _process_service_reminder(
     bot: Bot,
     credentials,
@@ -1234,6 +1335,33 @@ async def _process_service_reminder(
             reminder_id, service_id, event_date,
         )
         return
+    try:
+        approved_plan = _has_approved_schedule_for_event(
+            registry, service_id, event_date
+        )
+    except Exception:
+        debug_logger.exception(
+            "Не удалось проверить утверждённый график служения %s",
+            service_id,
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Напоминание для служения «{service['name']}» на "
+            f"{event_date:%d.%m.%Y} не отправлено: не удалось проверить, "
+            "утверждён ли график в БД бота.",
+            debug_logger,
+        )
+        return
+    if not approved_plan:
+        interaction_logger.warning(
+            "Напоминание служения %s пропущено: график на %s не утверждён",
+            service_id, event_date.strftime("%Y-%m"),
+        )
+        await _notify_unapproved_schedule(
+            bot, credentials, registry, service_id, event_date, debug_logger
+        )
+        return
     schedule_issues: list[str] = []
     raw_assignments: dict = {}
     try:
@@ -1250,6 +1378,7 @@ async def _process_service_reminder(
             registry=registry,
             raw_out=raw_assignments,
             backup_manager=backup_manager,
+            require_approved_plan=True,
         )
     except Exception as exc:
         debug_logger.exception(
@@ -1426,6 +1555,31 @@ async def _process_service_reminder(
             )
         else:
             try:
+                still_approved = _has_approved_schedule_for_event(
+                    registry, service_id, event_date
+                )
+            except Exception:
+                debug_logger.exception(
+                    "Не удалось повторно проверить утверждённый график "
+                    "служения %s",
+                    service_id,
+                )
+                await _notify_admin(
+                    bot,
+                    credentials.admin_tg_id,
+                    f"Групповое уведомление «{service['name']}» на "
+                    f"{date_text} не отправлено: не удалось повторно "
+                    "проверить утверждённый график в БД бота.",
+                    debug_logger,
+                )
+                return
+            if not still_approved:
+                await _notify_unapproved_schedule(
+                    bot, credentials, registry, service_id, event_date,
+                    debug_logger,
+                )
+                return
+            try:
                 await send_to_service_group(
                     lambda chat_id, text, **kwargs: send_telegram_screen(
                         bot.send_message, chat_id, text,
@@ -1520,6 +1674,36 @@ async def _process_user_reminder_schedule(
         return
 
     try:
+        approved_plan = _has_approved_schedule_for_event(
+            registry, schedule["service_id"], event_date
+        )
+    except Exception:
+        debug_logger.exception(
+            "Не удалось проверить утверждённый график для личного "
+            "расписания %s",
+            schedule_id,
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Личное напоминание на {event_date:%d.%m.%Y} не отправлено: "
+            "не удалось проверить, утверждён ли график в БД бота.",
+            debug_logger,
+        )
+        return
+    if not approved_plan:
+        interaction_logger.warning(
+            "Личное напоминание %s пропущено: график для %s на %s "
+            "не утверждён",
+            schedule_id, schedule["service_id"], event_date.strftime("%Y-%m"),
+        )
+        await _notify_unapproved_schedule(
+            bot, credentials, registry, schedule["service_id"],
+            event_date, debug_logger,
+        )
+        return
+
+    try:
         assignments, event_found = await _load_service_task_assignments(
             credentials,
             shm_dir,
@@ -1531,18 +1715,12 @@ async def _process_user_reminder_schedule(
             services=registry.service_catalog(),
             registry=registry,
             backup_manager=backup_manager,
+            require_approved_plan=True,
         )
-    except Exception as exc:
+    except Exception:
         debug_logger.exception(
             "Не удалось загрузить назначения для личного расписания %s",
             schedule_id,
-        )
-        await _notify_admin(
-            bot,
-            credentials.admin_tg_id,
-            f"Не удалось подготовить личное уведомление на "
-            f"{event_date:%d.%m.%Y}: {type(exc).__name__}.",
-            debug_logger,
         )
         return
     task_info = assignments.get(schedule["task"])
@@ -1626,6 +1804,30 @@ async def _process_user_reminder_schedule(
             schedule["service_id"], event_date, schedule["task"]
         )
     }
+    try:
+        still_approved = _has_approved_schedule_for_event(
+            registry, schedule["service_id"], event_date
+        )
+    except Exception:
+        debug_logger.exception(
+            "Не удалось повторно проверить утверждённый график для "
+            "личного расписания %s",
+            schedule_id,
+        )
+        await _notify_admin(
+            bot,
+            credentials.admin_tg_id,
+            f"Личное напоминание на {event_date:%d.%m.%Y} не отправлено: "
+            "не удалось повторно проверить утверждённый график в БД бота.",
+            debug_logger,
+        )
+        return
+    if not still_approved:
+        await _notify_unapproved_schedule(
+            bot, credentials, registry, schedule["service_id"],
+            event_date, debug_logger,
+        )
+        return
     try:
         sent_message = await send_telegram_screen(
             bot.send_message,
@@ -2112,7 +2314,7 @@ async def _run_locked(args: CliArgs) -> None:
         async def load_upcoming_service_events(
             force: bool = False, until: date | None = None,
             since: date | None = None, with_replacements: bool = True,
-            excel_only: bool = False,
+            excel_only: bool = False, approved_only: bool = False,
         ) -> list:
             # Один общий скачанный график на несколько минут для всех
             # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
@@ -2132,11 +2334,18 @@ async def _run_locked(args: CliArgs) -> None:
                 ]
                 # excel_only — лист как есть («📥 Загрузить» в боте).
                 if excel_only:
+                    if approved_only:
+                        raise ValueError(
+                            "Нельзя одновременно запросить Excel-кандидат "
+                            "и только утверждённые графики"
+                        )
                     return selected
-                # Утверждённый график бота главнее Excel (решение 15) — при
-                # каждом чтении: кэш хранит Excel.
+                # Для сводок исключаем месяцы без утверждённого графика.
+                # Проверка каждый раз использует актуальное состояние БД;
+                # кэш содержит только исходные Excel-события.
                 selected = _apply_bot_plans(
                     selected, service_registry, start, limit,
+                    approved_only=approved_only,
                 )
                 # with_replacements=False — график как в файле (замены
                 # вызывающий применит сам, например к своему кэшу).
@@ -2208,25 +2417,41 @@ async def _run_locked(args: CliArgs) -> None:
 
         if backup_manager is not None:
             async def notify_backup_failure(message: str) -> None:
-                delivered = await _notify_admin(
-                    bot, credentials.admin_tg_id, message, debug_logger
+                await _notify_super_admins(
+                    bot, service_registry, message, debug_logger
                 )
-                if not delivered:
-                    raise RuntimeError("Уведомление о бэкапе не доставлено администратору")
 
             backup_manager.set_failure_callback(notify_backup_failure)
 
             async def download_backup_schedule(path: Path) -> None:
-                await download_public(
-                    credentials.yandex_public_url, path, debug_logger,
-                    attempts=1, interval=0,
+                await _download_backup_schedule(
+                    credentials.yandex_public_url,
+                    path,
+                    debug_logger,
                 )
+
+        legacy_registry_notice = {"sent": False}
 
         async def scheduled_job() -> None:
             task = asyncio.current_task()
             if task is not None:
                 active_jobs.add(task)
             try:
+                if service_registry is None:
+                    debug_logger.error(
+                        "Старая рассылка «Собрания» пропущена: не удалось "
+                        "проверить утверждённый график в БД бота"
+                    )
+                    if not legacy_registry_notice["sent"]:
+                        legacy_registry_notice["sent"] = await _notify_admin(
+                            bot,
+                            credentials.admin_tg_id,
+                            "Рассылка «Собрания» приостановлена: не удалось "
+                            "проверить утверждённый график в БД бота. "
+                            "Проверьте журнал и состояние базы.",
+                            debug_logger,
+                        )
+                    return
                 await _process_upcoming_sunday(
                     bot=bot,
                     credentials=credentials,
@@ -2530,7 +2755,8 @@ async def _run_locked(args: CliArgs) -> None:
                         waiting_events["events"], service_registry
                     )
                 events = await context.load_upcoming_service_events(
-                    force=fresh, with_replacements=False, **kwargs
+                    force=fresh, with_replacements=False,
+                    approved_only=True, **kwargs
                 )
                 if fresh:
                     waiting_events["forced_at"] = now

@@ -59,6 +59,16 @@ def task_is_informational(task_info: Mapping | list[str]) -> bool:
     )
 
 
+def ordered_task_assignments(
+    assignments: dict[str, dict[str, Any] | list[str]],
+) -> list[tuple[str, dict[str, Any] | list[str]]]:
+    priority = {"старший": 0, "в смене": 1}
+    return sorted(
+        assignments.items(),
+        key=lambda item: priority.get(item[0].strip().casefold(), 2),
+    )
+
+
 def person_label(
     task: str,
     name: str,
@@ -99,7 +109,7 @@ def format_task_assignments(
         return "⚪ Ответственные не указаны"
 
     groups = []
-    for task, task_info in assignments.items():
+    for task, task_info in ordered_task_assignments(assignments):
         if task_is_informational(task_info):
             continue
         names = task_assignment_names(task_info)

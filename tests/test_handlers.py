@@ -2200,7 +2200,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 moved.message, lambda button: button.text == "⬅️ К напоминаниям"
             )
             self.assertIn("сборка · напоминания", back.message.answer.await_args.args[0])
-            self.assertEqual(len(self.callback_data_list(back.message)), 3)
+            self.assertEqual(len(self.callback_data_list(back.message)), 4)
+            self.assertIn(
+                "group_reminder:summary:",
+                "\n".join(self.callback_data_list(back.message)),
+            )
 
         asyncio.run(run())
 
@@ -6116,6 +6120,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_contact:sound",
                     "service:service_excel:sound",
                     "rdy:open:sound",
+                    "service:service_reminders:sound",
                     "svc_tasks:open:sound",
                     "service:service_setup:sound",
                     "service:service_help:sound",
@@ -7085,7 +7090,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.callback_data_list(callback.message),
                 ["service:service_contact:sound",
                  "service:service_excel:sound",
-                 "rdy:open:sound", "svc_tasks:open:sound",
+                 "rdy:open:sound", "service:service_reminders:sound",
+                 "svc_tasks:open:sound",
                  "service:service_setup:sound", "service:service_help:sound",
                  "service:back_to_services:list"],
             )
@@ -7135,6 +7141,198 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "только супер-администратор",
                 admins.message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_service_card_reminder_shortcut_selects_general_or_task(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+
+            def callback(data):
+                return SimpleNamespace(
+                    data=data,
+                    from_user=SimpleNamespace(id=12345),
+                    message=self.message(12345, ""),
+                    answer=AsyncMock(),
+                )
+
+            choices = callback("service:service_reminders:sound")
+            await self.callback_handler("on_service_selected")(choices)
+            self.assertIn(
+                "🔔 Общие",
+                [button.text for row in choices.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row],
+            )
+            general = await self._click(
+                choices.message, lambda button: button.text == "🔔 Общие"
+            )
+            self.assertIn(
+                "Всё служение",
+                general.message.answer.await_args.args[0],
+            )
+
+            choices = callback("service:service_reminders:sound")
+            await self.callback_handler("on_service_selected")(choices)
+            disabled = await self._click(
+                choices.message,
+                lambda button: button.text.startswith("🔴"),
+            )
+            self.assertIn(
+                "Сначала включите задачу",
+                disabled.answer.await_args.args[0],
+            )
+            disabled.message.answer.assert_not_awaited()
+
+            choices = callback("service:service_reminders:sound")
+            await self.callback_handler("on_service_selected")(choices)
+            task = await self._click(
+                choices.message,
+                lambda button: button.text.endswith("🎚️ звук"),
+            )
+            self.assertIn(
+                "звук",
+                task.message.answer.await_args.args[0],
+            )
+
+        asyncio.run(run())
+
+    def test_service_reminder_summary_lists_enabled_recipients_and_times(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            self.registry.set_group_chat(
+                67890, "sound", -10055, enabled=True
+            )
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей", 24680
+            )
+            self.registry.set_user_notifications_enabled(
+                24680, "sound", True
+            )
+            text_id = self.registry.ensure_user_text(
+                24680, "sound", "Микшер"
+            )
+            self.registry.add_schedule(text_id, 2, "18:30")
+            self.registry.set_responsible_contact(
+                67890, "sound", "Свет", "Мария", 35791
+            )
+            inactive_text_id = self.registry.ensure_user_text(
+                35791, "sound", "Свет"
+            )
+            self.registry.add_schedule(inactive_text_id, 1, "09:00")
+
+            choices = SimpleNamespace(
+                data="service:service_reminders:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(choices)
+            summary_button = next(
+                button
+                for row in choices.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "📊 Сводка"
+            )
+            summary = SimpleNamespace(
+                data=summary_button.callback_data,
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(summary)
+
+            text = summary.message.answer.await_args.args[0]
+            self.assertIn("Алексей", text)
+            self.assertIn("Микшер", text)
+            self.assertIn("за 2 дн. в 18:30", text)
+            self.assertIn("утверждённый в боте график", text)
+            self.assertNotIn("Мария", text)
+            self.assertNotIn("24680", text)
+
+        asyncio.run(run())
+
+    def test_service_reminder_shortcut_uses_task_picker_for_large_list(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 12345)
+            for name in ("Перевозка", "Сцена", "Свет", "Запись", "Фото", "Видео"):
+                self.registry.add_service_task(67890, "sound", name)
+            choices = SimpleNamespace(
+                data="service:service_reminders:sound",
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(choices)
+            self.assertIn(
+                "📋 Выбрать задачу",
+                [button.text for row in choices.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row],
+            )
+            picker = await self._click(
+                choices.message,
+                lambda button: button.text == "📋 Выбрать задачу",
+            )
+            picker_text = picker.message.answer.await_args.args[0]
+            self.assertIn("выберите задачу", picker_text)
+            self.assertIn("Страница 1/", picker_text)
+            task = await self._click(
+                picker.message, lambda button: button.text.endswith("🎚️ звук")
+            )
+            self.assertIn("звук", task.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_service_reminder_shortcut_opens_general_list_without_tasks(self):
+        async def run():
+            self.registry.add_service_admin(67890, "books", 12345)
+            self.registry.add_group_reminder(
+                67890, "books", 1, "10:00", "Напоминание о книгах"
+            )
+            callback = SimpleNamespace(
+                data="service:service_reminders:books",
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(callback)
+            text = callback.message.answer.await_args.args[0]
+            self.assertIn("нет отдельных задач", text)
+            self.assertIn("1. ✅", text)
+            self.assertIn("Напоминание о книгах", text)
+            self.assertNotIn(
+                "Общие",
+                [
+                    button.text
+                    for row in callback.message.answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard
+                    for button in row
+                ],
+            )
+            self.assertTrue(any(
+                data.startswith("group_reminder:open:books:")
+                for data in self.callback_data_list(callback.message)
+            ))
+            summary = await self._click(
+                callback.message,
+                lambda button: button.text == "📊 Сводка личных",
+                actor_id=12345,
+            )
+            summary_text = summary.message.answer.await_args.args[0]
+            self.assertIn("Нет ответственных", summary_text)
+            back = await self._click(
+                summary.message,
+                lambda button: button.text == "⬅️ К напоминаниям",
+                actor_id=12345,
+            )
+            self.assertIn(
+                "Напоминание о книгах",
+                back.message.answer.await_args.args[0],
             )
 
         asyncio.run(run())
@@ -7502,7 +7700,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 call.args[0] for call in screen.message.answer.await_args_list
             )
             self.assertIn("📊 ЗВУК · график Excel", text)
-            self.assertIn("в боте графика нет — напоминания по Excel", text)
+            self.assertIn(
+                "график в БД бота не утверждён — напоминания приостановлены",
+                text,
+            )
             load = callback("xls:load:sound:202611")
             await self.callback_handler("on_excel_schedule")(load)
             preview = load.message.answer.await_args.args[0]

@@ -41,6 +41,27 @@ class FormatTaskAssignmentsTest(unittest.TestCase):
         self.assertIn("• Олег", plain_text(text))
         self.assertNotIn("не привязан", text)
 
+    def test_senior_is_listed_before_shift_and_other_tasks_keep_order(self):
+        assignments = {
+            "в смене": {"names": ["Алексей", "Мария"]},
+            "звук": {"names": ["Иван"]},
+            "старший": {"names": ["Олег"]},
+            "пироги": {"names": ["Вера"]},
+        }
+
+        self.assertEqual(
+            plain_text(format_task_assignments(assignments)),
+            "⭐ старший\n"
+            "• Олег\n\n"
+            "👥 в смене\n"
+            "• Алексей\n"
+            "• Мария\n\n"
+            "🎚️ звук\n"
+            "• Иван\n\n"
+            "🥧 пироги\n"
+            "• Вера",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
