@@ -218,6 +218,13 @@ class ServiceRegistry:
         with self._connection() as connection:
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS schedule_notes (
+                    source_key TEXT PRIMARY KEY,
+                    digest TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    notes_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS services (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -6293,11 +6300,47 @@ class ServiceRegistry:
             )
         return self.get_schedule_plan(service_id, month)
 
+    @staticmethod
+    def schedule_plan_version(plan: dict | None) -> str:
+        if plan is None:
+            return hashlib.sha256(b"null").hexdigest()
+        return hashlib.sha256(json.dumps(
+            plan, sort_keys=True, ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+
+    def save_schedule_notes(self, source_key: str, digest: str, notes: list) -> None:
+        payload = json.dumps(notes, ensure_ascii=False)
+        with self._connection(notify=False) as connection:
+            previous = connection.execute(
+                "SELECT digest, notes_json FROM schedule_notes WHERE source_key=?",
+                (source_key,),
+            ).fetchone()
+            changed = previous is None or (
+                previous["digest"] != digest or previous["notes_json"] != payload
+            )
+            connection.execute(
+                "INSERT INTO schedule_notes VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(source_key) DO UPDATE SET digest=excluded.digest, "
+                "checked_at=excluded.checked_at, notes_json=excluded.notes_json",
+                (source_key, digest, _utc_now(), payload),
+            )
+        if changed and self.on_change is not None:
+            self.on_change()
+
+    def get_schedule_notes(self, source_key: str) -> list:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT notes_json FROM schedule_notes WHERE source_key=?",
+                (source_key,),
+            ).fetchone()
+        return json.loads(row["notes_json"]) if row else []
+
     def import_excel_plan(
         self, actor_id: int, service_id: str, month: str, *,
         dates: list[str], tasks: list[dict], slots: dict, days: dict,
         served_offsets: dict | None = None,
         approved_slot_days: dict | None = None,
+        expected_version: str | None = None,
     ) -> dict:
         """«📊 График Excel» → «✅ Подтвердить» (решение 15): график месяца
         из Excel как есть — итоговый график в боте (утверждён, без
@@ -6306,8 +6349,21 @@ class ServiceRegistry:
         _validate_positive_id(actor_id, "actor_id")
         now = _utc_now()
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            if expected_version is not None:
+                row = connection.execute(
+                    "SELECT p.*, s.group_chat_id AS service_chat, "
+                    "s.group_thread_id AS service_thread FROM schedule_plans p "
+                    "JOIN services s ON s.id=p.service_id "
+                    "WHERE p.service_id=? AND p.month=?", (service_id, month),
+                ).fetchone()
+                if self.schedule_plan_version(self._schedule_plan(row)) != expected_version:
+                    raise ValueError(
+                        "График месяца изменился после предпросмотра — "
+                        "загрузите Excel заново."
+                    )
             values = (
                 json.dumps(dates), json.dumps(tasks, ensure_ascii=False),
                 json.dumps(slots, ensure_ascii=False),

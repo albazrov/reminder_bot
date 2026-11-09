@@ -1599,11 +1599,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "⬅️ К списку служений — выбрать другое служение."
     )
 
-    def plan_version(plan: dict | None) -> tuple | None:
+    def plan_version(plan: dict | None) -> str:
         """Версия графика месяца: рабочая и утверждённая копии."""
-        if plan is None:
-            return None
-        return (plan["updated_at"], plan["approved_at"], plan["source"])
+        return ServiceRegistry.schedule_plan_version(plan)
 
     def excel_months() -> list[tuple[int, int]]:
         """Месяцы экрана «📊 График Excel»: текущий и следующий."""
@@ -2773,6 +2771,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         message: Message,
         actor_id: int,
         service_id: str,
+        *,
+        force_reload: bool = False,
     ) -> bool:
         registry = service_registry()
         if registry is None:
@@ -2797,14 +2797,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return False
         session_id = current_pending.get("session_id")
         try:
-            assignments = await task_loader(service_id)
+            assignments = await (
+                task_loader(service_id, force=True) if force_reload
+                else task_loader(service_id)
+            )
         except (PermissionError, ValueError) as exc:
             await _send_dialog(message, _status_text(str(exc), "❌"), parse_mode=None)
             return False
         except Exception:
             debug.exception("Не удалось прочитать задачи из графика служений")
-            await _send_dialog(message, "Не удалось прочитать файл графика служений. "
-                "Проверьте доступность расписания и попробуйте снова.",
+            await _send_dialog(message, "Не удалось прочитать график служений. "
+                "Попробуйте снова; если ошибка повторяется, обратитесь к суперадминистратору.",
                 parse_mode=None,
             )
             return False
@@ -2863,7 +2866,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if loader is None:
             await offer_contact_task_choices(message, actor_id, service_id)
             return
-        if not await load_contact_context(message, actor_id, service_id):
+        if not await load_contact_context(
+            message, actor_id, service_id, force_reload=force_reload
+        ):
             return
         pending = pending_inputs[actor_id]
         try:
@@ -3585,6 +3590,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             pending["send_now"] = {
                 "reminder_id": reminder_id, "text": result["text"],
                 "snapshot": send_now_snapshot(reminder),
+                "event_date": result.get("event_date"),
+                "schedule_state": result.get("schedule_state"),
             }
             text = (
                 f"📤 Отправить сейчас в чат служения? Так оно будет "
@@ -6911,6 +6918,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 loader = getattr(context, "load_upcoming_service_events", None)
                 if not 1 <= month <= 12 or loader is None:
                     raise ValueError("Загрузка графика недоступна.")
+                key = f"{year:04d}-{month:02d}"
+                token = secrets.token_urlsafe(6)
+                pending = {
+                    "operation": "excel_import", "service_id": service_id,
+                    "month": key, "token": token,
+                    "version": plan_version(registry.get_schedule_plan(service_id, key)),
+                }
+                pending_inputs[actor_id] = pending
                 await _send_dialog(
                     message,
                     f"⏳ {service_label(service)}: читаю лист "
@@ -6918,6 +6933,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
                 first = date(year, month, 1)
+                if pending_inputs.get(actor_id) is not pending:
+                    return
+                source: dict[str, str] = {}
                 try:
                     # Среда перед первым воскресеньем — в прошлом месяце,
                     # «вс +1» последнего воскресенья — уже в следующем.
@@ -6925,15 +6943,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         force=True, since=first - timedelta(days=6),
                         until=month_end(year, month) + timedelta(days=6),
                         with_replacements=False, excel_only=True,
+                        source_out=source,
                     )
                 except Exception:  # noqa: BLE001 — показать и не упасть
                     debug.exception("Не удалось прочитать график Excel")
+                    if pending_inputs.get(actor_id) is not pending:
+                        return
+                    pending_inputs.pop(actor_id, None)
                     await show_excel_schedule(
                         message, actor_id, service,
                         "⚠️ Не удалось прочитать лист месяца — проверьте "
                         "файл и попробуйте снова.",
                     )
                     return
+                if pending_inputs.get(actor_id) is not pending:
+                    return
+                if not is_service_admin(actor_id, service_id):
+                    pending_inputs.pop(actor_id, None)
+                    raise PermissionError("Недостаточно прав.")
                 loaded = schedule_plan.excel_plan(
                     registry, service_id, year, month, events
                 )
@@ -6941,18 +6968,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     people for tasks in loaded["slots"].values()
                     for people in tasks.values()
                 ):
+                    pending_inputs.pop(actor_id, None)
                     await show_excel_schedule(
                         message, actor_id, service,
                         f"⚠️ На листе «{month_title(year, month)}» для "
                         "служения нет назначений.",
                     )
                     return
-                key = f"{year:04d}-{month:02d}"
-                token = secrets.token_urlsafe(6)
-                pending_inputs[actor_id] = {
-                    "operation": "excel_import", "service_id": service_id,
-                    "month": key, "token": token, "loaded": loaded,
-                }
+                pending["loaded"] = loaded
+                pending["candidate_version"] = source.get("digest")
                 people = registry.readiness_people(service_id)
                 preview = {
                     "service_id": service_id, "month": key,
@@ -6978,7 +7002,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 current = registry.get_schedule_plan(service_id, key)
                 # Версия графика месяца на момент предпросмотра: если его
                 # успели поправить или утвердить — подтвердить нельзя.
-                pending_inputs[actor_id]["version"] = plan_version(current)
                 if current is not None and current["source"] != "excel":
                     lines += ["", (
                         "⚠️ Утверждённый график по опросу будет заменён."
@@ -7000,6 +7023,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 for chunk_index, chunk in enumerate(
                     chunks := _telegram_text_chunks("\n".join(lines))
                 ):
+                    if pending_inputs.get(actor_id) is not pending:
+                        return
                     await _send_dialog(
                         message, chunk, parse_mode=None,
                         reply_markup=(
@@ -7019,14 +7044,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     message, actor_id, service, "⚠️ Этот экран уже устарел."
                 )
                 return
-            pending_inputs.pop(actor_id, None)
             if action == "no":
+                pending_inputs.pop(actor_id, None)
                 await show_excel_schedule(
                     message, actor_id, service, "↩️ Загрузка отменена."
                 )
                 return
             loaded = pending["loaded"]
             async with readiness.service_lock(service_id):
+                if pending_inputs.get(actor_id) is not pending:
+                    return
+                candidate_version = getattr(context, "schedule_candidate_version", None)
+                if candidate_version is not None and (
+                    candidate_version() != pending.get("candidate_version")
+                ):
+                    raise ValueError(
+                        "Excel изменился после предпросмотра — загрузите график заново."
+                    )
                 if plan_version(registry.get_schedule_plan(
                     service_id, pending["month"]
                 )) != pending.get("version"):
@@ -7045,12 +7079,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     {**loaded, "service_id": service_id},
                     people,
                 )
+                pending_inputs.pop(actor_id, None)
                 registry.import_excel_plan(
                     actor_id, service_id, pending["month"],
                     dates=loaded["dates"], tasks=loaded["tasks"],
                     slots=loaded["slots"], days=loaded["days"],
                     served_offsets=offsets,
                     approved_slot_days=approved_days,
+                    expected_version=pending["version"],
                 )
             year, month = map(int, pending["month"].split("-"))
             await show_excel_schedule(
@@ -7845,6 +7881,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
                 try:
+                    check_state = getattr(context, "group_preview_state", None)
+                    if check_state is not None and (
+                        prepared.get("event_date") is None
+                        or check_state(service_id, prepared["event_date"])
+                        != prepared.get("schedule_state")
+                    ):
+                        await _answer_callback(
+                            callback, "⚠️ График изменился. Откройте предпросмотр заново."
+                        )
+                        return
                     await send_to_service_group(
                         lambda chat_id, text, **kwargs: send_telegram_screen(
                             context.bot.send_message, chat_id, text,

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import logging
 import os
@@ -235,6 +236,108 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 loader.assert_awaited_once()
 
         asyncio.run(load())
+
+    def test_approved_delivery_and_summary_read_db_without_network(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+        import hashlib
+        import sqlite3
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir)
+                registry = ServiceRegistry(root / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                day = date(2026, 11, 1)
+                url = "https://example.invalid/schedule"
+                key = hashlib.sha256(url.encode()).hexdigest()
+                self.approve_plan(registry, "sound", day, "Микшер", "Алексей")
+                registry.save_schedule_notes(
+                    key, "version-one",
+                    [["sound", day.isoformat(), "2я часть", "членское"]],
+                )
+                loader = AsyncMock(side_effect=AssertionError("network"))
+                with patch.object(app, "download_public", loader):
+                    result, found = await app._load_service_task_assignments(
+                        SimpleNamespace(yandex_public_url=url), root, ZoneInfo("UTC"),
+                        "sound", MagicMock(), only_date=day, registry=registry,
+                        require_approved_plan=True, return_event_found=True,
+                    )
+                    self.assertTrue(found)
+                    self.assertEqual(result["Микшер"]["names"], ["Алексей"])
+                    self.assertEqual(result["2я часть"]["names"], ["членское"])
+                    summary = await app._load_month_summary_events(
+                        loader, registry, {}, datetime(2026, 10, 31),
+                        public_url=url, since=day, until=date(2026, 11, 30),
+                    )
+                    self.assertEqual(len(summary), 1)
+                    # A successful source update removes deleted notes without changing assignments.
+                    registry.save_schedule_notes(key, "version-two", [])
+                    summary = await app._load_month_summary_events(
+                        loader, registry, {}, datetime(2026, 10, 31),
+                        public_url=url, since=day, until=date(2026, 11, 30),
+                    )
+                    self.assertEqual(
+                        [item.task for item in summary[0].assignments], ["Микшер"]
+                    )
+                    # Notes belonging to another URL are never reused.
+                    self.assertEqual(app._saved_note_events(
+                        registry, url + "-other", day, day
+                    ), [])
+                    with patch.object(
+                        registry, "get_schedule_plan",
+                        side_effect=sqlite3.OperationalError("unavailable"),
+                    ), self.assertRaises(sqlite3.OperationalError):
+                        await app._load_service_task_assignments(
+                            SimpleNamespace(yandex_public_url=url), root, ZoneInfo("UTC"),
+                            "sound", MagicMock(), only_date=day, registry=registry,
+                            require_approved_plan=True,
+                        )
+                loader.assert_not_awaited()
+
+        asyncio.run(process())
+
+    def test_reference_refresh_changes_notes_but_not_approved_assignments(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+        from openpyxl import Workbook
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            registry = ServiceRegistry(root / "registry.sqlite3")
+            registry.initialize(1001, -10001)
+            day = date(2026, 11, 1)
+            self.approve_plan(registry, "sound", day, "звук", "Алексей")
+            approved = registry.get_schedule_plan("sound", "2026-11")["approved"]
+            path = root / "candidate.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "НОЯБРЬ26"
+            for row in (["ЗВУК"], [day], ["звук", "Мария"], ["*2я часть", "членское"]):
+                sheet.append(row)
+            roster = workbook.create_sheet("Списки")
+            for row in (["ЗВУК"], ["звук"], ["Алексей"]):
+                roster.append(row)
+            workbook.save(path)
+            url = "https://example.invalid/schedule"
+            asyncio.run(app._refresh_schedule_reference_data(registry, url, path, MagicMock()))
+            shown = app._approved_service_events(registry, url, day, day)
+            self.assertEqual(
+                [(item.task, item.name) for item in shown[0].assignments],
+                [("звук", "Алексей"), ("2я часть", "членское")],
+            )
+            sheet.delete_rows(4)
+            workbook.save(path)
+            workbook.close()
+            asyncio.run(app._refresh_schedule_reference_data(registry, url, path, MagicMock()))
+            shown = app._approved_service_events(registry, url, day, day)
+            self.assertEqual(
+                [(item.task, item.name) for item in shown[0].assignments],
+                [("звук", "Алексей")],
+            )
+            self.assertEqual(
+                registry.get_schedule_plan("sound", "2026-11")["approved"], approved
+            )
 
     def test_service_reminder_without_approved_schedule_is_suppressed(self):
         from bot import app
@@ -840,12 +943,15 @@ class ReminderBotEntrypointTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
                 app, "download_public", new=AsyncMock()
             ), patch.object(app, "parse_service_events", side_effect=parse):
+                source = {}
                 events = await app._load_upcoming_service_events(
                     SimpleNamespace(yandex_public_url="https://example.invalid"),
                     Path(tmp_dir),
                     ZoneInfo("UTC"),
                     MagicMock(),
+                    source_out=source,
                 )
+                self.assertEqual(source["digest"], hashlib.sha256(b"").hexdigest())
                 leftovers = list((Path(tmp_dir) / "debug").iterdir())
             return events, leftovers
 

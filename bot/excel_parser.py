@@ -80,6 +80,32 @@ _COMMENTS_MARKER = "комментарии"
 _MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
+def parse_workbook_service_events(path: Path, debug_logger, services=None) -> list:
+    """Validate all monthly sheets, including months outside the UI window."""
+    workbook = _load_workbook(path, debug_logger)
+    try:
+        months = []
+        for name in workbook.sheetnames:
+            for number, prefix in enumerate(_MONTH_SHEETS, 1):
+                match = re.fullmatch(prefix + r"(\d{2})", name.strip().upper())
+                if match:
+                    months.append(date(2000 + int(match[1]), number, 1))
+        if not months and any(name.strip().lower() == "график" for name in workbook.sheetnames):
+            months = [date.today().replace(day=1)]
+    finally:
+        workbook.close()
+    if not months:
+        raise RuntimeError("В Excel нет месячных листов графика.")
+    events = []
+    for month in sorted(set(months)):
+        try:
+            parsed = parse_service_events(path, month, debug_logger, services)
+        except SheetEmptyError:
+            continue
+        events.extend(event for items in parsed.values() for event in items)
+    return events
+
+
 def _repair_known_stylesheet_issue(path: Path) -> BytesIO | None:
     with zipfile.ZipFile(path) as source:
         try:
