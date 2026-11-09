@@ -12,6 +12,7 @@ import zipfile
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -415,6 +416,41 @@ class BackupManagerTest(unittest.TestCase):
                 await self.manager.report_failure("schedule", "failed download")
             self.assertEqual(notices.await_count, 2)
             self.assertIn("schedule", self.manager._failure_notices)
+
+        asyncio.run(scenario())
+
+    def test_partial_notice_retries_only_failed_superadmins_until_recovery(self):
+        from bot import app
+
+        async def scenario():
+            registry = SimpleNamespace(
+                list_admin_ids=lambda: {1001: True, 2002: False, 3003: True}
+            )
+
+            async def notify(message, delivered):
+                await app._notify_super_admins(
+                    SimpleNamespace(), registry, message, self.manager.logger,
+                    delivered_ids=delivered,
+                )
+
+            self.manager.set_failure_callback(notify)
+            with patch.object(
+                app, "_notify_admin",
+                new=AsyncMock(side_effect=[True, False, True, True, True]),
+            ) as send:
+                await self.manager.report_failure("schedule", "failed once")
+                await self.manager.report_failure("schedule", "failed again")
+                await self.manager.report_failure("schedule", "still failed")
+                self.assertEqual(
+                    [call.args[1] for call in send.await_args_list],
+                    [1001, 3003, 3003],
+                )
+                self.manager.clear_failure("schedule")
+                await self.manager.report_failure("schedule", "new failure")
+                self.assertEqual(
+                    [call.args[1] for call in send.await_args_list],
+                    [1001, 3003, 3003, 1001, 3003],
+                )
 
         asyncio.run(scenario())
 

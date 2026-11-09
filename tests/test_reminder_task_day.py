@@ -136,6 +136,8 @@ class TaskDayProcessingTest(unittest.TestCase):
                 app, "_load_service_task_assignments",
                 new=AsyncMock(return_value=(assignments, True)),
             ) as load, patch.object(
+                app, "_has_approved_schedule_for_event", return_value=True,
+            ), patch.object(
                 app, "_notify_admin", new=AsyncMock(return_value=True)
             ) as notify, patch.object(
                 app, "send_admin_reports", new=AsyncMock()

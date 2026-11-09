@@ -29,6 +29,472 @@ NEEDS_PROC = unittest.skipUnless(
 
 
 class ReminderBotEntrypointTest(unittest.TestCase):
+    def setUp(self):
+        from bot import app
+
+        self._approved_schedule = patch.object(
+            app, "_has_approved_schedule_for_event", return_value=True
+        )
+        self._approved_schedule.start()
+
+    def tearDown(self):
+        self._approved_schedule.stop()
+
+    def test_backup_schedule_download_uses_configured_yandex_retries(self):
+        from bot import app
+        from bot.yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL
+
+        async def download():
+            path = Path("schedule.xlsx")
+            logger = MagicMock()
+            with patch.object(
+                app, "download_public", new=AsyncMock()
+            ) as download_public:
+                await app._download_backup_schedule(
+                    "https://example.invalid/schedule", path, logger
+                )
+            download_public.assert_awaited_once_with(
+                "https://example.invalid/schedule",
+                path,
+                logger,
+                attempts=RETRY_ATTEMPTS,
+                interval=RETRY_INTERVAL,
+            )
+
+        asyncio.run(download())
+
+    def test_backup_failure_notifies_only_super_admins(self):
+        from bot import app
+
+        async def notify():
+            registry = SimpleNamespace(
+                list_admin_ids=lambda: {1001: True, 2002: False, 3003: True}
+            )
+            with patch.object(
+                app, "_notify_admin", new=AsyncMock(return_value=True)
+            ) as send_notice:
+                await app._notify_super_admins(
+                    SimpleNamespace(),
+                    registry,
+                    "Ошибка обновления",
+                    MagicMock(),
+                )
+            self.assertEqual(
+                [call.args[1] for call in send_notice.await_args_list],
+                [1001, 3003],
+            )
+
+        asyncio.run(notify())
+
+    def test_backup_failure_uses_primary_admin_if_registry_is_unavailable(self):
+        from bot import app
+        import sqlite3
+
+        async def notify():
+            for registry in (
+                None,
+                SimpleNamespace(list_admin_ids=MagicMock(
+                    side_effect=sqlite3.OperationalError("database unavailable")
+                )),
+            ):
+                with patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as send_notice:
+                    await app._notify_super_admins(
+                        SimpleNamespace(), registry, "Ошибка", MagicMock(),
+                        primary_admin_id=1001,
+                    )
+                self.assertEqual(
+                    [call.args[1] for call in send_notice.await_args_list],
+                    [1001],
+                )
+
+        asyncio.run(notify())
+
+    @staticmethod
+    def approve_plan(registry, service_id, event_date, task, name):
+        slots = {event_date.isoformat(): {task: [name]}}
+        month = event_date.strftime("%Y-%m")
+        registry.save_schedule_draft(
+            service_id, month, run_id=None, dates=list(slots),
+            tasks=[{"name": task, "needed": 1}], slots=slots, last_served={},
+        )
+        registry.approve_schedule_plan(
+            1001, service_id, month, slots, chat_id=None, message_id=None,
+        )
+
+    def test_reminders_reject_replaced_approved_assignments_during_load(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            for personal in (False, True):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                    registry.initialize(1001, -10001)
+                    registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                    registry.set_responsible_contact(
+                        1001, "sound", "Микшер", "Алексей", 2002
+                    )
+                    registry.set_user_notifications_enabled(2002, "sound", True)
+                    text_id = registry.ensure_user_text(2002, "sound", "Микшер")
+                    schedule = registry.add_schedule(text_id, 1, "18:00")
+                    event_date = date(2026, 10, 18)
+                    self.approve_plan(
+                        registry, "sound", event_date, "Микшер", "Алексей"
+                    )
+                    reminder_id = registry.add_group_reminder(
+                        1001, "sound", 1, "18:00", "{task_assignments}",
+                        allow_duplicate=True,
+                    )
+                    bot = SimpleNamespace(send_message=AsyncMock())
+                    logger = MagicMock()
+
+                    async def load(*args, **kwargs):
+                        self.approve_plan(
+                            registry, "sound", event_date, "Микшер", "Мария"
+                        )
+                        return {"Микшер": ["Алексей"]}, True
+
+                    with patch.object(
+                        app, "_load_service_task_assignments", side_effect=load,
+                    ):
+                        if personal:
+                            await app._process_user_reminder_schedule(
+                                bot, SimpleNamespace(admin_tg_id=1001),
+                                Path(tmp_dir), ZoneInfo("UTC"), registry,
+                                schedule["id"], logger, logger,
+                                run_date=event_date - timedelta(days=1),
+                            )
+                        else:
+                            await app._process_service_reminder(
+                                bot, SimpleNamespace(admin_tg_id=1001),
+                                Path(tmp_dir), ZoneInfo("UTC"), registry,
+                                "sound", reminder_id, logger, logger,
+                                run_date=event_date - timedelta(days=1),
+                            )
+                    self.assertFalse(group_sends(bot))
+                    self.assertFalse(any(
+                        call.args[0] == 2002
+                        for call in bot.send_message.await_args_list
+                    ))
+                    self.assertFalse(registry.is_user_reminder_delivered(
+                        schedule["id"], event_date.isoformat(),
+                    ))
+                    self.assertFalse(registry.is_group_reminder_delivered(
+                        reminder_id, event_date.isoformat(), "group:-10055",
+                    ))
+
+        asyncio.run(process())
+
+    def test_month_summary_cache_rechecks_current_approved_assignments(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+        import sqlite3
+
+        async def load():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                event_date = date(2026, 10, 18)
+                self.approve_plan(
+                    registry, "sound", event_date, "Микшер", "Алексей"
+                )
+                events, _ = app._bot_plan_events(
+                    registry, event_date, event_date, service_id="sound"
+                )
+                loader = AsyncMock(return_value=events)
+                cache = {}
+                now = datetime(2026, 10, 10, 18, tzinfo=ZoneInfo("UTC"))
+                kwargs = dict(since=date(2026, 10, 1), until=date(2026, 10, 31))
+                initial = await app._load_month_summary_events(
+                    loader, registry, cache, now, **kwargs
+                )
+                self.assertEqual(initial[0].assignments[0].name, "Алексей")
+                self.approve_plan(
+                    registry, "sound", event_date, "Микшер", "Мария"
+                )
+                changed = await app._load_month_summary_events(
+                    loader, registry, cache, now + timedelta(minutes=1), **kwargs
+                )
+                self.assertEqual(changed[0].assignments[0].name, "Мария")
+                with patch.object(
+                    registry, "get_schedule_plan",
+                    side_effect=sqlite3.OperationalError("unavailable"),
+                ), self.assertRaises(sqlite3.OperationalError):
+                    await app._load_month_summary_events(
+                        loader, registry, cache, now + timedelta(minutes=2),
+                        **kwargs,
+                    )
+                with patch.object(registry, "get_schedule_plan", return_value=None):
+                    withdrawn = await app._load_month_summary_events(
+                        loader, registry, cache, now + timedelta(minutes=3),
+                        **kwargs,
+                    )
+                self.assertEqual(withdrawn, [])
+                loader.assert_awaited_once()
+
+        asyncio.run(load())
+
+    def test_service_reminder_without_approved_schedule_is_suppressed(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.list_group_reminders("assembly")[0]
+                event_date = date(2026, 10, 11)
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_has_approved_schedule_for_event",
+                    return_value=False,
+                ), patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(),
+                ) as load, patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as notify:
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=event_date - timedelta(
+                            days=reminder["reminder_days"]
+                        ),
+                    )
+
+                load.assert_not_awaited()
+                notify.assert_awaited_once()
+                self.assertIn("не сохранил его в БД бота", notify.await_args.args[2])
+                self.assertFalse(any(
+                    call.args[0] == -10001
+                    for call in bot.send_message.await_args_list
+                ))
+                self.assertTrue(registry.has_readiness_notice(
+                    "assembly", "2026-10", "schedule-unapproved"
+                ))
+
+        asyncio.run(process())
+
+    def test_personal_reminder_without_approved_schedule_is_suppressed(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "Микшер", "Алексей", 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                user_text = registry.upsert_user_text(
+                    2002, "sound", "Микшер", "Напоминание {name}"
+                )
+                schedule = registry.add_schedule(user_text, 1, "18:00")
+                event_date = date(2026, 10, 18)
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_has_approved_schedule_for_event",
+                    return_value=False,
+                ), patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(),
+                ) as load, patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as notify:
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], logger,
+                        logger,
+                        run_date=event_date - timedelta(
+                            days=schedule["reminder_days"]
+                        ),
+                    )
+
+                load.assert_not_awaited()
+                notify.assert_awaited_once()
+                self.assertFalse(any(
+                    call.args[0] == 2002
+                    for call in bot.send_message.await_args_list
+                ))
+
+        asyncio.run(process())
+
+    def test_personal_reminder_preparation_failure_is_logged_not_sent_to_admin(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "Микшер", "Алексей", 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                text_id = registry.ensure_user_text(2002, "sound", "Микшер")
+                schedule = registry.add_schedule(text_id, 1, "18:00")
+                event_date = date(2026, 10, 18)
+                logger = MagicMock()
+                with patch.object(
+                    app, "_has_approved_schedule_for_event",
+                    return_value=True,
+                ), patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(side_effect=RuntimeError("workbook unavailable")),
+                ), patch.object(
+                    app, "_notify_admin", new=AsyncMock(return_value=True)
+                ) as notify:
+                    await app._process_user_reminder_schedule(
+                        SimpleNamespace(send_message=AsyncMock()),
+                        SimpleNamespace(admin_tg_id=1001),
+                        Path(tmp_dir),
+                        ZoneInfo("UTC"),
+                        registry,
+                        schedule["id"],
+                        logger,
+                        logger,
+                        run_date=event_date - timedelta(
+                            days=schedule["reminder_days"]
+                        ),
+                    )
+
+                notify.assert_not_awaited()
+                logger.exception.assert_called_once()
+
+        asyncio.run(process())
+
+    def test_group_reminder_is_suppressed_if_approval_is_revoked_during_load(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                reminder = registry.list_group_reminders("assembly")[0]
+                event_date = date(2026, 10, 11)
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_has_approved_schedule_for_event",
+                    side_effect=(True, False),
+                ), patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Ведущий": ["Анна"]}, True)),
+                ):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, "assembly", reminder["id"],
+                        logger, logger,
+                        run_date=event_date - timedelta(
+                            days=reminder["reminder_days"]
+                        ),
+                    )
+
+                self.assertFalse(any(
+                    call.args[0] == -10001
+                    for call in bot.send_message.await_args_list
+                ))
+
+        asyncio.run(process())
+
+    def test_personal_reminder_is_suppressed_if_approval_is_revoked_during_load(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def process():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                registry.set_group_chat(1001, "sound", -10055, enabled=True)
+                registry.set_responsible_contact(
+                    1001, "sound", "Микшер", "Алексей", 2002
+                )
+                registry.set_user_notifications_enabled(2002, "sound", True)
+                user_text = registry.upsert_user_text(
+                    2002, "sound", "Микшер", "Напоминание {name}"
+                )
+                schedule = registry.add_schedule(user_text, 1, "18:00")
+                event_date = date(2026, 10, 18)
+                bot = SimpleNamespace(send_message=AsyncMock())
+                logger = MagicMock()
+                with patch.object(
+                    app, "_has_approved_schedule_for_event",
+                    side_effect=(True, False),
+                ), patch.object(
+                    app, "_load_service_task_assignments",
+                    new=AsyncMock(return_value=({"Микшер": ["Алексей"]}, True)),
+                ):
+                    await app._process_user_reminder_schedule(
+                        bot, SimpleNamespace(admin_tg_id=1001), Path(tmp_dir),
+                        ZoneInfo("UTC"), registry, schedule["id"], logger,
+                        logger,
+                        run_date=event_date - timedelta(
+                            days=schedule["reminder_days"]
+                        ),
+                    )
+
+                self.assertFalse(any(
+                    call.args[0] == 2002
+                    for call in bot.send_message.await_args_list
+                ))
+
+        asyncio.run(process())
+
+    def test_delivery_loader_does_not_download_excel_without_approved_plan(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        async def load():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+                registry.initialize(1001, -10001)
+                with patch.object(
+                    app, "download_public", new=AsyncMock()
+                ) as download:
+                    result = await app._load_service_task_assignments(
+                        SimpleNamespace(
+                            yandex_public_url="https://example.invalid/schedule"
+                        ),
+                        Path(tmp_dir),
+                        ZoneInfo("UTC"),
+                        "sound",
+                        MagicMock(),
+                        only_date=date(2026, 10, 18),
+                        return_event_found=True,
+                        registry=registry,
+                        require_approved_plan=True,
+                    )
+                download.assert_not_awaited()
+                self.assertEqual(result, ({}, False))
+
+        asyncio.run(load())
+
+    def test_approved_only_event_overlay_excludes_excel_candidates(self):
+        from bot import app
+        from bot.excel_parser import ServiceEvent
+        from bot.service_registry import ServiceRegistry
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+            registry.initialize(1001, -10001)
+            candidate = ServiceEvent("sound", date(2026, 10, 18), ())
+            self.assertEqual(
+                app._apply_bot_plans(
+                    [candidate], registry, date(2026, 10, 18),
+                    date(2026, 10, 18), approved_only=True,
+                ),
+                [],
+            )
+
     def test_legacy_delivery_parses_own_download_not_shared_backup_file(self):
         from bot import app
 

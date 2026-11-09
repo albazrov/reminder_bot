@@ -401,26 +401,37 @@ SHM_DIR=/dev/shm/reminder_bot/test LOG_DIR=/dev/shm/reminder_bot/test/logs ./man
 
 ## Разработка
 
-1. Разработка в ветке `dev` в `/home/pi/app/reminder_bot/src`.
-2. PR `dev → test`: unit-тесты на GitHub-hosted runner, затем деплой
-   в `/mnt/external_data/reminder_bot/test` self-hosted runner'ом.
-3. Тестовый бот остаётся запущенным для ручной проверки.
-4. После одобрения — PR `dev → main`. После merge в `main` workflow
-   синхронизирует проект в `/home/pi/app/reminder_bot/prod`.
+Рабочая копия форка — `reminder_bot_fork`, разработка ведётся в `dev`.
+Перед изменениями проверьте `git status -sb`, сохраните чужие локальные
+изменения и синхронизируйте `dev` с `origin/dev`. Не отправляйте напрямую
+изменения в `test` или `main`.
 
-Подробности — в `.github/workflows/deploy.yml` и разделе 7 `zt.txt`.
+1. PR `dev → test` запускает тесты и, если проверки успешны, развёртывание
+   на self-hosted runner в `/mnt/external_data/reminder_bot/test`.
+2. Проверьте работу тестового бота.
+3. Для выпуска создаётся PR `test → main`; push в `main` запускает prod
+   deploy в `/home/pi/app/reminder_bot/prod`.
+
+Коммит, push, создание/слияние PR и развёртывание выполняйте только в
+соответствии с явной просьбой пользователя. Предыдущее разрешение на выпуск
+не считается постоянным. Проверка Greptile может быть зелёной, даже если
+есть review-комментарии: изучайте сводку и новые inline-комментарии отдельно.
+Подробности и условия запуска — в `.github/workflows/deploy.yml`.
+
+Готовый общий промт для нового чата: [docs/NEW_CHAT_PROMPT.md](docs/NEW_CHAT_PROMPT.md).
+Правила разработки и предметные инварианты: [`.github/skills/reminder-bot-project/SKILL.md`](.github/skills/reminder-bot-project/SKILL.md).
 
 ### Тесты локально
 
 ```bash
-cd /home/pi/app/reminder_bot/src
-mkdir -p /dev/shm/app/reminder_bot/src/.tmp
-TMPDIR=/dev/shm/app/reminder_bot/src/.tmp \
-    /home/pi/.venv/bin/python -m unittest discover -s tests -v
+mkdir -p /Users/alex/projects/.tmp/reminder_bot
+TMPDIR=/Users/alex/projects/.tmp/reminder_bot \
+    /Users/alex/projects/.venv/bin/python -m unittest discover -s tests -q
 ```
 
-После завершения удалить только созданные тестовые файлы, не
-родительские каталоги.
+На Mac часть POSIX-тестов пропускается. Полный прогон записывайте во
+временный лог и запускайте в фоне, если он может занять больше короткого
+интерактивного вызова. Не запускайте локально бота с prod/test токеном.
 
 ### Отладка парсинга Excel
 
