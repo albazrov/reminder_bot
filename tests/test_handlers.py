@@ -6047,6 +6047,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             message = self.message(actor_id, "/my_schedule")
             await self.message_handler("on_my_schedule")(message)
 
+            self.context.load_upcoming_service_events.assert_awaited_once_with(
+                approved_only=True
+            )
             text = message.answer.await_args.args[0]
             self.assertIn("🗓 25.10.2026, вс", text)
             self.assertIn("🎚️ ЗВУК · Микшер", text)

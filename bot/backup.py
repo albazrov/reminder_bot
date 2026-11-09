@@ -263,9 +263,11 @@ class BackupManager:
         self._retry_armed = False
         self._backup_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
-        self._failure_callback: Callable[[str], Awaitable[None]] | None = None
+        self._failure_callback: Callable[[str, set[int]], Awaitable[None]] | None = None
         self._snapshot_validation_cache: dict[Path, tuple[tuple, bool]] = {}
         self._failure_notices: set[str] = set()
+        self._failure_recipients: dict[str, set[int]] = {}
+        self._failure_notice_lock = asyncio.Lock()
         self._storage_levels: dict[Path, str] = {}
         self._schedule_copy_task: asyncio.Task | None = None
         self._pending_schedule_copy: tuple[int, Path] | None = None
@@ -274,23 +276,26 @@ class BackupManager:
         self._closing = False
 
     def set_failure_callback(
-        self, callback: Callable[[str], Awaitable[None]]
+        self, callback: Callable[[str, set[int]], Awaitable[None]]
     ) -> None:
         self._failure_callback = callback
 
     async def report_failure(self, kind: str, message: str) -> None:
         self.logger.error("%s", message)
-        if kind in self._failure_notices or self._failure_callback is None:
-            return
-        try:
-            await self._failure_callback(message)
-        except Exception:
-            self.logger.exception("Не удалось уведомить администратора о бэкапе")
-        else:
-            self._failure_notices.add(kind)
+        async with self._failure_notice_lock:
+            if kind in self._failure_notices or self._failure_callback is None:
+                return
+            delivered = self._failure_recipients.setdefault(kind, set())
+            try:
+                await self._failure_callback(message, delivered)
+            except Exception:
+                self.logger.exception("Не удалось уведомить администратора о бэкапе")
+            else:
+                self._failure_notices.add(kind)
 
     def clear_failure(self, kind: str) -> None:
         self._failure_notices.discard(kind)
+        self._failure_recipients.pop(kind, None)
 
     async def _complete_io(self, action: Callable[[], _T]) -> _T:
         worker = asyncio.create_task(asyncio.to_thread(action))
@@ -470,7 +475,7 @@ class BackupManager:
                 await self.check_storage()
                 delay = SCHEDULE_RETRY_SECONDS
             else:
-                self._failure_notices.discard("schedule")
+                self.clear_failure("schedule")
                 delay = SCHEDULE_REFRESH_SECONDS
             finally:
                 first_attempt = False
@@ -543,7 +548,7 @@ class BackupManager:
                     self.mark_dirty()
                 raise
             self._retry_armed = False
-            self._failure_notices.discard("backup")
+            self.clear_failure("backup")
             self.logger.info("Резервная копия создана (%s): %s", reason, snapshot)
             await self.check_storage()
             return snapshot
@@ -578,8 +583,11 @@ class BackupManager:
                     f"storage:{path}", f"Не удалось проверить место на {path}: {exc}"
                 )
                 continue
-            self._failure_notices.discard(f"storage:{path}")
+            self.clear_failure(f"storage:{path}")
             level = self._storage_level(usage)
+            for other_level in ("warning", "critical"):
+                if other_level != level:
+                    self.clear_failure(f"space:{path}:{other_level}")
             if level == "ok":
                 self._storage_levels.pop(path, None)
                 continue
@@ -587,7 +595,6 @@ class BackupManager:
                 continue
             percent = (usage.total - usage.free) * 100 / usage.total
             kind = f"space:{path}:{level}"
-            self._failure_notices.discard(kind)
             await self.report_failure(
                 kind,
                 f"{'Критически мало места' if level == 'critical' else 'Мало места'} "

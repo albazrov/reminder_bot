@@ -11713,7 +11713,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 return
             events = await loader(
-                since=date(year, month, 1), until=month_end(year, month)
+                since=date(year, month, 1), until=month_end(year, month),
+                approved_only=True,
             )
             text = month_summary_text(
                 events, linked, service_labels(registry), year, month
@@ -11790,7 +11791,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     parse_mode=None,
                 )
                 return
-            text = upcoming_text(registry, actor_id, await loader())
+            text = upcoming_text(
+                registry, actor_id, await loader(approved_only=True)
+            )
         except sqlite3.Error:
             debug.exception("Не удалось прочитать назначения пользователя")
             text = "❌ Не удалось прочитать ваши назначения. Попробуйте позже."

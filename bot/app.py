@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import signal
+import sqlite3
 import stat
 import tempfile
 import time
@@ -581,21 +582,41 @@ async def _download_backup_schedule(
 
 async def _notify_super_admins(
     bot: Bot,
-    service_registry: ServiceRegistry,
+    service_registry: ServiceRegistry | None,
     message: str,
     debug_logger: logging.Logger,
+    *,
+    primary_admin_id: int | None = None,
+    delivered_ids: set[int] | None = None,
 ) -> None:
-    super_admin_ids = sorted(
-        telegram_id
-        for telegram_id, is_super_admin in service_registry.list_admin_ids().items()
-        if is_super_admin
-    )
+    delivered_ids = delivered_ids if delivered_ids is not None else set()
+    try:
+        admins = (
+            service_registry.list_admin_ids()
+            if service_registry is not None else {}
+        )
+    except (sqlite3.Error, OSError, RuntimeError):
+        debug_logger.exception(
+            "Не удалось прочитать суперадминистраторов для уведомления о бэкапе"
+        )
+        admins = {}
+    super_admin_ids = sorted(key for key, is_super in admins.items() if is_super)
+    if not super_admin_ids and primary_admin_id is not None:
+        debug_logger.warning(
+            "Реестр суперадминистраторов недоступен или пуст; "
+            "уведомление о бэкапе получит настроенный главный администратор"
+        )
+        super_admin_ids = [primary_admin_id]
     if not super_admin_ids:
         raise RuntimeError("В реестре не настроены суперадминистраторы")
 
     failed = False
     for telegram_id in super_admin_ids:
-        if not await _notify_admin(bot, telegram_id, message, debug_logger):
+        if telegram_id in delivered_ids:
+            continue
+        if await _notify_admin(bot, telegram_id, message, debug_logger):
+            delivered_ids.add(telegram_id)
+        else:
             failed = True
     if failed:
         raise RuntimeError("Не удалось уведомить всех суперадминистраторов")
@@ -933,6 +954,21 @@ def _has_approved_schedule_for_event(
     )
 
 
+def _approved_assignments_state(
+    registry, service_id: str, event_date: date,
+) -> tuple[bool, tuple[ServiceEvent, ...]]:
+    events, covered = _bot_plan_events(
+        registry, event_date, event_date, service_id=service_id
+    )
+    return (
+        _covered(
+            SimpleNamespace(service_id=service_id, event_date=event_date),
+            covered,
+        ),
+        tuple(event for event in events if event.event_date == event_date),
+    )
+
+
 def _covered(event, covered: set) -> bool:
     """Событие Excel заменено графиком бота: воскресенье утверждённого
     месяца, дата, которая есть в графике бота, или свой день задачи
@@ -992,6 +1028,40 @@ def _apply_bot_plans(
         kept + merged,
         key=lambda event: (event.event_date, event.service_id),
     )
+
+
+async def _load_month_summary_events(
+    loader, registry, cache: dict, now: datetime, *,
+    fresh: bool = False, **kwargs,
+) -> list:
+    forced_at = cache.get("forced_at")
+    fresh = fresh and (
+        forced_at is None or now - forced_at >= timedelta(minutes=10)
+    )
+    if (
+        not fresh
+        and cache.get("kwargs") == kwargs
+        and now - cache["at"] < timedelta(minutes=30)
+    ):
+        events = cache["events"]
+    else:
+        events = await loader(
+            force=fresh, with_replacements=False, approved_only=True, **kwargs
+        )
+        if fresh:
+            cache["forced_at"] = now
+        cache.update(kwargs=kwargs, at=now, events=events)
+    today = now.date()
+    start = min(kwargs.get("since") or today, today)
+    limit = kwargs.get("until") or today + timedelta(
+        weeks=UPCOMING_WEEKS_DEFAULT
+    )
+    # Кэш не фиксирует утверждение: отмена или замена плана действует
+    # немедленно, даже пока другой пользователь ждёт свой график.
+    current = _apply_bot_plans(
+        events, registry, start, limit, approved_only=True
+    )
+    return _apply_event_replacements(current, registry)
 
 
 def _apply_event_replacements(events: list, registry) -> list:
@@ -1339,6 +1409,9 @@ async def _process_service_reminder(
         approved_plan = _has_approved_schedule_for_event(
             registry, service_id, event_date
         )
+        approved_state = _approved_assignments_state(
+            registry, service_id, event_date
+        )
     except Exception:
         debug_logger.exception(
             "Не удалось проверить утверждённый график служения %s",
@@ -1558,6 +1631,9 @@ async def _process_service_reminder(
                 still_approved = _has_approved_schedule_for_event(
                     registry, service_id, event_date
                 )
+                same_assignments = approved_state == _approved_assignments_state(
+                    registry, service_id, event_date
+                )
             except Exception:
                 debug_logger.exception(
                     "Не удалось повторно проверить утверждённый график "
@@ -1577,6 +1653,13 @@ async def _process_service_reminder(
                 await _notify_unapproved_schedule(
                     bot, credentials, registry, service_id, event_date,
                     debug_logger,
+                )
+                return
+            if not same_assignments:
+                debug_logger.info(
+                    "Утверждённые назначения %s на %s изменились "
+                    "во время подготовки — отправка отменена",
+                    service_id, event_date,
                 )
                 return
             try:
@@ -1675,6 +1758,9 @@ async def _process_user_reminder_schedule(
 
     try:
         approved_plan = _has_approved_schedule_for_event(
+            registry, schedule["service_id"], event_date
+        )
+        approved_state = _approved_assignments_state(
             registry, schedule["service_id"], event_date
         )
     except Exception:
@@ -1808,6 +1894,9 @@ async def _process_user_reminder_schedule(
         still_approved = _has_approved_schedule_for_event(
             registry, schedule["service_id"], event_date
         )
+        same_assignments = approved_state == _approved_assignments_state(
+            registry, schedule["service_id"], event_date
+        )
     except Exception:
         debug_logger.exception(
             "Не удалось повторно проверить утверждённый график для "
@@ -1826,6 +1915,12 @@ async def _process_user_reminder_schedule(
         await _notify_unapproved_schedule(
             bot, credentials, registry, schedule["service_id"],
             event_date, debug_logger,
+        )
+        return
+    if not same_assignments:
+        debug_logger.info(
+            "Утверждённые назначения личного расписания %s изменились "
+            "во время подготовки — отправка отменена", schedule_id,
         )
         return
     try:
@@ -2416,9 +2511,13 @@ async def _run_locked(args: CliArgs) -> None:
         register(dp, context)
 
         if backup_manager is not None:
-            async def notify_backup_failure(message: str) -> None:
+            async def notify_backup_failure(
+                message: str, delivered_ids: set[int],
+            ) -> None:
                 await _notify_super_admins(
-                    bot, service_registry, message, debug_logger
+                    bot, service_registry, message, debug_logger,
+                    primary_admin_id=credentials.admin_tg_id,
+                    delivered_ids=delivered_ids,
                 )
 
             backup_manager.set_failure_callback(notify_backup_failure)
@@ -2737,31 +2836,11 @@ async def _run_locked(args: CliArgs) -> None:
             async def month_summary_events(
                 *, fresh: bool = False, **kwargs
             ) -> list:
-                now = datetime.now(tz)
-                # fresh — крайний срок сводки: скачать график заново, но не
-                # чаще раза в 10 минут (если отправка срывается и повторяется).
-                forced_at = waiting_events.get("forced_at")
-                fresh = fresh and (
-                    forced_at is None or now - forced_at >= timedelta(minutes=10)
+                return await _load_month_summary_events(
+                    context.load_upcoming_service_events,
+                    service_registry, waiting_events, datetime.now(tz),
+                    fresh=fresh, **kwargs,
                 )
-                # В кэше — график без замен: замены применяются при каждом
-                # чтении, чтобы сводка учла замену, сделанную за эти минуты.
-                if (
-                    not fresh
-                    and waiting_events.get("kwargs") == kwargs
-                    and now - waiting_events["at"] < timedelta(minutes=30)
-                ):
-                    return _apply_event_replacements(
-                        waiting_events["events"], service_registry
-                    )
-                events = await context.load_upcoming_service_events(
-                    force=fresh, with_replacements=False,
-                    approved_only=True, **kwargs
-                )
-                if fresh:
-                    waiting_events["forced_at"] = now
-                waiting_events.update(kwargs=kwargs, at=now, events=events)
-                return _apply_event_replacements(events, service_registry)
 
             async def month_summary_tick() -> None:
                 """Сводка на месяц (этап 4.1): раз в минуту — кому пора.

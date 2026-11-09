@@ -186,6 +186,7 @@ class ScreensTest(SendTest):
         self.assertIn("Ваши служения", text)
         # Месяц целиком, включая уже прошедшие воскресенья.
         self.assertEqual(self.loader.await_args.kwargs["since"].day, 1)
+        self.assertTrue(self.loader.await_args.kwargs["approved_only"])
         forward = next(
             item for item in self.buttons(menu.message)
             if item.callback_data.startswith("mymonth:")
