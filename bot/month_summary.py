@@ -108,7 +108,9 @@ async def send_due_month_summaries(
 ) -> SummaryRun:
     """Рассылает сводки, которым пришло время.
 
-    load_events(since=, until=, fresh=) — fresh: прочитать график заново.
+    load_events(since=, until=, fresh=) перечитывает утверждение из БД
+    для каждого получателя; исходные события можно кэшировать.
+    fresh запрашивает обновление источника с его ограничением частоты.
 
     Сводка ждёт, пока в графике месяца появятся события всех служений
     человека (лист или колонка ещё не заполнены); в первое воскресенье в
@@ -140,17 +142,15 @@ async def send_due_month_summaries(
         for target, items in due.items() for item in items
     )
     # С 1-го числа: сводка за текущий месяц включает уже прошедшие дни.
-    events = await load_events(
-        since=date(*min(due), 1),
-        until=max(month_end(*target) for target in due),
-        fresh=fresh,
-    )
+    since = date(*min(due), 1)
+    until = max(month_end(*target) for target in due)
     labels = service_labels(registry)
     for (year, month), users in due.items():
         key = month_key(year, month)
-        events_of_month = month_events(events, year, month)
-        published = {event.service_id for event in events_of_month}
         for item in users:
+            events = await load_events(since=since, until=until, fresh=fresh)
+            events_of_month = month_events(events, year, month)
+            published = {event.service_id for event in events_of_month}
             telegram_id = item["telegram_id"]
             linked = linked_assignments(registry, telegram_id)
             if {service_id for service_id, _, _ in linked} - published and (

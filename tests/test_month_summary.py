@@ -138,6 +138,69 @@ class SendTest(unittest.TestCase):
         self.bot.send_message.assert_not_awaited()
         self.assertTrue(self.registry.is_month_summary_delivered(USER, "2026-11"))
 
+    def test_batch_rechecks_approved_plan_between_recipients_without_download(self):
+        from bot import app
+
+        for withdraw in (False, True):
+            with self.subTest(withdraw=withdraw):
+                self.setUp()
+                second_user = USER + 1
+                self.registry.set_responsible_contact(
+                    SUPER, "sound", "звук", "Мария", second_user
+                )
+                for user in (USER, second_user):
+                    self.registry.set_month_summary(user, enabled=True)
+                slots = {
+                    "2026-11-01": {"звук": ["Алексей"]},
+                    "2026-11-08": {"звук": ["Мария"]},
+                }
+
+                def approve():
+                    self.registry.save_schedule_draft(
+                        "sound", "2026-11", run_id=None, dates=list(slots),
+                        tasks=[{"name": "звук", "needed": 1}],
+                        slots=slots, last_served={},
+                    )
+                    self.registry.approve_schedule_plan(
+                        SUPER, "sound", "2026-11", slots,
+                        chat_id=None, message_id=None,
+                    )
+
+                approve()
+                events, _ = app._bot_plan_events(
+                    self.registry, date(2026, 11, 1), date(2026, 11, 30)
+                )
+                source = AsyncMock(return_value=events)
+                cache = {}
+
+                async def load(**kwargs):
+                    return await app._load_month_summary_events(
+                        source, self.registry, cache, self.now, **kwargs
+                    )
+
+                async def send(user, text, **kwargs):
+                    if user == USER:
+                        if withdraw:
+                            self.registry.cancel_schedule_approval("sound", "2026-11")
+                        else:
+                            slots["2026-11-15"] = slots.pop("2026-11-08")
+                            approve()
+
+                self.loader = load
+                self.bot.send_message.side_effect = send
+                result = self.run_summaries()
+                source.assert_awaited_once()
+                if withdraw:
+                    self.assertEqual((result.sent, result.waiting), (1, True))
+                    self.assertFalse(self.registry.is_month_summary_delivered(
+                        second_user, "2026-11"
+                    ))
+                else:
+                    self.assertEqual(result.sent, 2)
+                    text = self.bot.send_message.await_args.args[1]
+                    self.assertIn("15.11.2026", text)
+                    self.assertNotIn("08.11.2026", text)
+
     def test_validation(self):
         with self.assertRaises(ValueError):
             self.registry.set_month_summary(USER, days=7)
