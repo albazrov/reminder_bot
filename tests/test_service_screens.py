@@ -201,6 +201,20 @@ class ServiceScreensTest(unittest.TestCase):
         self.assertNotIn("Черновая задача", approved)
         self.assertNotIn("Черновик", approved)
 
+    def test_shifted_tasks_do_not_create_empty_sunday_in_overview(self):
+        tasks = [{"name": "Микшер", "needed": 1, "day": -3}]
+        for approved in (False, True):
+            with self.subTest(approved=approved):
+                self.plan(
+                    {"2026-11-15": {"Микшер": ["Человек"]}},
+                    approved=approved, tasks=tasks,
+                )
+                text = self.overview()
+                self.assertIn("12.11.2026", text)
+                self.assertIn("Человек", text)
+                self.assertNotIn("15.11.2026", text)
+                self.assertNotIn("Назначений нет.", text)
+
     def test_big_graph_pages_keep_actions_and_all_people(self):
         async def run():
             names = [f"Участник {index:03d} " + "И" * 25 for index in range(120)]
@@ -318,6 +332,9 @@ class ServiceScreensTest(unittest.TestCase):
         self.registry.initialize(1001, -10001)
         self.assertEqual(self.registry.service_display_names("sound")["Полное А"], "И" * 32)
         self.registry.set_service_member_short_name(2001, "sound", "Полное А", "  ")
+        self.assertNotIn("Полное А", self.registry.service_display_names("sound"))
+        self.registry.set_service_member_short_name(2001, "sound", "Полное А", "Имя")
+        self.registry.set_service_member_short_name(2001, "sound", "Полное А", "")
         self.assertNotIn("Полное А", self.registry.service_display_names("sound"))
 
     def test_slow_chat_lookup_does_not_replace_a_newer_screen(self):
