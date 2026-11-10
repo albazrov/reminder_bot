@@ -38,6 +38,10 @@ class _SourceRequest:
 _flights: dict[tuple, tuple[asyncio.Task, _SourceRequest]] = {}
 
 
+class SourceChangedError(RuntimeError):
+    pass
+
+
 class YandexRequestError(RuntimeError):
     def __init__(self, status: int, retry_after: str | None = None):
         super().__init__(f"Яндекс.Диск вернул HTTP {status}")
@@ -210,7 +214,7 @@ async def _cached_source(
                     if fingerprint is not None:
                         algorithm, checksum, size = fingerprint
                         if len(content) != size or hashlib.new(algorithm, content).hexdigest() != checksum:
-                            raise RuntimeError("Файл Excel изменился во время скачивания; повторите загрузку.")
+                            raise SourceChangedError("Файл Excel изменился во время скачивания; повторите загрузку.")
                     digest = hashlib.sha256(content).hexdigest()
                     candidate = root / f"{key}-{digest}.xlsx"
                     _write_private(candidate, content)
@@ -231,7 +235,10 @@ async def _cached_source(
                 if manifest is not None and manifest["digest"] != new_manifest["digest"]:
                     (root / f"{key}-{manifest['digest']}.xlsx").unlink(missing_ok=True)
                 return content
-        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError, YandexRequestError) as exc:
+        except (
+            aiohttp.ClientError, TimeoutError, asyncio.TimeoutError,
+            YandexRequestError, SourceChangedError,
+        ) as exc:
             if isinstance(exc, YandexRequestError) and exc.status == 429:
                 _write_private(cooldown_path, str(
                     datetime.now(timezone.utc).timestamp()
