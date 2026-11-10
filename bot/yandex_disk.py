@@ -209,6 +209,9 @@ async def _cached_source(
                     fingerprint == manifest.get("fingerprint")
                 ):
                     candidate = root / f"{key}-{manifest['digest']}.xlsx"
+                    content = _read_private(candidate)
+                    if content is None or hashlib.sha256(content).hexdigest() != manifest["digest"]:
+                        raise RuntimeError("Проверенный локальный Excel изменился; повторите загрузку.")
                 else:
                     content = await _download_bytes(session, public_url)
                     if fingerprint is not None:
