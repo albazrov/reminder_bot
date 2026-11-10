@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import logging
 import re
@@ -141,6 +142,89 @@ class EventNotesTest(unittest.TestCase):
             reminder["id"], "2026-11-01", "group:-10002",
         ))
 
+    def excel_notes(self):
+        source = hashlib.sha256(b"unused").hexdigest()
+        self.registry.save_schedule_notes(source, "test-digest", [
+            ["assembly", "2026-11-01", "2я часть", "членское"],
+            ["assembly", "2026-11-01", "Причастие", ""],
+            ["assembly", "2026-11-08", "2я часть", "другая дата"],
+            ["kitchen", "2026-11-01", "местная заметка", "не общая"],
+        ])
+
+    def test_excel_assembly_notes_fallback_preview_and_renderer_parity(self):
+        self.plan()
+        self.excel_notes()
+        text = resolve_event_note(
+            self.registry, "sound", date(2026, 11, 1),
+            template="{event_notes}", public_url="unused",
+        )
+        self.assertIn("2я часть членское", text)
+        self.assertIn("Причастие", text)
+        self.assertNotIn("другая дата", text)
+        self.assertNotIn("местная заметка", text)
+        preview = self.preview()
+        self.assertTrue(preview["has_data"])
+        rendered = app._render_group_reminder(
+            "{informational_notes}\n{event_notes}", {}, self.registry.get_service("sound"),
+            {"звук": ["A"]}, {}, "01.11.2026", event_notes=text,
+        )
+        self.assertEqual(preview["text"], rendered)
+        self.assertIn("2я часть членское", preview["text"])
+        original = self.registry.get_schedule_notes
+        reads = 0
+
+        def fail_on_resolve(source):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise sqlite3.OperationalError("test")
+            return original(source)
+
+        with patch.object(self.registry, "get_schedule_notes", side_effect=fail_on_resolve):
+            broken = self.preview()
+        self.assertFalse(broken["has_data"])
+        self.assertIn("Не удалось прочитать заметки", broken["error"])
+
+    def test_published_note_replaces_excel_and_preserves_audience(self):
+        self.plan()
+        self.excel_notes()
+        self.note(targets=["sound"])
+        self.assertIn("членское", resolve_event_note(
+            self.registry, "sound", date(2026, 11, 1), public_url="unused",
+        ))
+        self.registry.publish_event_note(1001, "2026-11-01")
+        self.assertNotIn("членское", resolve_event_note(
+            self.registry, "sound", date(2026, 11, 1), public_url="unused",
+        ))
+        self.registry.set_service_enabled(1001, "kitchen", True)
+        self.registry.save_event_note_draft(1001, "2026-11-01", "Только для Кухни", ["kitchen"])
+        self.registry.publish_event_note(1001, "2026-11-01")
+        self.assertEqual(resolve_event_note(
+            self.registry, "sound", date(2026, 11, 1), public_url="unused",
+        ), "")
+        self.registry.unpublish_event_note(1001, "2026-11-01")
+        self.assertIn("членское", resolve_event_note(
+            self.registry, "sound", date(2026, 11, 1), public_url="unused",
+        ))
+
+    def test_excel_note_uses_source_sunday_not_shifted_day_and_requires_approval(self):
+        self.excel_notes()
+        self.assertEqual(resolve_event_note(
+            self.registry, "sound", date(2026, 11, 1), public_url="unused",
+        ), "")
+        self.plan(offset=3)
+        self.assertIn("членское", resolve_event_note(
+            self.registry, "sound", date(2026, 11, 4), "звук", public_url="unused",
+        ))
+        self.assertEqual(resolve_event_note(
+            self.registry, "sound", date(2026, 11, 4), "звук", public_url="another-source",
+        ), "")
+        with patch.object(self.registry, "get_schedule_notes", side_effect=AssertionError("not used")):
+            self.assertEqual(resolve_event_note(
+                self.registry, "sound", date(2026, 11, 4),
+                template="{task_assignments}", public_url="unused",
+            ), "")
+
     def preview(self):
         reminder = self.registry.list_group_reminders("sound")[0]
         credentials = SimpleNamespace(admin_tg_id=1001, yandex_public_url="unused")
@@ -177,6 +261,63 @@ class EventNotesTest(unittest.TestCase):
             self.assertEqual(resolve_event_note(
                 self.registry, "sound", date(2026, 11, 1), template="{task_assignments}",
             ), "")
+
+    def test_excel_notes_group_and_personal_delivery_match_previews(self):
+        self.plan()
+        self.excel_notes()
+        reminder = self.registry.list_group_reminders("sound")[0]
+        self.registry.update_group_reminder(
+            1001, reminder["id"], body="{event_notes}",
+        )
+        self.registry.set_service_personal_templates(
+            1001, "sound", {"звук": "{name}\n{event_notes}"},
+        )
+        self.registry.set_user_notifications_enabled(501, "sound", True)
+        text_id = self.registry.ensure_user_text(501, "sound", "звук")
+        rule = self.registry.add_schedule(text_id, 1, "18:00")
+        credentials = SimpleNamespace(admin_tg_id=1001, yandex_public_url="unused")
+        bot = SimpleNamespace(send_message=AsyncMock())
+
+        async def run():
+            with patch("bot.app._load_service_task_assignments", new=AsyncMock(
+                return_value=({"звук": ["A"]}, True),
+            )), patch("bot.app.send_admin_reports", new=AsyncMock()):
+                group_preview = await app.get_group_reminder_preview(
+                    reminder["id"], credentials, self.path, ZoneInfo("UTC"),
+                    self.registry, LOG,
+                )
+                await app._process_service_reminder(
+                    bot, credentials, self.path, ZoneInfo("UTC"), self.registry,
+                    "sound", reminder["id"], LOG, LOG,
+                    run_date=date(2026, 11, 1) - timedelta(days=reminder["reminder_days"]),
+                )
+                await app._process_user_reminder_schedule(
+                    bot, credentials, self.path, ZoneInfo("UTC"), self.registry,
+                    rule["id"], LOG, LOG, run_date=date(2026, 10, 31),
+                )
+            with patch("bot.app._load_service_task_assignments", new=AsyncMock(
+                return_value={"звук": ["A"]},
+            )):
+                personal_preview = await app._prepare_service_test_previews(
+                    "sound", credentials, self.path, ZoneInfo("UTC"), self.registry, LOG,
+                    group_template="{event_notes}",
+                )
+            return group_preview, personal_preview
+
+        with patch("bot.app._next_sunday_in_tz", return_value=date(2026, 11, 1)), patch(
+            "bot.app.reminder_occurrence",
+            return_value=(date(2026, 11, 1), date(2026, 10, 31)),
+        ):
+            group_preview, personal_preview = asyncio.run(run())
+        group_messages = [call for call in bot.send_message.await_args_list if call.args[0] == -10002]
+        personal_messages = [call for call in bot.send_message.await_args_list if call.args[0] == 501]
+        self.assertEqual(len(group_messages), 1)
+        self.assertEqual(len(personal_messages), 1)
+        self.assertEqual(group_messages[0].args[1], render_screen_chunks(group_preview["text"])[0])
+        self.assertIn("2я часть членское", group_messages[0].args[1])
+        expected = "🔔 Звук · звук · 01.11.2026\n" + personal_preview["personal_messages"][0]["text"]
+        self.assertEqual(personal_messages[0].args[1], render_screen_chunks(expected)[0])
+        self.assertIn("2я часть членское", personal_messages[0].args[1])
 
     def test_group_delivery_matches_preview_and_note_change_does_not_resend(self):
         self.plan()
@@ -336,3 +477,41 @@ class EventNoteHandlerTest(unittest.TestCase):
         note = self.registry.list_event_notes()[0]
         self.assertIsInstance(note["draft_targets"], list)
         self.assertFalse(note["published"])
+
+    def test_disabled_saved_recipient_can_be_removed_but_not_selected_again(self):
+        self.registry.set_service_enabled(1001, "kitchen", True)
+        self.click("evn:home")
+        self.click(self.button("evn:day:"))
+        self.click(self.button("evn:text:"))
+        self.message.text = "Текст для служений"
+        asyncio.run(self.input(self.message))
+        sunday = self.registry.list_event_notes()[0]["event_sunday"]
+        self.registry.save_event_note_draft(
+            1001, sunday, "Текст для служений", ["sound", "kitchen"],
+        )
+        self.registry.set_service_enabled(1001, "sound", False)
+        self.click("evn:home")
+        self.click(self.button("evn:day:"))
+        self.click(self.button("evn:targets:"))
+        markup = self.message.answer.await_args.kwargs["reply_markup"]
+        remove = next(
+            button for row in markup.inline_keyboard for button in row
+            if button.callback_data.endswith(":sound")
+        )
+        self.assertIn("недоступно", remove.text)
+        old_button = remove.callback_data
+        self.click(old_button)
+        markup = self.message.answer.await_args.kwargs["reply_markup"]
+        self.assertFalse(any(
+            button.callback_data.endswith(":sound")
+            for row in markup.inline_keyboard for button in row
+        ))
+        forged = self.button("evn:target:").rsplit(":", 1)[0] + ":sound"
+        rejected = self.click(forged)
+        self.assertIn("недоступно", rejected.answer.await_args.args[0])
+        self.click(self.button("evn:targetsok:"))
+        self.assertEqual(self.registry.get_event_note(sunday)["draft_targets"], ["kitchen"])
+        self.click(self.button("evn:text:"))
+        self.message.text = "Исправленный текст"
+        asyncio.run(self.input(self.message))
+        self.assertEqual(self.registry.get_event_note(sunday)["draft_body"], "Исправленный текст")

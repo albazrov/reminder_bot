@@ -6723,13 +6723,31 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(auto, f"rdy:pfree:sound:{month}")
             built = await press(auto)
             self.assertIn("Без опроса", built.message.answer.await_args.args[0])
+            def back_button(callback):
+                return next(
+                    button for row in callback.message.answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard for button in row
+                    if button.text.startswith("⬅️ К ")
+                )
+
+            back = back_button(built)
+            self.assertEqual((back.text, back.callback_data), ("⬅️ К графику", "rdy:month:sound"))
+            returned = await press(back.callback_data)
+            self.assertIn("ЗВУК › График", returned.message.answer.await_args.args[0])
+            self.assertNotIn("График › Опрос", returned.message.answer.await_args.args[0])
             key = month[:4] + "-" + month[4:]
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertIsNone(plan["run_id"])
             self.assertIsNone(plan["approved"])
             self.assertIsNone(self.registry.get_readiness_run("sound", key))
             self.assertTrue(any(values.get("звук") for values in plan["slots"].values()))
-            await press(auto)
+            reopened = await press(auto)
+            self.assertEqual(back_button(reopened).callback_data, "rdy:month:sound")
+            dates = await press(f"rdy:pedit:sound:{month}")
+            self.assertEqual(back_button(dates).callback_data, f"rdy:plan:sound:{month}")
+            edited_back = await press(back_button(dates).callback_data)
+            self.assertEqual(back_button(edited_back).callback_data, "rdy:month:sound")
             self.assertEqual(self.registry.get_schedule_plan("sound", key)["slots"], plan["slots"])
             self.context.load_upcoming_service_events.assert_not_awaited()
             self.context.bot.send_poll.assert_not_awaited()
@@ -7292,6 +7310,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             plan_screen = await press(f"rdy:plan:sound:{month_arg}")
             self.assertIn("📋 ЗВУК › График › Опрос", text_of(plan_screen))
             self.assertIn("📝 Черновик", text_of(plan_screen))
+            self.assertTrue(any(
+                button.text == "⬅️ К опросу" and button.callback_data == "rdy:open:sound"
+                for button in buttons(plan_screen)
+            ))
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей"])
 

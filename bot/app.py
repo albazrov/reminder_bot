@@ -1285,6 +1285,7 @@ async def get_group_reminder_preview(
             event_notes=resolve_event_note(
                 registry, service["id"], event_date, reminder.get("task"),
                 template=template,
+                public_url=credentials.yandex_public_url if "{event_notes" in template else None,
             ),
         )
     except (sqlite3.Error, EventNoteResolutionError) as exc:
@@ -1370,7 +1371,12 @@ async def get_template_preview(
                 date_text,
                 registry.service_display_names(service_id),
                 event_notes=resolve_event_note(
-                    registry, service_id, event_date, template=template or DEFAULT_GROUP_TEMPLATE
+                    registry, service_id, event_date,
+                    template=template or DEFAULT_GROUP_TEMPLATE,
+                    public_url=(
+                        credentials.yandex_public_url if template and "{event_notes" in template
+                        else None
+                    ),
                 ),
             )
     except (sqlite3.Error, EventNoteResolutionError) as exc:
@@ -1682,6 +1688,7 @@ async def _process_service_reminder(
             event_notes=resolve_event_note(
                 registry, service_id, event_date, reminder.get("task"),
                 template=group_template,
+                public_url=credentials.yandex_public_url if "{event_notes" in group_template else None,
             ),
         )
     except (AttributeError, IndexError, KeyError, ValueError, sqlite3.Error) as exc:
@@ -1977,6 +1984,7 @@ async def _process_user_reminder_schedule(
                     registry, schedule["service_id"], event_date,
                     schedule["task"],
                     template=template,
+                    public_url=credentials.yandex_public_url if "{event_notes" in template else None,
                 ),
             )
         )
@@ -2172,6 +2180,7 @@ async def _prepare_service_test_previews(
                         username=username,
                         event_notes=resolve_event_note(
                             registry, service_id, sunday_date, task, template=template,
+                            public_url=credentials.yandex_public_url if "{event_notes" in template else None,
                         ),
                     )
                 )
@@ -2212,6 +2221,10 @@ async def _prepare_service_test_previews(
                 informational_notes=format_informational_notes(assignments),
                 event_notes=resolve_event_note(
                     registry, service_id, sunday_date, template=effective_group_template,
+                    public_url=(
+                        credentials.yandex_public_url
+                        if "{event_notes" in effective_group_template else None
+                    ),
                 ),
             )
         )

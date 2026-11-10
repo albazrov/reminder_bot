@@ -1142,8 +1142,14 @@ def _build_plan(data: PlanInput) -> Plan:
     # могут назначаться одному человеку, только если это разные фактические дни.
     for event_date in sorted(set(data.dates)):
         assign_week(event_date, required, required_pass=True)
-    if plan.gaps() and not data.dependencies:
-        repair_gaps(plan, data)
+    if plan.gaps():
+        fixed = {
+            (event_date, task): frozenset({person})
+            for event_date, person in duty_choices.items()
+            for task in next(iter(data.dependencies.values()))
+            if person in plan.slots[(event_date, task)]
+        } if data.dependencies else {}
+        repair_gaps(plan, data, fixed=fixed)
         used_days.clear()
         served_weeks.clear()
         last = dict(data.last_served)
@@ -1195,13 +1201,18 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date],
     return total
 
 
-def repair_gaps(plan: Plan, data: PlanInput) -> None:
+def repair_gaps(
+    plan: Plan, data: PlanInput, *,
+    fixed: Mapping[tuple[date, str], frozenset[str]] | None = None,
+) -> None:
     """Дополняет обязательное покрытие перестановками по всему месяцу.
 
     Поток: исток → человек → (человек, фактический день) → место → сток.
     Сначала сохраняется месячный максимум (или уже имеющаяся нагрузка),
     затем мягкий максимум снимается, если иначе остаются пустые места.
     Увеличивающие пути меняют только назначения своей цепочки.
+    Основная роль выбранного исполнителя обязанности закреплена в fixed;
+    сама обязанность не занимает отдельного места потока.
     Вызывается до заполнения необязательных мест.
     """
     source, sink = ("source",), ("sink",)
@@ -1215,29 +1226,42 @@ def repair_gaps(plan: Plan, data: PlanInput) -> None:
             capacity.setdefault((end, start), 0)
         capacity[(start, end)] = capacity.get((start, end), 0) + amount
 
-    seats = sorted(plan.slots)
-    total = sum(plan.needed[key[1]] for key in seats)
+    fixed = fixed or {}
+    seats = sorted(key for key in plan.slots if key[1] not in data.dependencies)
+    total = sum(plan.needed[key[1]] - len(fixed.get(key, ())) for key in seats)
+    fixed_days: dict[str, set[date]] = {}
+    for key, people in fixed.items():
+        for person in people:
+            fixed_days.setdefault(person, set()).add(
+                plan.slot_dates.get((*key, person), key[0])
+            )
     loads = plan.load()
     for person in sorted(data.free):
         high = _limit(data, person)[1]
         add(
             source, ("person", person),
-            total if high is None else max(high, loads.get(person, 0)),
+            total if high is None else max(
+                0, max(high, loads.get(person, 0)) - len(fixed_days.get(person, ())),
+            ),
         )
         days = set()
         for key in seats:
             if not _can_serve(data, person, key[0], key[1]):
                 continue
             service_day = plan.slot_dates.get((*key, person), key[0])
+            if service_day in fixed_days.get(person, ()):
+                continue
             if service_day not in days:
                 add(("person", person), ("day", person, service_day), 1)
                 days.add(service_day)
             add(("day", person, service_day), ("seat", key), 1)
     for key in seats:
-        add(("seat", key), sink, plan.needed[key[1]])
+        add(("seat", key), sink, plan.needed[key[1]] - len(fixed.get(key, ())))
     # Текущий план — уже пущенный поток.
     for key in seats:
         for person in plan.slots[key]:
+            if person in fixed.get(key, ()):
+                continue
             service_day = plan.slot_dates.get((*key, person), key[0])
             for start, end in (
                 (source, ("person", person)),
@@ -1274,6 +1298,7 @@ def repair_gaps(plan: Plan, data: PlanInput) -> None:
             node[1] for node in edges.get(("seat", key), ())
             if node[0] == "day" and capacity[(("seat", key), node)] > 0
         }
+        assigned.update(fixed.get(key, ()))
         plan.slots[key] = [
             person for person in plan.slots[key] if person in assigned
         ] + sorted(assigned - set(plan.slots[key]))

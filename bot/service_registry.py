@@ -25,7 +25,7 @@ from .services import (
     normalized_name,
     split_day_key,
 )
-from .task_rules import AssignmentWarnings, assignment_errors, assignment_issues, dependent_tasks
+from .task_rules import AssignmentWarnings, assignment_issues, dependent_tasks
 
 
 GROUP_TEMPLATE_FIELDS = frozenset(
@@ -2144,13 +2144,25 @@ class ServiceRegistry:
         current = assigned.get(task, [])
         if old_name not in current:
             return ["Назначение изменилось — откройте график заново."]
-        assigned[task] = [new_name if name == old_name else name for name in current]
         people = self.readiness_people(service_id, connection=connection)
         skills = {
             person["name"]: set(person["tasks"]) for person in people
             if sum(other["name"] == person["name"] for other in people) == 1
         }
-        return assignment_errors(tasks, {event_date: assigned}, skills, complete=False)
+        _, previous_warnings = assignment_issues(
+            tasks, {event_date: assigned}, skills, complete=False,
+        )
+        changed = {
+            **assigned,
+            task: [new_name if name == old_name else name for name in current],
+        }
+        errors, warnings = assignment_issues(
+            tasks, {event_date: changed}, skills, complete=False,
+        )
+        # A newly chosen duty holder needs approval even if the warning text is unchanged.
+        if task in dependent_tasks(tasks):
+            previous_warnings = []
+        return errors + [warning for warning in warnings if warning not in previous_warnings]
 
     def assignment_tasks(self, service_id: str, event_date: str, *,
                          connection=None) -> list[dict]:
@@ -2191,15 +2203,18 @@ class ServiceRegistry:
         """A primary-role decline also declines its duty, in one transaction."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            answer_name, changed = self.set_confirmation(
+                service_id, event_date, task, telegram_id, status,
+                name=name, connection=connection,
+            )
             tasks = self.decline_scope_tasks(
-                service_id, event_date, task, telegram_id, connection=connection, name=name,
+                service_id, event_date, task, telegram_id, connection=connection, name=answer_name,
             ) if status == "declined" else [task]
-            return [
-                (other, *self.set_confirmation(
-                    service_id, event_date, other, telegram_id, status,
-                    name=name, connection=connection,
-                ))
-                for other in tasks
+            return [(task, answer_name, changed)] + [
+                (other, answer_name, self._save_confirmation(
+                    connection, service_id, event_date, other, telegram_id,
+                    answer_name, status,
+                )) for other in tasks[1:]
             ]
 
     def add_service_task(
@@ -2862,24 +2877,31 @@ class ServiceRegistry:
             ).fetchone()
             if contact is None:
                 raise PermissionError("Вы не привязаны к этой задаче.")
-            cursor = connection.execute(
-                """
-                INSERT INTO service_confirmations (
-                    service_id, event_date, task, telegram_id, name, status,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(service_id, event_date, task, telegram_id)
-                DO UPDATE SET status = excluded.status,
-                              name = excluded.name,
-                              updated_at = excluded.updated_at
-                WHERE service_confirmations.status != excluded.status
-                """,
-                (
-                    service_id, event_date, task, telegram_id,
-                    name or contact["name"], status, _utc_now(),
-                ),
+            answer_name = name or contact["name"]
+            changed = self._save_confirmation(
+                connection, service_id, event_date, task, telegram_id, answer_name, status,
             )
-        return name or contact["name"], cursor.rowcount > 0
+        return answer_name, changed
+
+    @staticmethod
+    def _save_confirmation(
+        connection, service_id: str, event_date: str, task: str,
+        telegram_id: int, name: str, status: str,
+    ) -> bool:
+        cursor = connection.execute(
+            """
+            INSERT INTO service_confirmations (
+                service_id, event_date, task, telegram_id, name, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(service_id, event_date, task, telegram_id)
+            DO UPDATE SET status = excluded.status,
+                          name = excluded.name,
+                          updated_at = excluded.updated_at
+            WHERE service_confirmations.status != excluded.status
+            """,
+            (service_id, event_date, task, telegram_id, name, status, _utc_now()),
+        )
+        return cursor.rowcount > 0
 
     def get_confirmation(
         self, service_id: str, event_date: str, task: str, telegram_id: int
@@ -6593,6 +6615,19 @@ class ServiceRegistry:
                 (service_id, month),
             ).fetchone()
         return self._schedule_plan(row)
+
+    def list_approved_schedule_plans(self, service_id: str, through_month: str) -> list[dict]:
+        """Saved history through a month, excluding unpublished drafts."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT p.*, s.group_chat_id AS service_chat, "
+                "s.group_thread_id AS service_thread "
+                "FROM schedule_plans p JOIN services s ON s.id = p.service_id "
+                "WHERE p.service_id = ? AND p.month <= ? AND p.approved_json IS NOT NULL "
+                "ORDER BY p.month",
+                (service_id, through_month),
+            ).fetchall()
+        return [self._schedule_plan(row) for row in rows]
 
     def save_schedule_draft(
         self,

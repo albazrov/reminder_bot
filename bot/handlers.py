@@ -4486,14 +4486,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def show_event_note_targets(message, actor_id, page=0):
         state = pending_inputs[actor_id]
-        services = [item for item in service_registry().list_services() if item["enabled"]]
         selected = state["targets"]
+        known = {item["id"]: item for item in service_registry().list_services()}
+        services = [item for item in known.values() if item["enabled"]]
+        services += [
+            {"id": service_id, "name": known.get(service_id, {}).get("name", service_id),
+             "enabled": False}
+            for service_id in selected or []
+            if service_id not in known or not known[service_id]["enabled"]
+        ]
         state["token"] = secrets.token_hex(4)
         state["step"] = "targets"
         page = max(0, min(page, (len(services) - 1) // 5))
         state["page"] = page
         rows = [[event_note_button(
-            ("✅ " if selected is None or item["id"] in selected else "⬜ ") + item["name"],
+            ("✅ " if selected is None or item["id"] in selected else "⬜ ") + item["name"]
+            + (" (недоступно — убрать)" if not item["enabled"] else ""),
             "target", state, item["id"],
         )] for item in services[page * 5:(page + 1) * 5]]
         if len(services) > 5:
@@ -4509,6 +4517,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(
             message, "СОБРАНИЕ › Заметка › Адресаты\n\n"
             "Выберите служения. «Все служения» включает и добавленные в будущем. "
+            "Недоступных сохранённых адресатов можно убрать. "
             "Адресаты сохранятся в черновике; публикация — отдельным действием.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keep_rows=True,
@@ -4561,7 +4570,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 elif action in {"targets", "target", "all", "page"}:
                     if action == "target":
                         available = {item["id"] for item in registry.list_services() if item["enabled"]}
-                        if value not in available:
+                        if value not in available and value not in (state["targets"] or []):
                             raise ValueError("Служение недоступно — откройте заметку заново.")
                         selected = set(available if state["targets"] is None else state["targets"])
                         selected.symmetric_difference_update({value})
@@ -5084,18 +5093,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def show_month_graph(
         message: Message, actor_id: int, service_id: str, page: int = 0,
+        *, summary: bool = False, month: date | None = None,
     ) -> None:
         registry = service_registry()
         service = registry.get_service(service_id)
-        month = datetime.now(context.timezone).date().replace(day=1)
+        current_month = datetime.now(context.timezone).date().replace(day=1)
+        month = month or current_month
+        request = {"operation": "graph_view", "service_id": service_id}
+        pending_inputs[actor_id] = request
         try:
-            text = schedule_plan.month_overview(registry, actor_id, service_id, month)
+            text = await asyncio.to_thread(
+                schedule_plan.month_overview, registry, actor_id, service_id, month,
+                include_load=summary,
+            )
         except (sqlite3.Error, OSError, RuntimeError, ValueError):
             debug.exception("Не удалось прочитать месячный график")
             text = (
                 "❌ Не удалось прочитать сохранённый график. "
                 "Вернитесь к служению и откройте «График» повторно."
             )
+        if pending_inputs.get(actor_id) is not request:
+            return
         chunks = screen_text_chunks(text, 2800)
         page = min(max(page, 0), len(chunks) - 1)
         rows = [[
@@ -5109,30 +5127,51 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             readiness_button(
                 "🧮 Авто", "pfree", service_id, month.strftime("%Y%m"),
             ),
-        ]]
+        ], [readiness_button("📊 Сводка", "summary", service_id)]]
+        if summary:
+            following = month_end(current_month.year, current_month.month) + timedelta(days=1)
+            rows = [[
+                readiness_button("📅 Текущий месяц", "summary", service_id,
+                                 current_month.strftime("%Y%m")),
+                readiness_button("📅 Следующий месяц", "summary", service_id,
+                                 following.strftime("%Y%m")),
+            ]]
         paging = []
+        action = "summary" if summary else "month"
+
+        def page_arg(number):
+            return f"{month:%Y%m}.{number}" if summary else str(number)
+
         if page:
             paging.append(readiness_button(
-                "⬅️ Предыдущее", "month", service_id, str(page - 1),
+                "⬅️ Предыдущее", action, service_id, page_arg(page - 1),
             ))
         if page + 1 < len(chunks):
             paging.append(readiness_button(
-                "➡️ Далее", "month", service_id, str(page + 1),
+                "➡️ Далее", action, service_id, page_arg(page + 1),
             ))
         if paging:
             rows.append(paging)
-        rows.append([InlineKeyboardButton(
-            text="⬅️ К служению",
-            callback_data=f"service:service_settings:{service_id}",
-        )])
+        if summary:
+            rows += [
+                [readiness_button("🔄 Обновить", "summary", service_id, page_arg(page))],
+                [readiness_button("⬅️ К графику", "month", service_id)],
+            ]
+        else:
+            rows.append([InlineKeyboardButton(
+                text="⬅️ К служению",
+                callback_data=f"service:service_settings:{service_id}",
+            )])
         await _send_dialog(
             message,
-            f"📅 {service_label(service)} › График\n"
+            f"📅 {service_label(service)} › График"
+            + (" › Сводка" if summary else "") + "\n"
             f"{month_title(month.year, month.month)}\n\n{chunks[page]}"
             + (f"\n\nСтраница {page + 1}/{len(chunks)}" if len(chunks) > 1 else ""),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None, _dialog_text_limit=4000,
-            _dialog_keyboard_limit=6, _dialog_keep_rows=True,
+            _dialog_keyboard_limit=max(6, sum(len(row) for row in rows)),
+            _dialog_keep_rows=True,
         )
 
     async def show_readiness(
@@ -5782,7 +5821,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )]
                 for answer in summary.outside[:20]
             ]
-        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        rows.append([readiness_button(
+            "⬅️ К графику" if plan.get("run_id") is None else "⬅️ К опросу",
+            "month" if plan.get("run_id") is None else "open",
+            service_id,
+        )])
         await _send_dialog(
             message, text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -6819,6 +6862,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await clean_and_clear_pending_actor(actor_id)
                 await clean_previous_menu(callback.message, debug)
             notice = None
+            if action == "summary":
+                current = now.date().replace(day=1)
+                following = month_end(current.year, current.month) + timedelta(days=1)
+                raw_month, separator, raw_page = (arg or current.strftime("%Y%m")).partition(".")
+                if raw_month not in {current.strftime("%Y%m"), following.strftime("%Y%m")}:
+                    raise ValueError("Сводка доступна только за текущий и следующий месяц.")
+                if separator and not raw_page.isdecimal():
+                    raise ValueError("Некорректная страница сводки.")
+                await show_month_graph(
+                    callback.message, actor_id, service_id, int(raw_page or 0),
+                    summary=True, month=date(int(raw_month[:4]), int(raw_month[4:]), 1),
+                )
+                await _answer_callback(callback)
+                return
             if action == "month":
                 if arg is not None and not arg.isdecimal():
                     raise ValueError("Некорректная страница графика.")

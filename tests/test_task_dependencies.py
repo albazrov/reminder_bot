@@ -1,18 +1,19 @@
 import asyncio
 import logging
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from bot import handlers, readiness, schedule_plan
+from bot import handlers, readiness, replacement, schedule_plan
 from bot.excel_parser import RosterMember
 from bot.schedule_planner import PlanInput, build_plan
-from bot.service_registry import ServiceRegistry
+from bot.service_registry import ServiceRegistry, task_token
 from bot.task_rules import assignment_errors
 from bot.task_rules import AssignmentWarnings
 
@@ -114,6 +115,58 @@ class DependentPlannerTest(unittest.TestCase):
         self.assertEqual(plan.slots[(day, "X")], ["C"])
         self.assertEqual(plan.slots[(day, "Y")], ["C"])
         self.assertEqual(plan.slots[(day, DUTY)], ["A"])
+
+    def test_repairs_shared_day_chain_without_losing_duty_or_other_assignments(self):
+        first, second = SUNDAYS[:2]
+        shared = first + timedelta(days=1)
+        skills = {
+            "A": {"X", "Y"}, "B": {"X", "Z"}, "C": {"Z"}, "D": {"W"},
+            "E": {HEAD, DUTY}, "F": {TEAM},
+        }
+        data = replace(
+            self.data(skills, (first, second)),
+            needed=dict.fromkeys((HEAD, TEAM, DUTY, "X", "Y", "Z", "W"), 1),
+            availability={
+                person: frozenset((shared, task) for task in tasks)
+                for person, tasks in skills.items() if person in "ABCD"
+            },
+            limits={person: (0, 1) for person in skills},
+            slot_dates={
+                (second if task == "Y" else first, task, person): shared
+                for person, tasks in skills.items() if person in "ABCD"
+                for task in tasks
+            },
+        )
+        plan = build_plan(data)
+        self.assertEqual(plan.covered_required(), 10)
+        for task, person in (("X", "B"), ("Y", "A"), ("Z", "C"), ("W", "D")):
+            self.assertEqual(
+                plan.slots[(second if task == "Y" else first, task)], [person],
+            )
+        for day in (first, second):
+            self.assertEqual(plan.slots[(day, HEAD)], ["E"])
+            self.assertEqual(plan.slots[(day, DUTY)], ["E"])
+            self.assertEqual(plan.slots[(day, TEAM)], ["F"])
+
+    def test_repair_does_not_take_duty_holders_primary_seat_or_double_book_them(self):
+        first, second = SUNDAYS[:2]
+        data = replace(
+            self.data({"A": [HEAD, DUTY, "X"], "B": [TEAM], "C": [HEAD]}, (first, second)),
+            needed={HEAD: 1, TEAM: 1, DUTY: 1, "X": 1},
+            availability={"A": frozenset({
+                (first, HEAD), (first, DUTY), (first, "X"),
+                (second, HEAD), (second, DUTY),
+            })},
+            slot_dates={
+                (first, "X", "A"): first + timedelta(days=1),
+                (second, "X", "A"): first,
+            },
+        )
+        plan = build_plan(data)
+        for day in (first, second):
+            self.assertEqual(plan.slots[(day, HEAD)], ["A"])
+            self.assertEqual(plan.slots[(day, DUTY)], ["A"])
+            self.assertEqual(plan.slots[(day, "X")], [])
 
 
 class DependentRegistryTest(unittest.TestCase):
@@ -268,6 +321,82 @@ class DependentRegistryTest(unittest.TestCase):
         self.assertEqual([item[0] for item in primary], [HEAD, DUTY])
         self.assertEqual(self.registry.get_confirmation("kitchen", "2026-11-08", DUTY, 501), "declined")
 
+    def test_replacements_preserve_accepted_outsider_warning_but_cannot_change_outsider(self):
+        self.registry.set_service_task_enabled(1001, "kitchen", "пироги", True)
+        self.registry.set_responsible_contact(1001, "kitchen", "пироги", "P", 505)
+        self.registry.set_responsible_contact(1001, "kitchen", "пироги", "Q", 506)
+        slots = {day: {HEAD: ["A"], TEAM: ["C"], DUTY: ["B"], "пироги": ["P"]}
+                 for day in self.slots}
+        warnings = self.registry.task_assignment_warnings("kitchen", slots, complete=True)
+        self.registry.approve_schedule_plan(
+            1001, "kitchen", "2026-11", slots, chat_id=None, message_id=None,
+            acknowledged_warnings=warnings,
+        )
+        for task in (TEAM, DUTY):
+            self.registry.set_responsible_contact(1001, "kitchen", task, "D", 504)
+        for source, day in (("admin", "2026-11-01"), ("poll", "2026-11-08")):
+            with self.subTest(source=source):
+                self.assertTrue(self.registry.set_replacement(
+                    "kitchen", day, "пироги", "P", "Q", 506, "", source, 1001,
+                ))
+                poll = {
+                    "poll_id": "test", "service_id": "kitchen", "event_date": day,
+                    "task": TEAM, "old_name": "C", "old_telegram_id": 503,
+                }
+                answer = {"telegram_id": 504, "can": True, "full_name": "D", "username": ""}
+                with patch.object(self.registry, "list_poll_answers", return_value=[answer]):
+                    self.assertEqual(replacement.choose_volunteer(self.registry, poll), answer)
+                with self.assertRaisesRegex(ValueError, "в смену"):
+                    self.registry.set_replacement(
+                        "kitchen", day, DUTY, "B", "D", 504, "", source, 1001,
+                    )
+                self.assertTrue(self.registry.set_replacement(
+                    "kitchen", day, TEAM, "C", "D", 504, "", source, 1001,
+                ))
+                self.assertEqual(
+                    self.registry.effective_assignments("kitchen", day)[DUTY], ["B"],
+                )
+                self.assertTrue(self.registry.set_replacement(
+                    "kitchen", day, DUTY, "B", "D", 504, "", source, 1001,
+                ))
+        self.assertEqual(
+            self.registry.get_schedule_plan("kitchen", "2026-11")["approval_warnings"], warnings,
+        )
+        self.registry.set_service_member_tasks(1001, "kitchen", "B", [TEAM])
+        with self.assertRaisesRegex(ValueError, "допуска"):
+            self.registry.set_replacement(
+                "kitchen", "2026-11-15", "пироги", "P", "Q", 506, "", "admin", 1001,
+            )
+
+    def test_primary_decline_survives_removed_duty_permission_without_bypassing_authorization(self):
+        self.approve()
+        self.registry.set_service_member_tasks(1001, "kitchen", "A", [HEAD])
+        day = "2026-11-01"
+        with self.assertRaises(PermissionError):
+            self.registry.set_assignment_answer("kitchen", day, DUTY, 501, "declined")
+        with self.assertRaises(PermissionError):
+            self.registry.set_assignment_answer("kitchen", day, HEAD, 503, "declined")
+        self.assertIsNone(self.registry.get_confirmation("kitchen", day, DUTY, 501))
+        answers = self.registry.set_assignment_answer("kitchen", day, HEAD, 501, "declined")
+        self.assertEqual(answers, [(HEAD, "A", True), (DUTY, "A", True)])
+        self.assertEqual(self.registry.get_confirmation("kitchen", day, HEAD, 501), "declined")
+        self.assertEqual(self.registry.get_confirmation("kitchen", day, DUTY, 501), "declined")
+        self.assertEqual(
+            self.registry.set_assignment_answer("kitchen", day, HEAD, 501, "declined"),
+            [(HEAD, "A", False), (DUTY, "A", False)],
+        )
+
+    def test_linked_decline_remains_atomic_on_database_failure(self):
+        self.approve()
+        with self.registry._connection() as connection:
+            connection.execute(
+                "CREATE TRIGGER reject_duty_answer BEFORE INSERT ON service_confirmations "
+                "WHEN NEW.task = 'Скатерти' BEGIN SELECT RAISE(ABORT, 'test'); END"
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.registry.set_assignment_answer("kitchen", "2026-11-01", HEAD, 501, "declined")
+        self.assertIsNone(self.registry.get_confirmation("kitchen", "2026-11-01", HEAD, 501))
+
     def test_rule_changes_leave_approved_snapshot_and_guards_intact(self):
         approved = self.approve()
         self.registry.initialize(1001, -10001)
@@ -409,6 +538,45 @@ class DependentRegistryTest(unittest.TestCase):
 class DependentHandlerTest(unittest.TestCase):
     def setUp(self):
         DependentRegistryTest.setUp(self)
+
+    def test_primary_refusal_notifies_admins_and_starts_both_replacements_after_permit_removed(self):
+        self.registry.approve_schedule_plan(
+            1001, "kitchen", "2026-11", self.slots, chat_id=None, message_id=None,
+        )
+        self.registry.set_service_member_tasks(1001, "kitchen", "A", [HEAD])
+        log = logging.getLogger("test-dependencies")
+        context = SimpleNamespace(
+            service_registry=self.registry, admin_id=1001, group_chat_id=-10001,
+            timezone=ZoneInfo("UTC"), interaction_logger=log, debug_logger=log,
+            bot=SimpleNamespace(send_message=AsyncMock(), delete_message=AsyncMock()),
+            on_assignment_declined=AsyncMock(),
+        )
+        dispatcher = SimpleNamespace(include_router=MagicMock())
+        with patch.object(handlers, "router", handlers.Router()):
+            handlers.register(dispatcher, context)
+        handler = next(item.callback
+                       for call in dispatcher.include_router.call_args_list
+                       for item in call.args[0].callback_query.handlers
+                       if item.callback.__name__ == "on_personal_answer")
+        callback = SimpleNamespace(
+            data=f"pcf:d:kitchen:20261115:{task_token(HEAD)}",
+            from_user=SimpleNamespace(id=501), answer=AsyncMock(),
+            message=SimpleNamespace(
+                text="Напоминание", edit_text=AsyncMock(), edit_reply_markup=AsyncMock(),
+            ),
+        )
+        with patch("bot.handlers.datetime") as clock, patch(
+            "bot.handlers.notify_admins_declined", new=AsyncMock(return_value=1),
+        ) as notify:
+            clock.now.return_value = SimpleNamespace(date=lambda: date(2026, 11, 10))
+            clock.strptime.side_effect = datetime.strptime
+            asyncio.run(handler(callback))
+        self.assertEqual([call.args[4] for call in notify.await_args_list], [HEAD, DUTY])
+        self.assertEqual(
+            [call.args[2] for call in context.on_assignment_declined.await_args_list], [HEAD, DUTY],
+        )
+        self.assertEqual(self.registry.get_confirmation("kitchen", "2026-11-15", HEAD, 501), "declined")
+        self.assertEqual(self.registry.get_confirmation("kitchen", "2026-11-15", DUTY, 501), "declined")
 
     def test_dependency_configuration_checks_session_and_permissions(self):
         for task in ("X", "Y", "Z"):
