@@ -78,6 +78,7 @@ if __package__:
     from .ui import send_telegram_screen, visible_units
     from .secure_fs import open_private_directory
     from .month_summary import send_due_month_summaries
+    from .personal_reminders import personal_reminder_block_reason
     from .readiness import run_readiness_tick
     from .schedule_plan import plan_events
     from .scheduler import (
@@ -146,6 +147,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.ui import send_telegram_screen, visible_units
     from bot.secure_fs import open_private_directory
     from bot.month_summary import send_due_month_summaries
+    from bot.personal_reminders import personal_reminder_block_reason
     from bot.readiness import run_readiness_tick
     from bot.schedule_plan import plan_events
     from bot.scheduler import (
@@ -1905,18 +1907,11 @@ async def _process_user_reminder_schedule(
             schedule_id,
         )
         return
-    task_info = assignments.get(schedule["task"])
-    if task_is_informational(task_info or []):
-        debug_logger.debug(
-            "Личное расписание %s пропущено: задача «%s» стала "
-            "информационной в графике",
-            schedule_id,
-            schedule["task"],
-        )
-        return
-    if not event_found or schedule["name"] not in task_assignment_names(
-        task_info or []
-    ):
+    reason = personal_reminder_block_reason(
+        schedule, assignments, event_found=event_found, approved=approved_plan,
+    )
+    if reason is not None:
+        debug_logger.debug("Личное расписание %s пропущено: %s", schedule_id, reason)
         return
 
     service = registry.get_service(schedule["service_id"])
