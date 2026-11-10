@@ -77,7 +77,7 @@ Production-workflow после слияния в `main` завершился у�
 набор — 805 тестов OK, 11 пропущено на macOS. `compileall` и
 `git diff --check` прошли. Прогноз сопоставлен с реальным обработчиком
 на общих mock-данных; живые сообщения не отправлялись.
-Этап подготовлен к публикации отдельным PR `dev → test`.
+Открыт [PR #20, dev → test](https://github.com/albazrov/reminder_bot/pull/20).
 Результаты CI, test deploy и Greptile проверяются на окончательном head PR.
 
 ## Следующие задачи
