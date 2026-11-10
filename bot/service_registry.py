@@ -154,6 +154,7 @@ _GROUP_REMINDER_SOURCE = (
 # Своих личных напоминаний человека в одном служении.
 USER_REMINDERS_PER_SERVICE = 10
 USER_REMINDER_BODY_LIMIT = 3000
+SHORT_NAME_LIMIT = 32
 
 
 def task_token(task: str) -> str:
@@ -592,6 +593,14 @@ class ServiceRegistry:
                     -- NULL — как у служения (задачи с отметкой «🔗»).
                     week_tasks_json TEXT,
                     updated_at TEXT NOT NULL,
+                    PRIMARY KEY (service_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS service_display_names (
+                    service_id TEXT NOT NULL REFERENCES services(id)
+                        ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    short_name TEXT NOT NULL,
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -2037,6 +2046,10 @@ class ServiceRegistry:
                 (actor_id,),
             ).fetchone() is not None
             if not is_super_admin:
+                if not enabled:
+                    raise PermissionError(
+                        "Отключить служение может только суперадминистратор."
+                    )
                 # Админ служения — только группа и не чужая: иначе он слал
                 # бы напоминания в чат другого служения или личный чат.
                 if group_chat_id > 0:
@@ -2125,6 +2138,8 @@ class ServiceRegistry:
             raise ValueError("enabled должен быть логическим значением")
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
+            if not enabled:
+                self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
             connection.execute(
                 "UPDATE services SET enabled = ? WHERE id = ?",
@@ -5372,6 +5387,53 @@ class ServiceRegistry:
                 })
         return result
 
+    def set_service_member_short_name(
+        self, actor_id: int, service_id: str, name: str, short_name: str,
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(short_name, str):
+            raise ValueError("Короткое имя должно быть текстом.")
+        if not short_name.isprintable():
+            raise ValueError("Короткое имя должно быть одной строкой без управляющих символов.")
+        short_name = short_name.strip()
+        if len(short_name) > SHORT_NAME_LIMIT:
+            raise ValueError(f"Короткое имя — не более {SHORT_NAME_LIMIT} символов.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            exists = connection.execute(
+                "SELECT 1 FROM service_members WHERE service_id = ? AND name = ? "
+                "UNION ALL SELECT 1 FROM responsible_contacts "
+                "WHERE service_id = ? AND name = ? LIMIT 1",
+                (service_id, name, service_id, name),
+            ).fetchone()
+            if exists is None:
+                raise ValueError("Человека больше нет в составе или привязках.")
+            if short_name:
+                connection.execute(
+                    "INSERT INTO service_display_names(service_id, name, short_name) "
+                    "VALUES (?, ?, ?) ON CONFLICT(service_id, name) "
+                    "DO UPDATE SET short_name = excluded.short_name "
+                    "WHERE service_display_names.short_name != excluded.short_name",
+                    (service_id, name, short_name),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM service_display_names WHERE service_id = ? AND name = ?",
+                    (service_id, name),
+                )
+            self._audit(
+                connection, actor_id, "service_member_short_name", service_id,
+                {"name": name, "short_name": short_name},
+            )
+
+    def service_display_names(self, service_id: str) -> dict[str, str]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT name, short_name FROM service_display_names WHERE service_id = ?",
+                (service_id,),
+            ).fetchall()
+        return {row["name"]: row["short_name"] for row in rows}
+
     def list_service_user_reminder_schedules(
         self, actor_id: int, service_id: str,
     ) -> list[dict]:
@@ -5394,8 +5456,10 @@ class ServiceRegistry:
                 (service_id,),
             ).fetchall()
             contacts = connection.execute(
-                "SELECT task, telegram_id, name, username "
-                "FROM responsible_contacts WHERE service_id = ? ORDER BY name",
+                "SELECT c.task, c.telegram_id, c.name, c.username, d.short_name "
+                "FROM responsible_contacts c LEFT JOIN service_display_names d "
+                "ON d.service_id = c.service_id AND d.name = c.name "
+                "WHERE c.service_id = ? ORDER BY c.name",
                 (service_id,),
             ).fetchall()
         by_contact = {}
@@ -5409,6 +5473,7 @@ class ServiceRegistry:
                 "notifications_enabled": bool(row["notifications_enabled"]),
                 "name": contact["name"] if contact else None,
                 "username": contact["username"] if contact else "",
+                "short_name": contact["short_name"] if contact else None,
             })
         return result
 
@@ -5479,9 +5544,11 @@ class ServiceRegistry:
             if row is None:
                 return None
             contact = connection.execute(
-                "SELECT name, username FROM responsible_contacts "
-                "WHERE service_id = ? AND task = ? AND telegram_id = ? "
-                "ORDER BY name LIMIT 1",
+                "SELECT c.name, c.username, d.short_name FROM responsible_contacts c "
+                "LEFT JOIN service_display_names d "
+                "ON d.service_id = c.service_id AND d.name = c.name "
+                "WHERE c.service_id = ? AND c.task = ? AND c.telegram_id = ? "
+                "ORDER BY c.name LIMIT 1",
                 (row["service_id"], row["task"], row["actor_id"]),
             ).fetchone()
         return {
@@ -5489,6 +5556,7 @@ class ServiceRegistry:
             "notifications_enabled": bool(row["notifications_enabled"]),
             "name": contact["name"] if contact else None,
             "username": contact["username"] if contact else "",
+            "short_name": contact["short_name"] if contact else None,
         }
 
     def is_user_reminder_delivered(
@@ -5569,9 +5637,10 @@ class ServiceRegistry:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             rows = connection.execute(
-                "SELECT task, name, telegram_id, username "
-                "FROM responsible_contacts WHERE service_id = ? "
-                "ORDER BY task, name",
+                "SELECT c.task, c.name, c.telegram_id, c.username, d.short_name "
+                "FROM responsible_contacts c LEFT JOIN service_display_names d "
+                "ON d.service_id = c.service_id AND d.name = c.name "
+                "WHERE c.service_id = ? ORDER BY c.task, c.name",
                 (service_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -5931,9 +6000,12 @@ class ServiceRegistry:
                 person["username"] = row["username"] or ""
             if row["task"] in enabled:
                 person["tasks"].add(row["task"])
+        display_names = self.service_display_names(service_id)
         names = [person["name"] for person in people]
         result = []
         for person in people:
+            if person["name"] in display_names:
+                person["short_name"] = display_names[person["name"]]
             # Ключ распределения уникален и при совпадении имён.
             key = person["name"]
             if names.count(key) > 1:

@@ -368,6 +368,37 @@ class PersonalReminderForecastTest(unittest.TestCase):
                             (2, "за 2 дня"), (6, "за 6 дней")):
             self.assertEqual(personal_rule_label(days, "09:00"), f"{words} в 09:00")
 
+    def test_short_name_is_display_only_in_forecast_and_real_delivery(self):
+        from bot.app import _process_user_reminder_schedule
+        from bot.ui import plain_text
+
+        async def run():
+            rule = self.rule(name="Алексей Полный")
+            self.approve({"2026-11-15": {"Микшер": ["Алексей Полный"]}})
+            self.registry.set_service_member_short_name(
+                1001, "sound", "Алексей Полный", "Лёша",
+            )
+            text = self.forecast()
+            self.assertIn("Микшер · Лёша", text)
+            self.assertIn("запланировано", text)
+            schedule = self.registry.get_user_reminder_schedule(rule["id"])
+            self.assertEqual(schedule["name"], "Алексей Полный")
+            self.assertEqual(schedule["actor_id"], 2001)
+            bot = SimpleNamespace(send_message=AsyncMock())
+            await _process_user_reminder_schedule(
+                bot, SimpleNamespace(admin_tg_id=1001, yandex_public_url="unused"),
+                Path(self.tmp.name), self.now.tzinfo, self.registry, rule["id"],
+                MagicMock(), MagicMock(), run_date=date(2026, 11, 14),
+            )
+            body = plain_text(bot.send_message.await_args.args[1])
+            self.assertIn("Лёша", body)
+            self.assertNotIn("Алексей Полный", body)
+            self.assertTrue(self.registry.is_user_reminder_delivered(rule["id"], "2026-11-15"))
+            self.registry.set_service_member_short_name(1001, "sound", "Алексей Полный", "")
+            self.assertIn("Микшер · Алексей Полный", self.forecast())
+
+        asyncio.run(run())
+
     def test_forecast_matches_delivery_on_same_fixtures(self):
         from bot.app import _process_user_reminder_schedule
 

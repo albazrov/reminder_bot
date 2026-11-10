@@ -69,6 +69,7 @@ if __package__:
     )
     from .presentation import (
         apply_replacements,
+        display_name,
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
@@ -138,6 +139,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.presentation import (
         apply_replacements,
+        display_name,
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
@@ -1277,7 +1279,7 @@ async def get_group_reminder_preview(
     try:
         result["text"] = _render_group_reminder(
             template, reminder, service, assignments, contacts_by_name,
-            date_text,
+            date_text, registry.service_display_names(service["id"]),
         )
     except (AttributeError, IndexError, ValueError):
         result["error"] = "Ошибка в синтаксисе шаблона."
@@ -1352,6 +1354,7 @@ async def get_template_preview(
                 assignments,
                 {(item["task"], item["name"]): item for item in contacts},
                 date_text,
+                registry.service_display_names(service_id),
             )
     except (AttributeError, IndexError, ValueError):
         result["error"] = "Ошибка в синтаксисе шаблона."
@@ -1383,6 +1386,7 @@ def _render_group_reminder(
     assignments: dict,
     contacts_by_name: dict,
     date_text: str,
+    display_names: dict[str, str] | None = None,
 ) -> str:
     """Текст группового напоминания; для задачи — только её ответственные."""
     task = reminder.get("task") or ""
@@ -1395,12 +1399,15 @@ def _render_group_reminder(
             service_name=service["name"],
             sunday_date=date_text,
             task_assignments=format_task_assignments(
-                scoped, contacts_by_name, mark_unlinked=True
+                scoped, contacts_by_name, mark_unlinked=True,
+                display_names=display_names,
             ),
             informational_notes=format_informational_notes(assignments),
             task=task,
             task_responsibles=(
-                format_task_responsibles(task, task_names, contacts_by_name)
+                format_task_responsibles(
+                    task, task_names, contacts_by_name, display_names=display_names,
+                )
                 if task_names
                 else ""
             ),
@@ -1643,7 +1650,7 @@ async def _process_service_reminder(
     try:
         group_text = _render_group_reminder(
             group_template, reminder, service, assignments, contacts_by_name,
-            date_text,
+            date_text, registry.service_display_names(service_id),
         )
     except (AttributeError, IndexError, KeyError, ValueError) as exc:
         await _notify_admin(
@@ -1927,7 +1934,7 @@ async def _process_user_reminder_schedule(
     try:
         text = template.format_map(
             _TemplateValues(
-                name=schedule["name"],
+                name=display_name(schedule),
                 task=schedule["task"],
                 service_name=schedule["service_name"],
                 sunday_date=event_date.strftime("%d.%m.%Y"),
@@ -2119,7 +2126,7 @@ async def _prepare_service_test_previews(
             try:
                 personal_text = template.format_map(
                     _TemplateValues(
-                        name=name,
+                        name=display_name(contact, name),
                         task=task,
                         service_name=service["name"],
                         sunday_date=sunday_str,
@@ -2146,6 +2153,7 @@ async def _prepare_service_test_previews(
         rendered_assignment_names,
         contacts_by_name,
         mark_unlinked=True,
+        display_names=registry.service_display_names(service["id"]),
     )
     effective_group_template = (
         service["group_template"]

@@ -825,9 +825,13 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "12345 | alex",
                 )
             )
-            await handlers[4].callback(
-                self.message(67890, "/service_chat assembly -10077 off")
-            )
+            disable = self.message(67890, "/service_chat assembly -10077 off")
+            await handlers[4].callback(disable)
+            await self.callback_handler("on_service_disable")(SimpleNamespace(
+                data=self.callback_data_list(disable)[0],
+                from_user=SimpleNamespace(id=67890),
+                message=disable, answer=AsyncMock(),
+            ))
 
             self.assertEqual(self.registry.list_service_admins("sound"), [12345])
             self.assertEqual(self.context.group_chat_id, -10077)
@@ -4074,14 +4078,18 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 if handler.callback.__name__ == "on_service_selected"
             )
             await service_handler(service_callback)
-            action_keyboard = service_callback.message.answer.await_args.kwargs[
-                "reply_markup"
-            ]
+            self.assertNotIn(
+                "service:service_chat_disable:sound",
+                self.callback_data_list(service_callback.message),
+            )
+            service_callback.data = "service:service_setup:sound"
+            await service_handler(service_callback)
+            action_keyboard = service_callback.message.answer.await_args.kwargs["reply_markup"]
             disable_button = next(
                 button
                 for row in action_keyboard.inline_keyboard
                 for button in row
-                if button.text == "🔴 Отключить служение"
+                if button.text == "⛔ Отключить служение"
             )
             disable_callback = SimpleNamespace(
                 data=disable_button.callback_data,
@@ -4093,6 +4101,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await service_handler(disable_callback)
+            self.assertTrue(self.registry.get_service("sound")["enabled"])
+            confirm = self.callback_data_list(disable_callback.message)[0]
+            disable_callback.data = confirm
+            await self.callback_handler("on_service_disable")(disable_callback)
             sound = self.registry.get_service("sound")
             self.assertFalse(sound["enabled"])
             self.assertEqual(sound["group_chat_id"], -100222)
@@ -5149,6 +5161,13 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             disable = self.message(67890, "/service_chat sound off")
             await self.admin_router.message.handlers[4].callback(disable)
+            self.assertTrue(self.registry.get_service("sound")["enabled"])
+            confirmation = SimpleNamespace(
+                data=self.callback_data_list(disable)[0],
+                from_user=SimpleNamespace(id=67890),
+                message=disable, answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_disable")(confirmation)
             sound = self.registry.get_service("sound")
             self.assertEqual(sound["group_chat_id"], -1002233)
             self.assertFalse(sound["enabled"])
@@ -6159,8 +6178,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.callback_data_list(message),
                 [
                     "service:service_contact:sound",
-                    "service:service_excel:sound",
-                    "rdy:open:sound",
+                    "rdy:month:sound",
                     "service:service_reminders:sound",
                     "svc_tasks:open:sound",
                     "service:service_setup:sound",
@@ -6186,6 +6204,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.callback_data_list(setup.message),
                 ["service:service_chat:sound", "service:service_admin_add:sound",
                  "service:service_admin_remove:sound",
+                 "service:service_chat_disable:sound",
                  "service:service_settings:sound"],
             )
             # Проверка доставки — в «📡 Групповой чат», когда чат назначен.
@@ -6570,7 +6589,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Ход опроса", progress.message.answer.await_args.args[0]
             )
             # Замены — в разделе «📅 График» (решение 17, 5в).
-            section = await press("rdy:open:sound")
+            section = await press("rdy:month:sound")
             self.assertIn(
                 "rdy:repl:sound",
                 str(section.message.answer.await_args.kwargs["reply_markup"]),
@@ -6722,7 +6741,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         async def run():
             screen = await press("rdy:open:sound")
-            self.assertIn("📅 График · ЗВУК", text_of(screen))
+            self.assertIn("ЗВУК › График › Опрос", text_of(screen))
             skipped = await press(f"rdy:skip:sound:{month_arg}")
             self.assertIn("Составить без опроса", text_of(skipped))
             built = await press(data_of(skipped, "rdy:pfree:"))
@@ -7010,7 +7029,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 [button.callback_data for button in buttons(screen)],
             )
             plan_screen = await press(f"rdy:plan:sound:{month_arg}")
-            self.assertIn("📋 График", text_of(plan_screen))
+            self.assertIn("📋 ЗВУК › График › Опрос", text_of(plan_screen))
             self.assertIn("📝 Черновик", text_of(plan_screen))
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей"])
@@ -7130,8 +7149,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.callback_data_list(callback.message),
                 ["service:service_contact:sound",
-                 "service:service_excel:sound",
-                 "rdy:open:sound", "service:service_reminders:sound",
+                 "rdy:month:sound", "service:service_reminders:sound",
                  "svc_tasks:open:sound",
                  "service:service_setup:sound", "service:service_help:sound",
                  "service:back_to_services:list"],
@@ -7535,6 +7553,46 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_manual_chat_off_requires_confirmation_before_any_change(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -100444, enabled=True)
+            self.context.bot.get_chat = AsyncMock(return_value=SimpleNamespace(
+                type="supergroup", title="Чат", username=None, invite_link=None,
+            ))
+            self.context.bot.get_chat_member = AsyncMock(
+                return_value=SimpleNamespace(status="member"),
+            )
+            before = self.registry.get_service("sound")
+            for actor in (67890, 24680):
+                if actor == 24680:
+                    self.registry.add_service_admin(67890, "sound", actor)
+                picker = SimpleNamespace(
+                    data="service:service_chat_set:sound",
+                    from_user=SimpleNamespace(id=actor),
+                    message=self.message(actor, ""), answer=AsyncMock(),
+                )
+                await self.callback_handler("on_service_selected")(picker)
+                typed = self.message(actor, "-100555 off")
+                await self.message_handler("on_service_parameter")(typed)
+                self.assertEqual(self.registry.get_service("sound"), before)
+                if actor == 24680:
+                    self.assertIn("суперадминистратор", typed.answer.await_args.args[0])
+                    continue
+                confirm = self.callback_data_list(typed)[0]
+                self.assertTrue(confirm.startswith("disable:sound:"))
+                await self.callback_handler("on_service_disable")(SimpleNamespace(
+                    data=confirm, from_user=SimpleNamespace(id=actor),
+                    message=typed, answer=AsyncMock(),
+                ))
+                service = self.registry.get_service("sound")
+                self.assertFalse(service["enabled"])
+                self.assertEqual(service["group_chat_id"], -100555)
+                self.registry.set_group_chat(
+                    67890, "sound", before["group_chat_id"], enabled=before["enabled"],
+                )
+
+        asyncio.run(run())
+
     def test_service_card_hub_buttons_open_sections(self):
         async def run():
             for operation, expected in (
@@ -7795,6 +7853,46 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_member_short_name_edit_reset_cancel_and_stale(self):
+        async def run():
+            members = await self.open_members()
+            card = await self.press_inline(
+                members.message, "⚪ Пётр · не привязан", "on_contact_person_choice",
+            )
+            edited = await self.press_inline(
+                card.message, "✏️ Короткое имя", "on_member_card",
+            )
+            self.assertIn("32 символов", "".join(
+                call.args[0] for call in edited.message.answer.await_args_list if call.args
+            ))
+            invalid = await self.type_text("И" * 33)
+            self.assertIn("не более 32", "".join(
+                call.args[0] for call in invalid.answer.await_args_list if call.args
+            ))
+            saved = await self.type_text("Петя")
+            self.assertEqual(self.registry.service_display_names("sound"), {"Пётр": "Петя"})
+            again = await self.press_inline(saved, "✏️ Короткое имя", "on_member_card")
+            cancelled = await self.press_inline(
+                again.message, "⬅️ К человеку", "on_member_card",
+            )
+            stale = SimpleNamespace(
+                data=self.callback_data_list(again.message)[0],
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""), answer=AsyncMock(),
+            )
+            await self.callback_handler("on_member_card")(stale)
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            self.assertEqual(self.registry.service_display_names("sound")["Пётр"], "Петя")
+            again = await self.press_inline(
+                cancelled.message, "✏️ Короткое имя", "on_member_card",
+            )
+            await self.press_inline(
+                again.message, "🧹 Убрать короткое имя", "on_member_card",
+            )
+            self.assertEqual(self.registry.service_display_names("sound"), {})
+
+        asyncio.run(run())
+
     def test_member_month_limit(self):
         async def run():
             members = await self.open_members()
@@ -7857,7 +7955,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text = "".join(
                 call.args[0] for call in screen.message.answer.await_args_list
             )
-            self.assertIn("📊 ЗВУК · график Excel", text)
+            self.assertIn("ЗВУК › График › Загрузить с диска", text)
             self.assertIn(
                 "график в БД бота не утверждён — напоминания приостановлены",
                 text,

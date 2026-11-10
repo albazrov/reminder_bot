@@ -23,7 +23,10 @@ from aiogram.types import ReplyParameters
 from .excel_parser import ServiceAssignment, ServiceEvent, _schedule_sheet_name
 from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title
-from .presentation import task_emoji
+from .presentation import (
+    apply_replacements, display_name, format_task_assignments,
+    task_assignment_names, task_emoji,
+)
 from .readiness import (
     DEFAULT_PLAN_TITLE,
     DEFAULT_PLAN_UPDATE_TITLE,
@@ -557,7 +560,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
               window: tuple[int, int] = (0, 0)) -> str:
     """window — окно дней служения от воскресенья (Уборка: −1, +1)."""
     year, month = map(int, plan["month"].split("-"))
-    names = _names(summary.people)
+    names = {person["key"]: display_name(person) for person in summary.people}
     by_key = {person["key"]: person for person in summary.people}
     silent = {person["key"] for person in summary.not_answered}
     polled = [person for person in summary.people if person["tasks"]]
@@ -596,7 +599,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     else:
         status = f"✅ Утверждён {local_text(plan['approved_at'], tz)}"
     lines = [
-        f"📋 График · {service_label} · {month_title(year, month)}",
+        f"📋 {service_label} › График › Опрос › {month_title(year, month)}",
         status,
         "",
         (
@@ -658,7 +661,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
                                     person["name"]),
     )
     lines += ["", "👥 Нагрузка (дней служения в месяце):"] + [
-        f"   {len(load.get(person['key'], set()))} — {person['name']}"
+        f"   {len(load.get(person['key'], set()))} — {display_name(person)}"
         + ("" if person["telegram_id"] else " (без Telegram)")
         for person in ordered
     ]
@@ -917,7 +920,7 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         person = by_key.get(key)
         if person is None:
             return key
-        return user_link(person["telegram_id"], person["name"])
+        return user_link(person["telegram_id"], display_name(person))
 
     lines = [
         publication_title(service, plan["month"], update, settings),
@@ -991,7 +994,7 @@ def update_notice(service: dict, plan: dict, people: list[dict],
     def link(key: str) -> str:
         person = by_key.get(key)
         return (
-            user_link(person["telegram_id"], person["name"]) if person
+            user_link(person["telegram_id"], display_name(person)) if person
             else key
         )
 
@@ -1146,6 +1149,88 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
         ServiceEvent(plan["service_id"], moment, tuple(items))
         for moment, items in sorted(events.items())
     ]
+
+
+def month_overview(registry, actor_id: int, service_id: str, month: date) -> str:
+    """Saved assignments by actual date; never load Excel or modify a plan."""
+    first = month.replace(day=1)
+    last = month_end(first.year, first.month)
+    contacts = {
+        (item["task"], item["name"]): item
+        for item in registry.list_responsible_contacts(actor_id, service_id)
+    }
+    people = registry.readiness_people(service_id)
+    display_names = registry.service_display_names(service_id)
+    selected = registry.get_schedule_plan(service_id, first.strftime("%Y-%m"))
+    if selected is None:
+        status = (
+            "⚪ Графика на текущий месяц пока нет.\n"
+            "Загрузите его с диска или создайте через «Опрос»."
+        )
+    elif selected["approved"] is None:
+        status = "📝 Не утверждён.\nНапоминания по этому графику не отправляются."
+    else:
+        status = "✅ Утверждённый график с актуальными заменами."
+        if selected["dirty"]:
+            status += "\nЕсть неутверждённые правки; ниже действует прежний график."
+    assignments: dict[date, dict[str, list[str]]] = {}
+    cursor = (first - timedelta(days=7)).replace(day=1)
+    while cursor <= last + timedelta(days=7):
+        plan = registry.get_schedule_plan(service_id, cursor.strftime("%Y-%m"))
+        draft = plan is not None and plan["approved"] is None
+        if draft and cursor == first:
+            plan = {
+                **plan, "approved": plan["slots"],
+                "approved_tasks": plan["tasks"], "approved_days": plan["days"],
+                "approved_slot_days": approved_slot_days(plan, people),
+            }
+        elif draft:
+            plan = None
+        if plan is not None:
+            tasks = {task["name"]: task for task in plan.get("approved_tasks") or []}
+            for slots in plan["approved"].values():
+                for task in slots:
+                    tasks.setdefault(task, {"name": task})
+            saved_tasks = {"tasks": list(tasks.values())}
+            for day_key, slots in plan["approved"].items():
+                for task in tasks:
+                    if slots.get(task):
+                        continue
+                    moment = date.fromisoformat(day_key) + timedelta(
+                        days=slot_offset(saved_tasks, None, day_key, task) or 0,
+                    )
+                    if first <= moment <= last:
+                        assignments.setdefault(moment, {}).setdefault(task, [])
+            for event in plan_events(plan, people):
+                if not first <= event.event_date <= last:
+                    continue
+                day = assignments.setdefault(event.event_date, {})
+                event_tasks: dict[str, list[str]] = {}
+                for assignment in event.assignments:
+                    event_tasks.setdefault(assignment.task, []).append(assignment.name)
+                current = event_tasks if draft else apply_replacements(
+                    event_tasks,
+                    registry.list_replacements(service_id, event.event_date.isoformat()),
+                )
+                for task, info in current.items():
+                    names = day.setdefault(task, [])
+                    for name in task_assignment_names(info):
+                        if name not in names:
+                            names.append(name)
+        cursor = (cursor + timedelta(days=32)).replace(day=1)
+    lines = [status]
+    if assignments and selected is None:
+        lines.append("Ниже — даты соседних утверждённых графиков, попавшие в этот месяц.")
+    for day, current in sorted(assignments.items()):
+        lines += [
+            "", f"🗓 {day:%d.%m.%Y}",
+            format_task_assignments(current, contacts, display_names=display_names),
+        ]
+        if not any(current.values()):
+            lines.append("Назначений нет.")
+    if not assignments and selected is not None:
+        lines += ["", "На этот месяц назначений нет."]
+    return "\n".join(lines)
 
 
 def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:

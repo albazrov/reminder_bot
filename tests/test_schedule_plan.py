@@ -1662,7 +1662,7 @@ class SchedulePlanTest(unittest.TestCase):
         plan = self.draft()
         summary = readiness.summarize(self.registry, self.run, with_plan=False)
         text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
-        self.assertIn("📋 График · ЗВУК · ноябрь 2026", text)
+        self.assertIn("📋 ЗВУК › График › Опрос › ноябрь 2026", text)
         self.assertIn("📝 Черновик", text)
         self.assertIn("Ответили 3 из 4", text)
         self.assertIn("🗓 01.11", text)
@@ -1892,7 +1892,7 @@ class SchedulePlanTest(unittest.TestCase):
             if call.args[0] == 1001
         )
         self.assertIn("Опрос завершён", admin_call.args[1])
-        self.assertIn("📋 График · Звук", admin_call.args[1])
+        self.assertIn("📋 Звук › График › Опрос", admin_call.args[1])
         buttons = [
             button.callback_data
             for row in admin_call.kwargs["reply_markup"].inline_keyboard
@@ -1928,7 +1928,7 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertTrue(
             self.registry.get_readiness_run_by_id(run["id"])["result_sent"]
         )
-        self.assertIn("📋 График", bot.send_message.await_args.args[1])
+        self.assertIn("📋 Звук › График › Опрос", bot.send_message.await_args.args[1])
 
     def test_partial_publication_is_removed(self):
         plan = self.draft()

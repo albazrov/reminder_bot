@@ -41,6 +41,15 @@ class FormatTaskAssignmentsTest(unittest.TestCase):
         self.assertIn("• Олег", plain_text(text))
         self.assertNotIn("не привязан", text)
 
+    def test_short_name_for_unbound_person_keeps_unlinked_status(self):
+        text = format_task_assignments(
+            {"Микшер": ["Олег"]}, self.contacts, mark_unlinked=True,
+            display_names={"Олег": "О."},
+        )
+        self.assertIn("• О. · не привязан", plain_text(text))
+        self.assertNotIn("Олег", plain_text(text))
+        self.assertNotIn("LINK:", text)
+
     def test_senior_is_listed_before_shift_and_other_tasks_keep_order(self):
         assignments = {
             "в смене": {"names": ["Алексей", "Мария"]},
