@@ -17,7 +17,8 @@ MAX_SCREEN_UNITS = 500
 MAX_CALLBACK_UNITS = 200
 _RICH_MARKER = re.compile(
     r"\x00(?:CODE:(?P<code>[A-Za-z0-9_-]*)"
-    r"|LINK:(?P<user_id>\d+):(?P<label>[A-Za-z0-9_-]*))\x00"
+    r"|LINK:(?P<user_id>\d+):(?P<label>[A-Za-z0-9_-]*)"
+    r"|URL:(?P<url>[A-Za-z0-9_-]*):(?P<url_label>[A-Za-z0-9_-]*))\x00"
 )
 _STATUS_PREFIX = re.compile(r"^(?:✅|❌|⚠️|ℹ️|⏳)\s*")
 _NAVIGATION_PREFIXES = ("⬅️", "✖️", "✅", "➡️", "↩️", "🏠")
@@ -48,11 +49,13 @@ def _decode_marker(match: re.Match) -> tuple[str, str]:
     is_code = match.group("code") is not None
     try:
         value = _decode_marker_value(
-            match.group("code") if is_code else match.group("label")
+            match.group("code") if is_code else
+            match.group("url_label") if match.group("url") is not None
+            else match.group("label")
         )
     except ValueError:
         return "text", match.group(0).replace("\x00", "")
-    return ("code" if is_code else "link"), value
+    return ("code" if is_code else "url" if match.group("url") is not None else "link"), value
 
 
 def _escape_rich_text(text: str) -> str:
@@ -68,6 +71,15 @@ def _escape_rich_text(text: str) -> str:
                 f'<a href="tg://user?id={match.group("user_id")}">'
                 f"{html.escape(value)}</a>"
             )
+        elif kind == "url":
+            try:
+                url = _decode_marker_value(match.group("url"))
+            except ValueError:
+                url = ""
+            if _valid_telegram_url(url):
+                pieces.append(f'<a href="{html.escape(url, quote=True)}">{html.escape(value)}</a>')
+            else:
+                pieces.append(html.escape(value))
         else:
             pieces.append(html.escape(value))
         cursor = match.end()
@@ -133,8 +145,19 @@ def user_link(telegram_id: int | str | None, label: str) -> str:
     return f"\x00LINK:{int(user_id)}:{_encode_marker_value(label)}\x00"
 
 
-def render_screen_chunks(text: str, limit: int = MAX_SCREEN_UNITS) -> list[str]:
-    """Escape plain dialog text, emphasize its first line, and cap each screen."""
+def _valid_telegram_url(url: str) -> bool:
+    return re.fullmatch(r"https://t\.me/[A-Za-z0-9_+/-]+", url) is not None
+
+
+def telegram_link(url: str, label: str) -> str:
+    """A safe Telegram chat link, rendered by the same pipeline as mentions."""
+    if not _valid_telegram_url(url):
+        return label
+    return f"\x00URL:{_encode_marker_value(url)}:{_encode_marker_value(label)}\x00"
+
+
+def screen_text_chunks(text: str, limit: int = MAX_SCREEN_UNITS) -> list[str]:
+    """Split at line boundaries without breaking rich-text markers."""
     if limit < 32:
         raise ValueError("Лимит экрана должен быть не меньше 32 символов.")
     source = str(text).strip()
@@ -160,9 +183,13 @@ def render_screen_chunks(text: str, limit: int = MAX_SCREEN_UNITS) -> list[str]:
             current_units += extra
     if current:
         chunks.append("\n".join(current))
+    return chunks
 
+
+def render_screen_chunks(text: str, limit: int = MAX_SCREEN_UNITS) -> list[str]:
+    """Escape plain dialog text, emphasize its first line, and cap each screen."""
     rendered = []
-    for chunk in chunks:
+    for chunk in screen_text_chunks(text, limit):
         title, separator, body = chunk.partition("\n")
         title_html = f"<b>{_escape_rich_text(title)}</b>"
         rendered.append(

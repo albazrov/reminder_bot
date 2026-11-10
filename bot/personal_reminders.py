@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from .month_summary import month_end
 from .presentation import (
     apply_replacements,
+    display_name,
     task_assignment_names,
     task_is_informational,
 )
@@ -59,6 +60,7 @@ def personal_reminder_forecast(
     """Use actual event dates, including shifted slots of adjacent plans."""
     schedules = registry.list_service_user_reminder_schedules(actor_id, service_id)
     contacts = registry.list_responsible_contacts(actor_id, service_id)
+    display_names = registry.service_display_names(service_id)
     service = registry.get_service(service_id)
     if service is None:
         raise ValueError("Служение не найдено.")
@@ -117,7 +119,7 @@ def personal_reminder_forecast(
                     if item["actor_id"] == person_id and item["task"] == task
                     and item["name"] == name
                 ]
-                label = name
+                label = display_names.get(name) or display_name(contact, name)
                 base, separator, suffix = name.rpartition(" · ")
                 if name not in known_names and separator and suffix.isdecimal():
                     label = f"{base} (нет актуальной привязки)"
@@ -168,7 +170,7 @@ def personal_reminder_forecast(
         reason = personal_reminder_block_reason(
             rule, {}, event_found=False, approved=approved,
         )
-        name = rule["name"] or "Получатель без привязки"
+        name = display_name(rule, "Получатель без привязки")
         entries.append(
             f"• {name} · {rule['task']}\n"
             f"Правило: {personal_rule_label(rule['reminder_days'], rule['reminder_time'])}"
