@@ -231,7 +231,7 @@ async def _cached_source(
                 if manifest is not None and manifest["digest"] != new_manifest["digest"]:
                     (root / f"{key}-{manifest['digest']}.xlsx").unlink(missing_ok=True)
                 return content
-        except (aiohttp.ClientError, TimeoutError, YandexRequestError) as exc:
+        except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError, YandexRequestError) as exc:
             if isinstance(exc, YandexRequestError) and exc.status == 429:
                 _write_private(cooldown_path, str(
                     datetime.now(timezone.utc).timestamp()
@@ -298,6 +298,6 @@ async def download_public(
                 if on_change is not None and previous != content:
                     on_change()
                 return dest
-            except (aiohttp.ClientError, TimeoutError, YandexRequestError) as exc:
+            except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError, YandexRequestError) as exc:
                 await _retry_or_raise(exc, attempt, request, debug_logger)
     raise RuntimeError("Не удалось скачать файл Excel")

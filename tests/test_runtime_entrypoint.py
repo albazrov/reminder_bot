@@ -252,6 +252,10 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 url = "https://example.invalid/schedule"
                 key = hashlib.sha256(url.encode()).hexdigest()
                 self.approve_plan(registry, "sound", day, "Микшер", "Алексей")
+                registry.bind_service_member(
+                    1001, "sound", "Алексей", 5005, tasks=("звук",),
+                )
+                self.assertNotIn("Микшер", registry.list_user_tasks(5005, "sound"))
                 registry.save_schedule_notes(
                     key, "version-one",
                     [["sound", day.isoformat(), "2я часть", "членское"]],
@@ -265,6 +269,7 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     )
                     self.assertTrue(found)
                     self.assertEqual(result["Микшер"]["names"], ["Алексей"])
+                    self.assertIn("Микшер", registry.list_user_tasks(5005, "sound"))
                     self.assertEqual(result["2я часть"]["names"], ["членское"])
                     summary = await app._load_month_summary_events(
                         loader, registry, {}, datetime(2026, 10, 31),
@@ -296,6 +301,25 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                 loader.assert_not_awaited()
 
         asyncio.run(process())
+
+    def test_approved_overview_adds_local_task_bindings_without_network(self):
+        from bot import app
+        from bot.service_registry import ServiceRegistry
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry = ServiceRegistry(Path(tmp_dir) / "registry.sqlite3")
+            registry.initialize(1001, -10001)
+            day = date(2026, 11, 1)
+            registry.bind_service_member(
+                1001, "sound", "Алексей", 5005, tasks=("звук",),
+            )
+            self.approve_plan(registry, "sound", day, "Микшер", "Алексей")
+            with patch.object(app, "download_public", new=AsyncMock()) as download:
+                app._approved_service_events(
+                    registry, "https://example.invalid/schedule", day, day,
+                )
+                download.assert_not_awaited()
+            self.assertIn("Микшер", registry.list_user_tasks(5005, "sound"))
 
     def test_reference_refresh_changes_notes_but_not_approved_assignments(self):
         from bot import app

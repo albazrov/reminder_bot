@@ -191,6 +191,24 @@ class SourceTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(result, RuntimeError)
             self.assertIn("3 попыток", str(result))
 
+    async def test_python310_asyncio_timeout_retries_cached_and_uncached(self):
+        class LegacyAsyncTimeout(Exception):
+            pass
+
+        for cache_dir in (None, self.cache):
+            with self.subTest(cache_dir=cache_dir):
+                self.session.get.reset_mock()
+                self.session.get.side_effect = LegacyAsyncTimeout("timeout")
+                with patch.object(
+                    yandex_disk.asyncio, "TimeoutError", LegacyAsyncTimeout
+                ), patch.object(yandex_disk.asyncio, "sleep", new=AsyncMock()):
+                    with self.assertRaisesRegex(RuntimeError, "3 попыток"):
+                        await yandex_disk.download_public(
+                            "https://example.invalid/source", self.root / "out.xlsx",
+                            self.logger, attempts=3, cache_dir=cache_dir,
+                        )
+                self.assertEqual(self.session.get.call_count, 3)
+
     async def test_retry_after_and_terminal_errors(self):
         responses = [Response(status=429, headers={"Retry-After": "600"})]
         self.session.get.side_effect = responses + self.responses(b"retry")

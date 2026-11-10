@@ -656,6 +656,10 @@ def _approved_service_events(
 ) -> list:
     notes = _saved_note_events(registry, public_url, first, last)
     events = _apply_bot_plans(notes, registry, first, last, approved_only=True)
+    for service_id in sorted({event.service_id for event in events}):
+        registry.ensure_member_contacts(service_id, _service_event_assignments([
+            event for event in events if event.service_id == service_id
+        ]))
     return _apply_event_replacements(events, registry) if with_replacements else events
 
 
@@ -720,8 +724,8 @@ async def _load_service_task_assignments(
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
     """Назначения служения из графика; issues пополняется предупреждениями.
 
-    С registry заодно обновляется состав служений из «Списков», а люди,
-    уже привязанные к Telegram, получают привязки к новым задачам графика.
+    Люди с Telegram получают привязки к новым задачам графика из БД.
+    Только явная загрузка Excel обновляет состав из «Списков».
     """
     sunday_date = only_date or _next_sunday_in_tz(tz)
     planned: list = []
@@ -751,6 +755,7 @@ async def _load_service_task_assignments(
         )
         events += [event for event in notes if event.service_id == service_id]
         result = _service_event_assignments(events)
+        registry.ensure_member_contacts(service_id, result)
         if raw_out is not None:
             raw_out.clear()
             raw_out.update(result)

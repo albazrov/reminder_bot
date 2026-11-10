@@ -11232,11 +11232,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             or now - task_cache_updated.get(service_id, 0)
             >= PERSONAL_TASK_CACHE_TTL_SECONDS
         ):
-            assigned = set(registry.list_user_tasks(actor_id, service_id))
             loader = getattr(context, "load_service_task_assignments", None)
             if loader is None:
                 raise ValueError("Не удалось проверить актуальный график служения.")
             current_assignments = await loader(service_id)
+            assigned = set(registry.list_user_tasks(actor_id, service_id))
             task_cache[service_id] = [
                 task
                 for task, task_info in current_assignments.items()

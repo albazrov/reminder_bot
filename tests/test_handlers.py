@@ -5816,6 +5816,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_enable_sees_bindings_created_by_schedule_loader(self):
+        async def run():
+            actor_id = 4612
+            self.registry.bind_service_member(
+                67890, "sound", "Имя из расписания", actor_id, tasks=("Микшер",),
+            )
+            assignments = {
+                "Микшер": ["Имя из расписания"],
+                "Пульт": ["Имя из расписания"],
+            }
+
+            async def load(service_id):
+                self.registry.ensure_member_contacts(service_id, assignments)
+                return assignments
+
+            self.context.load_service_task_assignments = load
+            await self.personal_toggle(actor_id)
+            self.assertEqual(self.rules(actor_id, "Пульт"), [(1, "18:00", True)])
+
+        asyncio.run(run())
+
     def test_enable_with_disabled_rule_still_covers_other_task(self):
         async def run():
             actor_id = 4613
