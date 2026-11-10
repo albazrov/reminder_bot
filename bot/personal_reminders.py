@@ -65,6 +65,11 @@ def personal_reminder_forecast(
     people = registry.readiness_people(service_id)
     known_names = {person["name"] for person in people}
     first, last = month.replace(day=1), month_end(month.year, month.month)
+    deliveries, confirmations, enabled_recipients = (
+        registry.get_personal_reminder_forecast_state(
+            actor_id, service_id, first, last,
+        )
+    )
     selected_plan = registry.get_schedule_plan(service_id, f"{first:%Y-%m}")
     approved = selected_plan is not None and selected_plan["approved"] is not None
     assignments_by_date: dict[date, dict] = {}
@@ -118,10 +123,7 @@ def personal_reminder_forecast(
                     label = f"{base} (нет актуальной привязки)"
                 title = f"📅 {event_date:%d.%m.%Y} · {task} · {label}"
                 if not rules:
-                    confirmation = (
-                        registry.get_confirmation(service_id, event_iso, task, person_id)
-                        if person_id and person_id > 0 else None
-                    )
+                    confirmation = confirmations.get((event_iso, task, person_id))
                     if confirmation:
                         reason = "принял" if confirmation == "confirmed" else "отказался"
                         entries.append(f"{title}\nСтатус: {reason}.")
@@ -130,7 +132,7 @@ def personal_reminder_forecast(
                         reason = "нет привязки Telegram к задаче"
                     elif not service["enabled"]:
                         reason = "служение выключено"
-                    elif not registry.is_user_notifications_enabled(person_id, service_id):
+                    elif person_id not in enabled_recipients:
                         reason = "уведомления выключены"
                     else:
                         reason = "нет включённого правила"
@@ -139,11 +141,9 @@ def personal_reminder_forecast(
                     scheduled_ids.add(rule["schedule_id"])
                     reason = personal_reminder_block_reason(
                         rule, assignments, event_found=True, approved=True,
-                        delivered=registry.is_user_reminder_delivered(
-                            rule["schedule_id"], event_iso
-                        ),
-                        confirmation=registry.get_confirmation(
-                            service_id, event_iso, task, rule["actor_id"]
+                        delivered=(rule["schedule_id"], event_iso) in deliveries,
+                        confirmation=confirmations.get(
+                            (event_iso, task, rule["actor_id"])
                         ),
                     )
                     send_at = reminder_send_datetime(

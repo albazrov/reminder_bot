@@ -230,6 +230,107 @@ class PersonalReminderForecastTest(unittest.TestCase):
                 self.registry, 2001, "sound", self.month, self.now,
             )
 
+    def test_bulk_rules_match_single_reads_including_unbound_and_disabled(self):
+        self.rule("Яна", 2001)
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Анна", 2001,
+        )
+        self.rule("Мария", 3001, enabled=False)
+        self.registry.set_user_notifications_enabled(3001, "sound", False)
+        unbound = self.rule("Иван", 4001)
+        with self.registry._connection() as connection:
+            connection.execute(
+                "DELETE FROM responsible_contacts WHERE telegram_id = 4001"
+            )
+            connection.execute(
+                "DELETE FROM user_notification_prefs WHERE actor_id = 4001"
+            )
+        rows = self.registry.list_service_user_reminder_schedules(1001, "sound")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["name"], "Анна")
+        self.assertEqual(rows[-1]["schedule_id"], unbound["id"])
+        self.assertIsNone(rows[-1]["name"])
+        self.assertEqual(rows, [
+            self.registry.get_user_reminder_schedule(row["schedule_id"])
+            for row in rows
+        ])
+
+    def test_bulk_forecast_state_is_scoped_to_service_and_dates(self):
+        rule = self.rule()
+        self.registry.set_confirmation(
+            "sound", "2026-11-15", "Микшер", 2001, "confirmed",
+        )
+        self.registry.set_confirmation(
+            "sound", "2026-12-01", "Микшер", 2001, "declined",
+        )
+        for day in ("2026-10-31", "2026-11-01", "2026-11-30", "2026-12-01"):
+            self.registry.mark_user_reminder_delivered(rule["id"], day)
+        task = self.registry.get_service("books")["name"]
+        self.registry.set_responsible_contact(1001, "books", task, "Мария", 3001)
+        self.registry.set_user_notifications_enabled(3001, "books", True)
+        other_text = self.registry.ensure_user_text(3001, "books", task)
+        other_rule = self.registry.add_schedule(other_text, 1, "18:00")
+        self.registry.mark_user_reminder_delivered(other_rule["id"], "2026-11-15")
+        self.registry.set_confirmation(
+            "books", "2026-11-15", task, 3001, "declined",
+        )
+        state = self.registry.get_personal_reminder_forecast_state(
+            1001, "sound", self.month, date(2026, 11, 30),
+        )
+        self.assertEqual(state, (
+            {(rule["id"], "2026-11-01"), (rule["id"], "2026-11-30")},
+            {("2026-11-15", "Микшер", 2001): "confirmed"},
+            {2001},
+        ))
+        with self.assertRaises(PermissionError):
+            self.registry.get_personal_reminder_forecast_state(
+                3001, "sound", self.month, date(2026, 11, 30),
+            )
+        with self.assertRaises(ValueError):
+            self.registry.get_personal_reminder_forecast_state(
+                1001, "sound", date(2026, 11, 30), self.month,
+            )
+
+    def test_forecast_database_reads_do_not_grow_with_people_or_rules(self):
+        days = [f"2026-11-{day:02d}" for day in (1, 8, 15, 22, 29)]
+        names = []
+
+        def measure():
+            self.approve({day: {"Микшер": list(names)} for day in days})
+            queries = []
+            connect = self.registry._connect
+
+            def traced_connect():
+                connection = connect()
+                connection.set_trace_callback(queries.append)
+                return connection
+
+            with patch.object(self.registry, "_connect", side_effect=traced_connect) as spy:
+                entries = personal_reminder_forecast(
+                    self.registry, 1001, "sound", self.month, self.now,
+                )
+            return spy.call_count, len(queries), entries
+
+        names.append("Участник 00")
+        self.rule(names[-1])
+        small_connections, small_queries, _ = measure()
+        for number in range(1, 70):
+            names.append(f"Участник {number:02d}")
+            self.rule(names[-1], 2001 + number)
+        connections, queries, entries = measure()
+        self.assertEqual(len(entries), 350)
+        self.assertEqual(connections, small_connections)
+        self.assertEqual(queries, small_queries)
+        self.assertLessEqual(connections, 20)
+        self.assertLessEqual(queries, 60)
+        with self.registry._connection() as connection:
+            connection.execute("DELETE FROM user_reminder_schedules")
+        no_rule_connections, no_rule_queries, entries = measure()
+        self.assertEqual(len(entries), 350)
+        self.assertEqual(no_rule_connections, connections)
+        self.assertEqual(no_rule_queries, queries)
+        self.assertTrue(all("нет включённого правила" in entry for entry in entries))
+
     def test_unbound_rule_is_not_hidden(self):
         rule = self.rule()
         with self.registry._connection() as connection:
@@ -278,13 +379,18 @@ class PersonalReminderForecastTest(unittest.TestCase):
                     self.registry.set_user_notifications_enabled(
                         2001, "sound", scenario != "disabled",
                     )
-                    with patch.object(
-                        self.registry, "get_confirmation",
-                        return_value="confirmed" if scenario == "answered" else None,
-                    ), patch.object(
-                        self.registry, "is_user_reminder_delivered",
-                        return_value=scenario == "delivered",
-                    ), patch("bot.app._download_schedule", new=AsyncMock()) as download:
+                    with self.registry._connection() as connection:
+                        connection.execute("DELETE FROM service_confirmations")
+                        connection.execute("DELETE FROM user_reminder_deliveries")
+                    if scenario == "answered":
+                        self.registry.set_confirmation(
+                            "sound", "2026-11-15", "Микшер", 2001, "confirmed",
+                        )
+                    if scenario == "delivered":
+                        self.registry.mark_user_reminder_delivered(
+                            rule["id"], "2026-11-15",
+                        )
+                    with patch("bot.app._download_schedule", new=AsyncMock()) as download:
                         text = self.forecast()
                         self.assertEqual(
                             "— запланировано" in text, scenario == "scheduled",
