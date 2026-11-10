@@ -135,6 +135,36 @@ class SourceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.get.call_count, 3)
         self.validate.assert_called_once()
 
+    async def test_source_change_during_download_retries_with_fresh_metadata(self):
+        self.session.get.side_effect = [
+            Response(self.meta(b"old")), Response({"href": "https://example.invalid/file"}),
+            Response(b"new"),
+        ] + self.responses(b"new")
+        with patch.object(yandex_disk.asyncio, "sleep", new=AsyncMock()) as sleep:
+            path = await yandex_disk.download_public(
+                "https://example.invalid/source", self.root / "out.xlsx",
+                self.logger, attempts=3, interval=300, cache_dir=self.cache,
+                validate=self.validate,
+            )
+        self.assertEqual(path.read_bytes(), b"new")
+        self.assertEqual(self.session.get.call_count, 6)
+        self.assertIn(unittest.mock.call(300), sleep.await_args_list)
+        self.validate.assert_called_once()
+
+    async def test_invalid_workbook_is_not_retried(self):
+        self.session.get.side_effect = self.responses(b"invalid")
+        self.validate.side_effect = RuntimeError("invalid workbook")
+        with self.assertRaisesRegex(RuntimeError, "invalid workbook"):
+            await yandex_disk.download_public(
+                "https://example.invalid/source", self.root / "out.xlsx",
+                self.logger, attempts=3, cache_dir=self.cache,
+                validate=self.validate,
+            )
+        self.assertEqual(self.session.get.call_count, 3)
+        self.assertIsNone(yandex_disk.source_version(
+            "https://example.invalid/source", self.cache,
+        ))
+
     async def test_force_joining_cached_request_still_checks_metadata(self):
         self.session.get.side_effect = self.responses(b"cached")
         await self.get()
