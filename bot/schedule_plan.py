@@ -1202,7 +1202,7 @@ def month_overview(registry, actor_id: int, service_id: str, month: date) -> str
                     if first <= moment <= last:
                         assignments.setdefault(moment, {}).setdefault(task, [])
             for event in plan_events(plan, people):
-                if not first <= event.event_date <= last:
+                if not event.assignments or not first <= event.event_date <= last:
                     continue
                 day = assignments.setdefault(event.event_date, {})
                 event_tasks: dict[str, list[str]] = {}
