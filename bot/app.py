@@ -56,6 +56,7 @@ if __package__:
         resolve_assignments,
     )
     from .admin_report import report_text, send_admin_reports
+    from .event_notes import EventNoteResolutionError, resolve_event_note
     from .handlers import register, send_to_service_group
     from .logger import setup_loggers
     from .notifier import (
@@ -126,6 +127,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         resolve_assignments,
     )
     from bot.admin_report import report_text, send_admin_reports
+    from bot.event_notes import EventNoteResolutionError, resolve_event_note
     from bot.handlers import register, send_to_service_group
     from bot.logger import setup_loggers
     from bot.notifier import (
@@ -1280,7 +1282,20 @@ async def get_group_reminder_preview(
         result["text"] = _render_group_reminder(
             template, reminder, service, assignments, contacts_by_name,
             date_text, registry.service_display_names(service["id"]),
+            event_notes=resolve_event_note(
+                registry, service["id"], event_date, reminder.get("task"),
+                template=template,
+                public_url=credentials.yandex_public_url if "{event_notes" in template else None,
+            ),
         )
+    except (sqlite3.Error, EventNoteResolutionError) as exc:
+        debug_logger.exception("Не удалось прочитать заметки для предпросмотра")
+        result["error"] = (
+            f"Не удалось прочитать заметки события: {exc}"
+            if isinstance(exc, EventNoteResolutionError)
+            else "Не удалось прочитать заметки события. Попробуйте позже."
+        )
+        return result
     except (AttributeError, IndexError, ValueError):
         result["error"] = "Ошибка в синтаксисе шаблона."
         return result
@@ -1355,7 +1370,23 @@ async def get_template_preview(
                 {(item["task"], item["name"]): item for item in contacts},
                 date_text,
                 registry.service_display_names(service_id),
+                event_notes=resolve_event_note(
+                    registry, service_id, event_date,
+                    template=template or DEFAULT_GROUP_TEMPLATE,
+                    public_url=(
+                        credentials.yandex_public_url if template and "{event_notes" in template
+                        else None
+                    ),
+                ),
             )
+    except (sqlite3.Error, EventNoteResolutionError) as exc:
+        debug_logger.exception("Не удалось прочитать заметки для предпросмотра шаблона")
+        result["error"] = (
+            f"Не удалось прочитать заметки события: {exc}"
+            if isinstance(exc, EventNoteResolutionError)
+            else "Не удалось прочитать заметки события. Попробуйте позже."
+        )
+        return result
     except (AttributeError, IndexError, ValueError):
         result["error"] = "Ошибка в синтаксисе шаблона."
         return result
@@ -1387,6 +1418,8 @@ def _render_group_reminder(
     contacts_by_name: dict,
     date_text: str,
     display_names: dict[str, str] | None = None,
+    *,
+    event_notes: str = "",
 ) -> str:
     """Текст группового напоминания; для задачи — только её ответственные."""
     task = reminder.get("task") or ""
@@ -1403,6 +1436,7 @@ def _render_group_reminder(
                 display_names=display_names,
             ),
             informational_notes=format_informational_notes(assignments),
+            event_notes=event_notes,
             task=task,
             task_responsibles=(
                 format_task_responsibles(
@@ -1651,12 +1685,18 @@ async def _process_service_reminder(
         group_text = _render_group_reminder(
             group_template, reminder, service, assignments, contacts_by_name,
             date_text, registry.service_display_names(service_id),
+            event_notes=resolve_event_note(
+                registry, service_id, event_date, reminder.get("task"),
+                template=group_template,
+                public_url=credentials.yandex_public_url if "{event_notes" in group_template else None,
+            ),
         )
-    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+    except (AttributeError, IndexError, KeyError, ValueError, sqlite3.Error) as exc:
+        debug_logger.exception("Не удалось подготовить групповое напоминание")
         await _notify_admin(
             bot,
             credentials.admin_tg_id,
-            f"Некорректный групповой шаблон служения «{service['name']}»: "
+            f"Не удалось подготовить текст напоминания служения «{service['name']}»: "
             f"{type(exc).__name__}",
             debug_logger,
         )
@@ -1940,9 +1980,15 @@ async def _process_user_reminder_schedule(
                 sunday_date=event_date.strftime("%d.%m.%Y"),
                 telegram_id=str(schedule["actor_id"]),
                 username=schedule["username"],
+                event_notes=resolve_event_note(
+                    registry, schedule["service_id"], event_date,
+                    schedule["task"],
+                    template=template,
+                    public_url=credentials.yandex_public_url if "{event_notes" in template else None,
+                ),
             )
         )
-    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+    except (AttributeError, IndexError, KeyError, ValueError, sqlite3.Error) as exc:
         debug_logger.exception(
             "Некорректный личный текст для расписания %s", schedule_id
         )
@@ -2132,6 +2178,10 @@ async def _prepare_service_test_previews(
                         sunday_date=sunday_str,
                         telegram_id=telegram_id,
                         username=username,
+                        event_notes=resolve_event_note(
+                            registry, service_id, sunday_date, task, template=template,
+                            public_url=credentials.yandex_public_url if "{event_notes" in template else None,
+                        ),
                     )
                 )
             except (AttributeError, IndexError, KeyError, ValueError) as exc:
@@ -2169,6 +2219,13 @@ async def _prepare_service_test_previews(
                 sunday_date=sunday_str,
                 task_assignments=assignment_text,
                 informational_notes=format_informational_notes(assignments),
+                event_notes=resolve_event_note(
+                    registry, service_id, sunday_date, template=effective_group_template,
+                    public_url=(
+                        credentials.yandex_public_url
+                        if "{event_notes" in effective_group_template else None
+                    ),
+                ),
             )
         )
     except (AttributeError, IndexError, KeyError, ValueError) as exc:

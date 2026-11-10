@@ -78,7 +78,7 @@ def build_report_text(
         shown_name = (display_names or {}).get(name) or display_name(contact, name)
         telegram_id = contact.get("telegram_id") if contact else None
         if not telegram_id:
-            delivery.append(f"⚪ {shown_name} ({task}) — не привязан")
+            delivery.append(f"⚪ {shown_name} ({task}) — тг аккаунт к боту не подключен")
         elif not notifications_enabled(telegram_id):
             delivery.append(f"🔕 {shown_name} ({task}) — уведомления выключены")
         else:

@@ -7,9 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from bot import schedule_plan
 from bot.handlers import register
 from bot.presentation import display_name, person_label
-from bot.schedule_plan import excel_text, month_overview, plan_events, publication_text
+from bot.schedule_plan import (
+    excel_text, month_overview, plan_events, publication_text, workload_lines,
+)
 from bot.service_registry import ServiceRegistry
 from bot.ui import plain_text, render_screen_chunks, visible_units
 
@@ -123,7 +126,8 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertIn("неутверждённые правки", text)
             self.assertEqual(
                 [item.text for item in self.buttons(shown)],
-                ["🔁 Замены", "📥 Загрузить с диска", "🗳 Опрос", "⬅️ К служению"],
+                ["🔁 Замены", "📥 Загрузить с диска", "🗳 Опрос", "🧮 Авто",
+                 "📊 Сводка", "⬅️ К служению"],
             )
             self.context.load_upcoming_service_events.assert_not_awaited()
             self.context.load_service_task_assignments.assert_not_awaited()
@@ -224,11 +228,12 @@ class ServiceScreensTest(unittest.TestCase):
             for _ in range(10):
                 texts.append(self.text(shown))
                 buttons = self.buttons(shown)
-                self.assertLessEqual(len(buttons), 6)
+                self.assertLessEqual(len(buttons), 8)
                 self.assertTrue(all(len(item.callback_data.encode()) <= 64 for item in buttons))
                 self.assertIn("rdy:repl:sound", [b.callback_data for b in buttons])
                 self.assertIn("rdy:open:sound", [b.callback_data for b in buttons])
                 self.assertIn("service:service_excel:sound", [b.callback_data for b in buttons])
+                self.assertIn("rdy:summary:sound", [b.callback_data for b in buttons])
                 self.assertLessEqual(visible_units(self.text(shown)), 4096)
                 next_page = next((item for item in buttons if item.text == "➡️ Далее"), None)
                 if next_page is None:
@@ -238,6 +243,305 @@ class ServiceScreensTest(unittest.TestCase):
             for name in names:
                 self.assertIn(name, "\n".join(texts))
 
+        asyncio.run(run())
+
+    def summary(self):
+        return plain_text(month_overview(
+            self.registry, 1001, "sound", self.now.date(), include_load=True,
+        ))
+
+    def test_auto_help_and_next_month_preserve_approved_current_graph(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "A", 3001)
+        self.plan({"2026-11-15": {"Микшер": ["A"]}})
+        before = self.registry.get_schedule_plan("sound", "2026-11")
+
+        async def run():
+            shown = await self.press("rdy:pfree:sound:202611", 2001)
+            self.assertIn("График уже составлен", self.text(shown))
+            buttons = self.buttons(shown)
+            self.assertLessEqual(len(buttons), 6)
+            help_button = next(b for b in buttons if b.text == "❓ Справка")
+            help_screen = await self.press(help_button.callback_data, 2001)
+            for text in ("Изменить", "Пересчитать", "ручные правки", "Утвердить",
+                         "До утверждения", "другого месяца"):
+                self.assertIn(text, self.text(help_screen))
+            returned = await self.press(self.buttons(help_screen)[0].callback_data, 2001)
+            self.assertIn("График", self.text(returned))
+            next_button = next(b for b in self.buttons(returned) if b.text == "🧮 Авто дек")
+            self.assertEqual(next_button.callback_data, "rdy:pfree:sound:202612")
+            following = await self.press(next_button.callback_data, 2001)
+            self.assertIn("декабрь 2026", self.text(following))
+            self.assertIn("🧮 Авто ноя", [b.text for b in self.buttons(following)])
+            draft = self.registry.get_schedule_plan("sound", "2026-12")
+            self.assertIsNone(draft["run_id"])
+            self.assertIsNone(draft["approved"])
+            self.assertTrue(any(names for tasks in draft["slots"].values()
+                                for names in tasks.values()))
+            await self.press(next_button.callback_data, 2001)
+            self.assertEqual(self.registry.get_schedule_plan("sound", "2026-12"), draft)
+            denied = await self.press(help_button.callback_data, 9999)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+            self.assertEqual(self.registry.get_schedule_plan("sound", "2026-11"), before)
+            self.context.load_upcoming_service_events.assert_not_awaited()
+            self.context.bot.send_message.assert_not_awaited()
+        asyncio.run(run())
+
+    def test_auto_month_link_crosses_year_and_blocks_unrelated_months(self):
+        self.now = self.now.replace(month=12)
+        self.plan({"2026-12-06": {"Микшер": ["A"]}}, month="2026-12")
+
+        async def run():
+            shown = await self.press("rdy:pfree:sound:202612")
+            button = next(b for b in self.buttons(shown) if b.text == "🧮 Авто янв")
+            self.assertEqual(button.callback_data, "rdy:pfree:sound:202701")
+            self.assertTrue(all(len(b.callback_data.encode()) <= 64 for b in self.buttons(shown)))
+            await self.press("rdy:pfree:sound:202702")
+            self.assertIsNone(self.registry.get_schedule_plan("sound", "2027-02"))
+        asyncio.run(run())
+
+    def test_auto_next_month_does_not_bypass_existing_readiness_poll(self):
+        run = self.registry.create_readiness_run(
+            "sound", "2026-12", status="open", dates=["2026-12-06"],
+            deadline="2026-11-25T18:00:00+00:00",
+        )
+
+        async def check():
+            shown = await self.press("rdy:pfree:sound:202612", 2001)
+            self.assertIn("Опрос этого месяца уже есть", self.text(shown))
+            self.assertIsNone(self.registry.get_schedule_plan("sound", "2026-12"))
+            self.assertEqual(self.registry.get_readiness_run("sound", "2026-12"), run)
+        asyncio.run(check())
+
+    def test_summary_load_uses_effective_graph_previous_replacements_and_ignores_draft(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        for name, telegram_id in (("Алексей", 3001), ("Мария", 3002), ("Борис", 3003)):
+            self.registry.set_responsible_contact(1001, "sound", "Микшер", name, telegram_id)
+        self.plan({"2026-10-04": {"Микшер": ["Алексей"]}}, month="2026-10")
+        self.registry.set_replacement(
+            "sound", "2026-10-04", "Микшер", "Алексей", "Мария", 3002, "", "admin", 1001,
+        )
+        self.plan({
+            "2026-11-01": {"Микшер": ["Алексей"]},
+            "2026-11-15": {"Микшер": ["Мария"]},
+        })
+        self.registry.set_replacement(
+            "sound", "2026-11-01", "Микшер", "Алексей", "Мария", 3002, "", "admin", 1001,
+        )
+        self.plan({"2026-11-22": {"Микшер": ["Черновик"]}}, approved=False)
+        text = self.summary()
+        self.assertIn("2 — Мария · интервалы, нед.: 4, 2", text)
+        self.assertIn("0 — Алексей", text)
+        self.assertIn("0 — Борис", text)
+        self.assertNotIn("Черновик", text)
+        self.assertIn("неутверждённые правки", text)
+        self.assertNotIn("0 — Алексей · интервалы", text)
+
+    def test_summary_keeps_namesakes_load_history_and_replacements_separate(self):
+        for task in ("Микшер", "Монтаж", "Запас"):
+            self.registry.add_service_task(1001, "sound", task)
+        for task, telegram_id, username in (
+            ("Микшер", 3101, "gleb_one"), ("Монтаж", 3102, "gleb_two"),
+            ("Запас", 3103, "gleb_three"),
+        ):
+            self.registry.set_responsible_contact(
+                1001, "sound", task, "Глеб", telegram_id, username,
+            )
+        # Legacy per-task bindings can contain separate accounts with one name.
+        with self.registry._connection() as connection:
+            for task, telegram_id, username in (
+                ("Микшер", 3101, "gleb_one"), ("Монтаж", 3102, "gleb_two"),
+            ):
+                connection.execute(
+                    "UPDATE responsible_contacts SET telegram_id = ?, username = ? "
+                    "WHERE service_id = 'sound' AND task = ?",
+                    (telegram_id, username, task),
+                )
+        people = self.registry.readiness_people("sound")
+        keys = {person["telegram_id"]: person["key"] for person in people}
+        self.assertEqual(len(set(keys.values())), 3)
+        tasks = [{"name": task, "needed": 1} for task in ("Микшер", "Монтаж", "Запас")]
+        self.plan({
+            "2026-10-04": {"Микшер": [keys[3101]]},
+            "2026-10-25": {"Монтаж": [keys[3102]]},
+        }, month="2026-10", tasks=tasks)
+        self.plan({
+            "2026-11-01": {"Микшер": [keys[3101]]},
+            "2026-11-08": {"Монтаж": [keys[3102]]},
+            "2026-11-15": {"Микшер": [keys[3101]]},
+        }, tasks=tasks)
+        text = self.summary()
+        self.assertIn("2 — Глеб (@gleb_one) · интервалы, нед.: 4, 2", text)
+        self.assertIn("1 — Глеб (@gleb_two) · интервалы, нед.: 2", text)
+        self.assertIn("0 — Глеб (@gleb_three)", text)
+        saved = self.registry.get_schedule_plan("sound", "2026-11")
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=saved["dates"],
+            tasks=tasks, slots=saved["slots"],
+            last_served={keys[3101]: "2026-10-04", keys[3102]: "2026-10-25"},
+        )
+        with patch.object(self.registry, "list_approved_schedule_plans", return_value=[]):
+            text = self.summary()
+        self.assertIn("2 — Глеб (@gleb_one) · интервалы, нед.: 4, 2", text)
+        self.assertIn("1 — Глеб (@gleb_two) · интервалы, нед.: 2", text)
+        # A same-name substitute is identified by Telegram, not by the task permit.
+        with patch.object(self.registry, "list_replacements", side_effect=lambda service, day: [
+            {"task": "Микшер", "old_name": "Глеб", "new_name": "Глеб",
+             "telegram_id": 3102},
+        ] if day in {"2026-10-04", "2026-11-01"} else []):
+            text = self.summary()
+        self.assertIn("1 — Глеб (@gleb_one) · интервалы, нед.: нет данных", text)
+        self.assertIn("2 — Глеб (@gleb_two) · интервалы, нед.: 1, 1", text)
+        self.assertIn("0 — Глеб (@gleb_three)", text)
+
+    def test_summary_draft_missing_history_own_days_and_same_day_duty(self):
+        self.plan({
+            "2026-11-01": {"Микшер": ["A"], "Дополнительная": ["A"]},
+            "2026-11-08": {"Микшер": ["A"], "Дополнительная": []},
+        }, approved=False, tasks=[
+            {"name": "Микшер", "needed": 1, "day": 0},
+            {"name": "Дополнительная", "needed": 1, "day": 0},
+        ])
+        text = self.summary()
+        self.assertIn("Не утверждён", text)
+        self.assertIn("2 — A (без Telegram) · интервалы, нед.: нет данных, 1", text)
+        self.registry.set_schedule_day(1001, "sound", "2026-11", "2026-11-08", "A", 3)
+        text = self.summary()
+        self.assertIn("11.11.2026", text)
+        self.assertIn("нет данных, 1.4", text)
+
+    def test_summary_uses_saved_history_when_no_prior_approved_graph(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "A", 3001)
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=["2026-11-01"],
+            tasks=[{"name": "Микшер", "needed": 1}], slots={"2026-11-01": {"Микшер": ["A"]}},
+            last_served={"A": "2026-10-04"},
+        )
+        self.assertIn("1 — A · интервалы, нед.: 4", self.summary())
+        plan = self.registry.get_schedule_plan("sound", "2026-11")
+        before_approval = plain_text(schedule_plan.plan_text(
+            "ЗВУК", plan, schedule_plan.plan_summary(self.registry, plan, None),
+            self.context.timezone,
+        ))
+        self.assertIn("1 — A · интервалы, нед.: 4", before_approval)
+
+    def test_workload_intervals_are_chronological_unique_actual_days(self):
+        people = [{"key": "A", "name": "A", "telegram_id": 1}]
+        text = "\n".join(workload_lines(
+            {"A": {date(2026, 11, 15), date(2026, 11, 1), date(2026, 11, 11)}},
+            people, {"A": "2026-10-04"},
+        ))
+        self.assertIn("3 — A · интервалы, нед.: 4, 1.4, 0.6", text)
+
+    def test_summary_button_months_refresh_permissions_and_no_writes(self):
+        async def run():
+            self.plan({"2026-11-15": {"Микшер": ["Ноябрь"]}})
+            self.plan({"2026-12-06": {"Микшер": ["Декабрь"]}}, month="2026-12")
+            with self.registry._connection() as connection:
+                before = [line for line in connection.iterdump() if "nav_hints" not in line]
+            main = await self.press("rdy:month:sound", 2001)
+            entry = next(button.callback_data for button in self.buttons(main)
+                         if button.text == "📊 Сводка")
+            shown = await self.press(entry, 2001)
+            self.assertIn("График › Сводка", self.text(shown))
+            self.assertIn("Ноябрь", self.text(shown))
+            self.assertIn("Нагрузка", self.text(shown))
+            following = next(button.callback_data for button in self.buttons(shown)
+                             if button.text == "📅 Следующий месяц")
+            shown = await self.press(following, 2001)
+            self.assertIn("Декабрь", self.text(shown))
+            self.assertNotIn("Ноябрь", self.text(shown))
+            refresh = next(button.callback_data for button in self.buttons(shown)
+                           if button.text == "🔄 Обновить")
+            refreshed = await self.press(refresh, 2001)
+            self.assertIn("Декабрь", self.text(refreshed))
+            self.assertIn("rdy:month:sound", [button.callback_data
+                                            for button in self.buttons(refreshed)])
+            denied = await self.press(entry, 9999)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+            self.context.load_upcoming_service_events.assert_not_awaited()
+            self.context.load_service_task_assignments.assert_not_awaited()
+            self.assertFalse(any(
+                call.kwargs.get("chat_id", call.args[0] if call.args else None) == -10055
+                for call in self.context.bot.send_message.await_args_list
+            ))
+            with self.registry._connection() as connection:
+                after = [line for line in connection.iterdump() if "nav_hints" not in line]
+            self.assertEqual(before, after)
+        asyncio.run(run())
+
+    def test_summary_big_graph_pages_keep_navigation_and_all_workload(self):
+        async def run():
+            names = [f"Участник {index:03d} " + "И" * 25 for index in range(120)]
+            self.plan({"2026-11-15": {"Микшер": names}})
+            shown = await self.press("rdy:summary:sound")
+            texts = []
+            for _ in range(30):
+                texts.append(self.text(shown))
+                buttons = self.buttons(shown)
+                self.assertLessEqual(len(buttons), 6)
+                self.assertIn("rdy:month:sound", [button.callback_data for button in buttons])
+                self.assertTrue(all(len(button.callback_data.encode()) <= 64 for button in buttons))
+                self.assertLessEqual(visible_units(self.text(shown)), 4096)
+                forward = next((button for button in buttons if button.text == "➡️ Далее"), None)
+                if forward is None:
+                    break
+                shown = await self.press(forward.callback_data)
+            self.assertGreater(len(texts), 1)
+            text = "\n".join(texts)
+            for name in names:
+                self.assertIn(f"1 — {name}", text)
+        asyncio.run(run())
+
+    def test_summary_errors_and_empty_state_keep_graph_exit(self):
+        async def run():
+            empty = await self.press("rdy:summary:sound")
+            self.assertIn("Графика на выбранный месяц пока нет", self.text(empty))
+            self.assertIn("rdy:month:sound", [button.callback_data for button in self.buttons(empty)])
+            for value, error in (
+                ("202611.bad", "Некорректная страница"),
+                ("202710", "только за текущий и следующий"),
+                ("202611.1.2", "Некорректная страница"),
+            ):
+                rejected = await self.press(f"rdy:summary:sound:{value}")
+                self.assertIn(error, rejected.answer.await_args.args[0])
+            with patch.object(self.registry, "list_approved_schedule_plans",
+                              side_effect=RuntimeError("test")):
+                failed = await self.press("rdy:summary:sound")
+            self.assertIn("Не удалось прочитать", self.text(failed))
+            self.assertNotIn("пока нет", self.text(failed))
+            self.assertIn("rdy:month:sound", [button.callback_data for button in self.buttons(failed)])
+        asyncio.run(run())
+
+    def test_slow_summary_cannot_replace_newer_graph_screen(self):
+        async def run():
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def delayed(function, *args, **kwargs):
+                if kwargs.get("include_load"):
+                    started.set()
+                    await release.wait()
+                return function(*args, **kwargs)
+
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delayed):
+                slow = asyncio.create_task(self.press("rdy:summary:sound"))
+                await started.wait()
+                main = await self.press("rdy:month:sound")
+                release.set()
+                stale = await slow
+            stale.message.answer.assert_not_awaited()
+            self.assertIn("ЗВУК › График", self.text(main))
+        asyncio.run(run())
+
+    def test_summary_current_and_next_month_cross_year_boundary(self):
+        self.now = self.now.replace(month=12)
+        self.plan({"2027-01-03": {"Микшер": ["Январь"]}}, month="2027-01")
+
+        async def run():
+            shown = await self.press("rdy:summary:sound:202701")
+            self.assertIn("январь 2027", self.text(shown))
+            self.assertIn("Январь", self.text(shown))
         asyncio.run(run())
 
     def test_graph_database_error_is_not_an_empty_graph(self):

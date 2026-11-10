@@ -97,7 +97,8 @@ class ReportTextTest(unittest.TestCase):
         )
         self.assertIn("📋 Отчёт · Звук · 04.01.2099", text)
         self.assertIn("✅ Алексей (звук) — уведомления включены", text)
-        self.assertIn("⚪ Борис (сборка) — не привязан", text)
+        self.assertIn("⚪ Борис (сборка) — тг аккаунт к боту не подключен", text)
+        self.assertNotIn("⚪ Борис (сборка) — не привязан", text)
         self.assertIn("✅ подтвердил(а) — Алексей (звук)", text)
         self.assertIn("⏳ нет ответа — Борис (сборка)", text)
 

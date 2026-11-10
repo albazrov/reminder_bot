@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import date, timedelta
 from io import BytesIO
 
@@ -22,6 +22,7 @@ from aiogram.types import ReplyParameters
 
 from .excel_parser import ServiceAssignment, ServiceEvent, _schedule_sheet_name
 from .group_send import send_to_service_group
+from . import task_rules
 from .month_summary import month_end, month_key, month_title
 from .presentation import (
     apply_replacements, display_name, format_task_assignments,
@@ -63,7 +64,7 @@ def revision(plan: dict) -> str:
     кнопки с прежней версией считаются устаревшими."""
     data = json.dumps(
         [plan["updated_at"], plan["run_id"], plan["slots"],
-         plan.get("days", {})],
+         plan.get("days", {}), plan.get("tasks", [])],
         ensure_ascii=False, sort_keys=True,
     )
     return hashlib.sha1(data.encode()).hexdigest()[:6]
@@ -162,6 +163,8 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
         {
             "name": task["name"], "needed": task["needed"], "max": task["max"],
             "implicit": task["implicit"], "day": task.get("day"),
+            **({"requires_any": task["requires_any"]}
+               if task.get("requires_any") else {}),
         }
         for task in registry.plan_tasks(service_id)
     ]
@@ -436,6 +439,45 @@ def served_days(plan: dict, people: list[dict]) -> dict[str, set[date]]:
     return result
 
 
+def workload_lines(
+    load: dict[str, set[date]], people: list[dict], previous: dict[str, str],
+) -> list[str]:
+    by_key = {person["key"]: person for person in people}
+    for key in load:
+        by_key.setdefault(key, {"key": key, "name": key, "telegram_id": None})
+    ordered = sorted(
+        by_key.values(),
+        key=lambda person: (-len(load.get(person["key"], ())), person["name"]),
+    )
+    lines = ["", "👥 Нагрузка (дней служения в месяце):"]
+    names = [display_name(person) for person in ordered]
+    for person in ordered:
+        key = person["key"]
+        label = display_name(person)
+        if names.count(label) > 1 and person.get("username"):
+            label += f" (@{person['username'].lstrip('@')})"
+        days = sorted(load.get(key, ()))
+        last = date.fromisoformat(previous[key]) if previous.get(key) else None
+        intervals = []
+        for day in days:
+            intervals.append(
+                f"{(day - last).days / 7:.1f}".rstrip("0").rstrip(".")
+                if last is not None and last < day
+                else "нет данных"
+            )
+            last = day
+        lines.append(
+            f"   {len(days)} — {label}"
+            + ("" if person["telegram_id"] else " (без Telegram)")
+            + (" · интервалы, нед.: " + ", ".join(intervals) if days else "")
+        )
+    lines.append(
+        "Интервалы: от прошлого известного служения к первому назначению, "
+        "затем между назначениями по порядку. «Нет данных» — история неизвестна."
+    )
+    return lines
+
+
 def week_groups(plan: dict, day: str, window: tuple[int, int]
                 ) -> tuple[str, list[tuple[str, int | None, list[dict]]]]:
     """График по неделям (у задач свои дни): «Неделя 26.10–01.11» и дни
@@ -656,18 +698,12 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
             )
     # Нагрузка — фактические дни служения, а не недели графика.
     load = served_days(plan, polled)
-    ordered = sorted(
-        polled, key=lambda person: (-len(load.get(person["key"], set())),
-                                    person["name"]),
-    )
-    lines += ["", "👥 Нагрузка (дней служения в месяце):"] + [
-        f"   {len(load.get(person['key'], set()))} — {display_name(person)}"
-        + ("" if person["telegram_id"] else " (без Telegram)")
-        for person in ordered
-    ]
+    lines += workload_lines(load, polled, plan.get("last_served") or {})
     problems = gaps(plan)
     if problems:
         lines += [""] + problems
+    if plan.get("approval_warnings") and plan["approved"] is not None:
+        lines += ["", "⚠️ При утверждении приняты предупреждения:"] + plan["approval_warnings"]
     # Задача без людей во все даты, хотя её выполняют люди состава, —
     # обычно её включили после составления черновика.
     able = {task for person in summary.people for task in person["tasks"]}
@@ -718,6 +754,7 @@ def busy_on(plan: dict, day: str, task: str,
         if other != task
         for person in people
         if not {task, other} <= (bundles or {}).get(person, frozenset())
+        and not task_rules.compatible(plan["tasks"], task, other)
     }
 
 
@@ -734,6 +771,9 @@ def candidates(
     for person in summary.people:
         key = person["key"]
         if key in taken or not person["tasks"]:
+            continue
+        anchors = task_rules.dependent_tasks(plan["tasks"]).get(task)
+        if anchors and task not in person["tasks"]:
             continue
         if key in silent:
             (quiet if task in person["tasks"] else rest).append(key)
@@ -768,6 +808,12 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
         notes.append(f"⚠️ не отметил(а) {service_day:%d.%m}")
     if person is not None and task not in person["tasks"]:
         notes.append(f"⚠️ не приписан(а) к «{task}»")
+    anchors = task_rules.dependent_tasks(plan["tasks"]).get(task)
+    if anchors and not any(
+        key in slot_people(plan, day, anchor) for anchor in anchors
+    ):
+        notes.append("⚠️ ответственный не входит в смену; "
+                     "при утверждении потребуется подтверждение")
     near = [
         other for other in sorted(served_days(plan, summary.people).get(key, ()))
         if other != service_day
@@ -969,6 +1015,8 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                 f"  {task_emoji(task['name'])} {task['name']}", keys,
                 "    ", empty, mention,
             )
+    if plan.get("approval_warnings"):
+        lines += ["", "⚠️ Утверждено с предупреждениями:"] + plan["approval_warnings"]
     if update:
         baseline = published_baseline(plan)
         changes = change_lines(
@@ -1108,7 +1156,7 @@ def excel_plan(registry, service_id: str, year: int, month: int,
     }
 
 
-def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
+def plan_events(plan: dict, people: list[dict], *, keyed: bool = False) -> list[ServiceEvent]:
     """Утверждённый график бота как события графика (решение 15): по ним
     — напоминания и замены. Задача со своим днём — событием своей даты
     (как в Excel), разовый день человека учитывается."""
@@ -1143,7 +1191,7 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
                 published, by_key, day, task["name"], approved=True
             ):
                 events.setdefault(moment, []).append(
-                    ServiceAssignment(task["name"], names.get(key, key))
+                    ServiceAssignment(task["name"], key if keyed else names.get(key, key))
                 )
     return [
         ServiceEvent(plan["service_id"], moment, tuple(items))
@@ -1151,7 +1199,95 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
     ]
 
 
-def month_overview(registry, actor_id: int, service_id: str, month: date) -> str:
+def _apply_assignment_replacements(
+    assignments: dict[str, list[str]], replacements: list[dict], people: list[dict],
+    *, keyed: bool = False,
+) -> dict[str, list[str]]:
+    if not keyed:
+        return apply_replacements(assignments, replacements)
+    by_key = {person["key"]: person for person in people}
+
+    def person_key(
+        name: str, task: str, telegram_id: int | None = None,
+        assigned: Sequence[str] = (),
+    ) -> str:
+        if telegram_id:
+            matches = [person["key"] for person in people
+                       if person["telegram_id"] == telegram_id]
+        else:
+            matches = [key for key in assigned
+                       if by_key.get(key, {}).get("name", key) == name]
+            if not matches:
+                matches = [person["key"] for person in people
+                           if person["name"] == name and task in person["tasks"]]
+        return matches[0] if len(matches) == 1 else name
+
+    current = {
+        task: [key if key in by_key else person_key(key, task) for key in keys]
+        for task, keys in assignments.items()
+    }
+    for replacement in replacements:
+        task = replacement["task"]
+        item = {
+            **replacement,
+            "old_name": person_key(
+                replacement["old_name"], task, assigned=current.get(task, ()),
+            ),
+            "new_name": person_key(
+                replacement["new_name"], task, replacement.get("telegram_id"),
+            ),
+        }
+        current = apply_replacements(current, [item])
+    return current
+
+
+def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
+                                draft: bool = False, keyed: bool = False,
+                                ) -> dict[date, dict[str, list[str]]]:
+    if draft:
+        plan = {
+            **plan, "approved": plan["slots"],
+            "approved_tasks": plan["tasks"], "approved_days": plan["days"],
+            "approved_slot_days": approved_slot_days(plan, people),
+        }
+    tasks = {task["name"]: task for task in plan.get("approved_tasks") or []}
+    for slots in plan["approved"].values():
+        for task in slots:
+            tasks.setdefault(task, {"name": task})
+    assignments: dict[date, dict[str, list[str]]] = {}
+    saved_tasks = {"tasks": list(tasks.values())}
+    for day_key, slots in plan["approved"].items():
+        for task in tasks:
+            if slots.get(task):
+                continue
+            moment = date.fromisoformat(day_key) + timedelta(
+                days=slot_offset(saved_tasks, None, day_key, task) or 0,
+            )
+            assignments.setdefault(moment, {}).setdefault(task, [])
+    for event in plan_events(plan, people, keyed=keyed):
+        if not event.assignments:
+            continue
+        day = assignments.setdefault(event.event_date, {})
+        event_tasks: dict[str, list[str]] = {}
+        for assignment in event.assignments:
+            event_tasks.setdefault(assignment.task, []).append(assignment.name)
+        replacements = [] if draft else registry.list_replacements(
+            plan["service_id"], event.event_date.isoformat(),
+        )
+        current = _apply_assignment_replacements(
+            event_tasks, replacements, people, keyed=keyed,
+        )
+        for task, info in current.items():
+            names = day.setdefault(task, [])
+            for name in task_assignment_names(info):
+                if name not in names:
+                    names.append(name)
+    return assignments
+
+
+def month_overview(
+    registry, actor_id: int, service_id: str, month: date, *, include_load: bool = False,
+) -> str:
     """Saved assignments by actual date; never load Excel or modify a plan."""
     first = month.replace(day=1)
     last = month_end(first.year, first.month)
@@ -1163,9 +1299,10 @@ def month_overview(registry, actor_id: int, service_id: str, month: date) -> str
     display_names = registry.service_display_names(service_id)
     selected = registry.get_schedule_plan(service_id, first.strftime("%Y-%m"))
     if selected is None:
+        month_label = "выбранный" if include_load else "текущий"
         status = (
-            "⚪ Графика на текущий месяц пока нет.\n"
-            "Загрузите его с диска или создайте через «Опрос»."
+            f"⚪ Графика на {month_label} месяц пока нет.\n"
+            "Загрузите его с диска или создайте через «Опрос» / «Авто»."
         )
     elif selected["approved"] is None:
         status = "📝 Не утверждён.\nНапоминания по этому графику не отправляются."
@@ -1173,48 +1310,36 @@ def month_overview(registry, actor_id: int, service_id: str, month: date) -> str
         status = "✅ Утверждённый график с актуальными заменами."
         if selected["dirty"]:
             status += "\nЕсть неутверждённые правки; ниже действует прежний график."
+        if selected.get("approval_warnings"):
+            status += "\n\n⚠️ При утверждении приняты предупреждения:\n" + "\n".join(
+                selected["approval_warnings"]
+            )
     assignments: dict[date, dict[str, list[str]]] = {}
+    load: dict[str, set[date]] = {}
     cursor = (first - timedelta(days=7)).replace(day=1)
     while cursor <= last + timedelta(days=7):
         plan = registry.get_schedule_plan(service_id, cursor.strftime("%Y-%m"))
         draft = plan is not None and plan["approved"] is None
-        if draft and cursor == first:
-            plan = {
-                **plan, "approved": plan["slots"],
-                "approved_tasks": plan["tasks"], "approved_days": plan["days"],
-                "approved_slot_days": approved_slot_days(plan, people),
-            }
-        elif draft:
+        if draft and cursor != first:
             plan = None
         if plan is not None:
-            tasks = {task["name"]: task for task in plan.get("approved_tasks") or []}
-            for slots in plan["approved"].values():
-                for task in slots:
-                    tasks.setdefault(task, {"name": task})
-            saved_tasks = {"tasks": list(tasks.values())}
-            for day_key, slots in plan["approved"].items():
-                for task in tasks:
-                    if slots.get(task):
-                        continue
-                    moment = date.fromisoformat(day_key) + timedelta(
-                        days=slot_offset(saved_tasks, None, day_key, task) or 0,
-                    )
+            if include_load:
+                for moment, current in _effective_plan_assignments(
+                    registry, plan, people, draft=draft, keyed=True,
+                ).items():
                     if first <= moment <= last:
-                        assignments.setdefault(moment, {}).setdefault(task, [])
-            for event in plan_events(plan, people):
-                if not event.assignments or not first <= event.event_date <= last:
+                        for keys in current.values():
+                            for key in keys:
+                                load.setdefault(key, set()).add(moment)
+            for moment, current in _effective_plan_assignments(
+                registry, plan, people, draft=draft,
+            ).items():
+                if not first <= moment <= last:
                     continue
-                day = assignments.setdefault(event.event_date, {})
-                event_tasks: dict[str, list[str]] = {}
-                for assignment in event.assignments:
-                    event_tasks.setdefault(assignment.task, []).append(assignment.name)
-                current = event_tasks if draft else apply_replacements(
-                    event_tasks,
-                    registry.list_replacements(service_id, event.event_date.isoformat()),
-                )
-                for task, info in current.items():
+                day = assignments.setdefault(moment, {})
+                for task, values in current.items():
                     names = day.setdefault(task, [])
-                    for name in task_assignment_names(info):
+                    for name in values:
                         if name not in names:
                             names.append(name)
         cursor = (cursor + timedelta(days=32)).replace(day=1)
@@ -1230,6 +1355,28 @@ def month_overview(registry, actor_id: int, service_id: str, month: date) -> str
             lines.append("Назначений нет.")
     if not assignments and selected is not None:
         lines += ["", "На этот месяц назначений нет."]
+    if include_load:
+        previous: dict[str, str] = {}
+        history = registry.list_approved_schedule_plans(
+            service_id, (last + timedelta(days=7)).strftime("%Y-%m"),
+        )
+        for plan in history:
+            for moment, current in _effective_plan_assignments(
+                registry, plan, people, keyed=True,
+            ).items():
+                if moment >= first:
+                    continue
+                for keys in current.values():
+                    for key in keys:
+                        previous[key] = max(previous.get(key, ""), moment.isoformat())
+        if selected and not any(plan["month"] < selected["month"] for plan in history):
+            for key, day in selected["last_served"].items():
+                if day < first.isoformat():
+                    previous[key] = max(previous.get(key, ""), day)
+        lines += workload_lines(
+            load, [person for person in people if person["tasks"]],
+            previous,
+        )
     return "\n".join(lines)
 
 
@@ -1392,7 +1539,8 @@ async def _edit_publication(bot, chat_id: int, message_ids: list[int],
 
 async def publish(
     bot, registry, service: dict, plan: dict, actor_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, *,
+    acknowledged_warnings: list[str] | None = None,
 ) -> dict:
     """«✅ Утвердить»: график в чат служения, затем отметка в базе.
     Первая публикация закрепляется; обновление правит закреплённую и
@@ -1406,6 +1554,12 @@ async def publish(
     if not service.get("enabled", True):
         raise ValueError("Служение выключено — график не опубликован.")
     people = registry.readiness_people(service["id"])
+    warnings = registry.validate_task_assignments(
+        service["id"], plan["slots"], complete=True, month=plan["month"],
+        days=plan.get("days"),
+        acknowledged_warnings=acknowledged_warnings,
+    )
+    plan = {**plan, "approval_warnings": warnings}
     settings = registry.get_readiness_settings(service["id"])
     text = publication_text(
         service, plan, people, window_of(registry, service["id"]), settings,
@@ -1534,6 +1688,7 @@ async def publish(
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
                 served_offsets=served_offsets(plan, people),
                 approved_slot_days=approved_slot_days(plan, people),
+                acknowledged_warnings=warnings,
             )
             break
         except Exception as exc:  # noqa: BLE001
