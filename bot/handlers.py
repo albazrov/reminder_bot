@@ -279,6 +279,7 @@ TEMPLATE_FIELD_HELP = {
     "sunday_date": "дата собрания (воскресенье)",
     "task_assignments": "задачи и ответственные",
     "informational_notes": "информационные заметки графика",
+    "event_notes": "опубликованные заметки к собранию",
     "task": "задача напоминания",
     "task_responsibles": "ответственные этой задачи",
     "delivery_status": "кому включены личные уведомления",
@@ -289,7 +290,7 @@ TEMPLATE_FIELD_HELP = {
     "people": "упоминания опрашиваемых",
 }
 GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments",
-                "informational_notes")
+                "informational_notes", "event_notes")
 REPORT_FIELDS = ("service_name", "sunday_date", "task_assignments",
                  "delivery_status", "confirmation_status")
 READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
@@ -705,6 +706,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if chat_type == ChatType.PRIVATE
             else None
         )
+        if (chat_type == ChatType.PRIVATE
+                and text.lstrip().startswith(("❌", "⚠️"))
+                and (markup is None or isinstance(markup, InlineKeyboardMarkup))):
+            rows = (
+                [list(row) for row in markup.inline_keyboard]
+                if isinstance(markup, InlineKeyboardMarkup) else []
+            )
+            previous_back = (nav_state.get(actor_id) or {}).get("back")
+            if not rows or back_callback(InlineKeyboardMarkup(inline_keyboard=rows)) is None:
+                rows.append([InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=previous_back or "menu:start",
+                )])
+            if not any(
+                button.text == "🏠 В начало"
+                for row in rows for button in row
+            ):
+                rows.append([InlineKeyboardButton(
+                    text="🏠 В начало", callback_data="menu:start",
+                )])
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
         # Карточка после /here не сбрасывает листание других меню админа.
         if chat_type != SERVICE_CARD_CHAT_TYPE:
             for token, page_state in list(pending_dialog_pages.items()):
@@ -741,7 +763,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
-                        "🔢", "🔤", "⛔", "↔️", "📥",
+                        "🔢", "🔤", "⛔", "↔️", "📥", "🌐", "🧮", "❓",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -766,7 +788,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if button.text.startswith((
                         "⬅️ К ", "↩️ К ", "📅 К графику",
                         "👤 Выбрать пользователя Telegram",
+                        "🏠 В начало",
                     ))
+                    or (
+                        button.text == "⬅️ Назад"
+                        and text.lstrip().startswith(("❌", "⚠️"))
+                    )
                 ]
                 pageable_buttons = [
                     button for button in buttons
@@ -1567,6 +1594,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         назначение и снятие админов."""
         registry = service_registry()
         items = [("📡 Групповой чат", "service_chat")]
+        if service_id == "assembly":
+            items.append(("📝 Заметки к собранию", "event_notes"))
         if registry and registry.is_super_admin(actor_id):
             items += [
                 ("👤 Назначить админа", "service_admin_add"),
@@ -1574,7 +1603,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         rows = [
             [InlineKeyboardButton(
-                text=label, callback_data=f"service:{operation}:{service_id}",
+                text=label,
+                callback_data=(
+                    "evn:home" if operation == "event_notes"
+                    else f"service:{operation}:{service_id}"
+                ),
             )]
             for label, operation in items
         ]
@@ -4275,6 +4308,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             f"📋 {task['name']}\n\n"
             f"Статус: {'🟢 включена' if task['enabled'] else '🔴 выключена'}.\n"
+            + (
+                "Дополнительная обязанность: ровно один человек из назначенных на "
+                + ", ".join(task["requires_any"]) + ".\n"
+                if task.get("requires_any") else "Основная задача.\n"
+            ) +
             "Выключенные задачи не читаются из графика. "
             "Для настройки напоминаний сначала включите задачу.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -4294,12 +4332,304 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ),
                 )],
                 [InlineKeyboardButton(
+                    text="🔗 Обязанность внутри смены",
+                    callback_data=f"svc_tasks:dep:{service_id}:{session_id}",
+                )],
+                [InlineKeyboardButton(
                     text="⬅️ К задачам",
                     callback_data=f"svc_tasks:open:{service_id}",
                 )],
             ]),
             parse_mode=None,
         )
+
+    async def show_task_dependency(message, actor_id, service_id, page=None):
+        registry = service_registry()
+        pending = pending_inputs[actor_id]
+        tasks = registry.list_service_tasks(service_id)
+        task = next(
+            (item for item in tasks if item["position"] == pending["task_position"]), None,
+        )
+        if task is None:
+            raise ValueError("Задача больше не существует — откройте список заново.")
+        pending["step"] = "task_dependency"
+        selected = pending.setdefault("dependency_anchors", list(task.get("requires_any", [])))
+        session = pending["session_id"]
+        choices = [item for item in tasks if item["name"] != task["name"] and item["enabled"]]
+        page = pending.get("dependency_page", 0) if page is None else page
+        page = max(0, min(page, max(0, (len(choices) - 1) // 3)))
+        pending["dependency_page"] = page
+        rows = layout_buttons([
+            InlineKeyboardButton(
+                text=("✅ " if item["name"] in selected else "⬜ ") + item["name"],
+                callback_data=f"svc_tasks:danchor:{service_id}:{item['position']}:{session}",
+            )
+            for item in choices[page * 3:(page + 1) * 3]
+        ])
+        if len(choices) > 3:
+            rows.append([
+                InlineKeyboardButton(
+                    text="⬅️ Стр.",
+                    callback_data=f"svc_tasks:dpage:{service_id}:{max(0, page - 1)}:{session}",
+                ),
+                InlineKeyboardButton(
+                    text="➡️ Стр.",
+                    callback_data=f"svc_tasks:dpage:{service_id}:{page + 1}:{session}",
+                ),
+            ])
+        rows += [
+            [InlineKeyboardButton(text="✅ Сохранить",
+                                  callback_data=f"svc_tasks:dsave:{service_id}:{session}")],
+            [InlineKeyboardButton(text="Убрать зависимость",
+                                  callback_data=f"svc_tasks:dclear:{service_id}:{session}")],
+            [InlineKeyboardButton(text="⬅️ К задаче",
+                                  callback_data=f"svc_tasks:dback:{service_id}:{session}")],
+        ]
+        await _send_dialog(
+            message,
+            f"📋 {task['name']} › Обязанность внутри смены\n\n"
+            "Выберите основные задачи. Ответственным будет ровно один "
+            "допущенный человек, назначенный на любую из выбранных задач "
+            "в это воскресенье. Например: «старший» или «в смене».\n"
+            "Одна дополнительная обязанность на служение. После сохранения "
+            "пересчитайте черновик; утверждённый график автоматически не меняется.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    def event_note_state(actor_id, **values):
+        state = {
+            "operation": "event_note", "service_id": "assembly",
+            "token": secrets.token_hex(4), **values,
+        }
+        pending_inputs[actor_id] = state
+        return state
+
+    def event_note_button(label, action, state, value=""):
+        return InlineKeyboardButton(
+            text=label,
+            callback_data=f"evn:{action}:{state['token']}:{value}",
+        )
+
+    async def show_event_note_month(message, actor_id, month=None):
+        month = month or datetime.now(context.timezone).date().replace(day=1)
+        state = event_note_state(actor_id, month=month.isoformat())
+        rows = layout_buttons([
+            event_note_button(
+                f"📝 {day:%d.%m}", "day", state, day.isoformat(),
+            )
+            for day in (
+                date.fromisoformat(value)
+                for value in schedule_plan.free_run("assembly", month.year, month.month)["dates"]
+            )
+        ])
+        rows.append([
+            event_note_button("⬅️ Месяц", "month", state,
+                              (month - timedelta(days=1)).replace(day=1).isoformat()),
+            event_note_button("➡️ Месяц", "month", state,
+                              (month_end(month.year, month.month) + timedelta(days=1)).isoformat()),
+        ])
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К настройкам Собрания",
+            callback_data="service:service_setup:assembly",
+        )])
+        await _send_dialog(
+            message, f"СОБРАНИЕ › Заметки › {month_title(month.year, month.month)}\n\n"
+            "Выберите воскресное событие. Опубликованный текст можно включить "
+            "в напоминания других служений полем {event_notes}. "
+            "Публикация сама ничего не рассылает.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    async def show_event_note_detail(message, actor_id, sunday, notice=""):
+        note = service_registry().get_event_note(sunday)
+        state = event_note_state(
+            actor_id, event_sunday=sunday,
+            revision=note["revision"] if note else 0,
+            targets=note["draft_targets"] if note else None,
+        )
+        targets = state["targets"]
+        names = {item["id"]: item["name"] for item in service_registry().list_services()}
+        audience = "все служения" if targets is None else ", ".join(
+            names.get(item, item) for item in targets
+        )
+        text = (
+            f"СОБРАНИЕ › Заметка › {date.fromisoformat(sunday):%d.%m.%Y}\n\n"
+            f"{notice}\n\n" if notice else
+            f"СОБРАНИЕ › Заметка › {date.fromisoformat(sunday):%d.%m.%Y}\n\n"
+        )
+        text += (
+            f"Статус: {'опубликована' if note and note['published'] else 'черновик'}.\n"
+            f"Адресаты черновика: {audience}.\n\n"
+            + (note["draft_body"] if note else "Текста пока нет. Нажмите «Изменить текст».")
+            + "\n\nИзменения черновика видны в напоминаниях только после публикации."
+        )
+        buttons = [
+            event_note_button("✏️ Изменить текст", "text", state),
+            event_note_button("👥 Адресаты", "targets", state),
+            event_note_button("👁 Предпросмотр", "preview", state),
+            event_note_button("✅ Опубликовать", "publish", state),
+        ]
+        if note and note["published"]:
+            buttons.append(event_note_button("⛔ Снять с публикации", "unpublish", state))
+        buttons.append(event_note_button("⬅️ К датам", "dates", state))
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[item] for item in buttons]),
+            parse_mode=None,
+        )
+
+    async def show_event_note_targets(message, actor_id, page=0):
+        state = pending_inputs[actor_id]
+        selected = state["targets"]
+        known = {item["id"]: item for item in service_registry().list_services()}
+        services = [item for item in known.values() if item["enabled"]]
+        services += [
+            {"id": service_id, "name": known.get(service_id, {}).get("name", service_id),
+             "enabled": False}
+            for service_id in selected or []
+            if service_id not in known or not known[service_id]["enabled"]
+        ]
+        state["token"] = secrets.token_hex(4)
+        state["step"] = "targets"
+        page = max(0, min(page, (len(services) - 1) // 5))
+        state["page"] = page
+        rows = [[event_note_button(
+            ("✅ " if selected is None or item["id"] in selected else "⬜ ") + item["name"]
+            + (" (недоступно — убрать)" if not item["enabled"] else ""),
+            "target", state, item["id"],
+        )] for item in services[page * 5:(page + 1) * 5]]
+        if len(services) > 5:
+            rows.append([
+                event_note_button("⬅️ Стр.", "page", state, str(max(0, page - 1))),
+                event_note_button("➡️ Стр.", "page", state, str(page + 1)),
+            ])
+        rows += [
+            [event_note_button("🌐 Все служения", "all", state)],
+            [event_note_button("✅ Сохранить адресатов", "targetsok", state)],
+            [event_note_button("⬅️ К заметке", "edit", state)],
+        ]
+        await _send_dialog(
+            message, "СОБРАНИЕ › Заметка › Адресаты\n\n"
+            "Выберите служения. «Все служения» включает и добавленные в будущем. "
+            "Недоступных сохранённых адресатов можно убрать. "
+            "Адресаты сохранятся в черновике; публикация — отдельным действием.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    @admin_router.callback_query(F.data.startswith("evn:"))
+    async def on_event_notes(callback: CallbackQuery) -> None:
+        if (not callback.from_user or not callback.message
+                or callback.message.chat.type != ChatType.PRIVATE):
+            await _answer_callback(callback)
+            return
+        actor_id = callback.from_user.id
+        registry = service_registry()
+        try:
+            if registry is None or not is_service_admin(actor_id, "assembly"):
+                raise PermissionError("Заметки доступны администраторам Собрания.")
+            if callback.data == "evn:home":
+                await clean_and_clear_pending_actor(actor_id)
+                await show_event_note_month(callback.message, actor_id)
+            else:
+                parts = callback.data.split(":")
+                state = pending_inputs.get(actor_id) or {}
+                if (len(parts) != 4 or state.get("operation") not in
+                        {"event_note", "event_note_input"} or state.get("token") != parts[2]):
+                    raise ValueError("Этот экран устарел. Откройте заметки заново.")
+                _, action, _, value = parts
+                sunday = state.get("event_sunday")
+                if action == "month":
+                    await show_event_note_month(callback.message, actor_id, date.fromisoformat(value))
+                elif action == "day":
+                    await show_event_note_detail(callback.message, actor_id, value)
+                elif action == "dates":
+                    await show_event_note_month(
+                        callback.message, actor_id, date.fromisoformat(sunday).replace(day=1),
+                    )
+                elif action == "edit":
+                    await show_event_note_detail(callback.message, actor_id, sunday)
+                elif action == "text":
+                    state.update(operation="event_note_input", token=secrets.token_hex(4))
+                    await _send_dialog(
+                        callback.message, "Отправьте текст заметки (до 2000 символов).\n"
+                        "Например: «После собрания общение в большом зале».\n"
+                        "Это текст без автоматических упоминаний людей.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            event_note_button("⬅️ К заметке", "edit", state),
+                        ]]), parse_mode=None,
+                    )
+                elif action in {"targets", "target", "all", "page"}:
+                    if action == "target":
+                        available = {item["id"] for item in registry.list_services() if item["enabled"]}
+                        if value not in available and value not in (state["targets"] or []):
+                            raise ValueError("Служение недоступно — откройте заметку заново.")
+                        selected = set(available if state["targets"] is None else state["targets"])
+                        selected.symmetric_difference_update({value})
+                        state["targets"] = sorted(selected)
+                    elif action == "all":
+                        state["targets"] = None
+                    await show_event_note_targets(
+                        callback.message, actor_id, int(value) if action == "page" else state.get("page", 0),
+                    )
+                elif action == "targetsok":
+                    note = registry.get_event_note(sunday)
+                    if not note:
+                        raise ValueError("Сначала сохраните текст заметки.")
+                    registry.save_event_note_draft(
+                        actor_id, sunday, note["draft_body"], state["targets"],
+                        expected_revision=state["revision"],
+                    )
+                    await show_event_note_detail(callback.message, actor_id, sunday, "Адресаты сохранены в черновике.")
+                elif action == "preview":
+                    note = registry.get_event_note(sunday)
+                    state["token"] = secrets.token_hex(4)
+                    await _send_dialog(
+                        callback.message,
+                        "👁 Черновик:\n" + (note["draft_body"] if note else "Нет текста.")
+                        + "\n\nСейчас опубликовано:\n"
+                        + (note["published_body"] if note and note["published"] else "Не опубликовано."),
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            event_note_button("⬅️ К заметке", "edit", state),
+                        ]]), parse_mode=None,
+                    )
+                elif action in {"publish", "unpublish"}:
+                    state["token"] = secrets.token_hex(4)
+                    state["step"] = action
+                    await _send_dialog(
+                        callback.message,
+                        ("Опубликовать черновик для выбранных служений?"
+                         if action == "publish" else "Убрать заметку из будущих напоминаний?")
+                        + "\nУже отправленные сообщения не меняются. Рассылка не запускается.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [event_note_button("✅ Подтвердить", action + "ok", state)],
+                            [event_note_button("⬅️ К заметке", "edit", state)],
+                        ]), parse_mode=None,
+                    )
+                elif action in {"publishok", "unpublishok"}:
+                    if state.get("step") != action[:-2]:
+                        raise ValueError("Подтверждение устарело.")
+                    method = registry.publish_event_note if action == "publishok" else registry.unpublish_event_note
+                    method(actor_id, sunday, expected_revision=state["revision"])
+                    await show_event_note_detail(callback.message, actor_id, sunday, "✅ Сохранено.")
+                else:
+                    raise ValueError("Неизвестное действие — откройте заметки заново.")
+        except (ValueError, PermissionError) as exc:
+            await _answer_callback(callback, f"❌ {exc}")
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось открыть или изменить заметку события")
+            await _answer_callback(callback, "❌ Ошибка базы данных. Попробуйте ещё раз.")
+            return
+        await _answer_callback(callback)
 
     async def show_personal_reminder_summary(
         message: Message,
@@ -4763,18 +5093,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def show_month_graph(
         message: Message, actor_id: int, service_id: str, page: int = 0,
+        *, summary: bool = False, month: date | None = None,
     ) -> None:
         registry = service_registry()
         service = registry.get_service(service_id)
-        month = datetime.now(context.timezone).date().replace(day=1)
+        current_month = datetime.now(context.timezone).date().replace(day=1)
+        month = month or current_month
+        request = {"operation": "graph_view", "service_id": service_id}
+        pending_inputs[actor_id] = request
         try:
-            text = schedule_plan.month_overview(registry, actor_id, service_id, month)
+            text = await asyncio.to_thread(
+                schedule_plan.month_overview, registry, actor_id, service_id, month,
+                include_load=summary,
+            )
         except (sqlite3.Error, OSError, RuntimeError, ValueError):
             debug.exception("Не удалось прочитать месячный график")
             text = (
                 "❌ Не удалось прочитать сохранённый график. "
                 "Вернитесь к служению и откройте «График» повторно."
             )
+        if pending_inputs.get(actor_id) is not request:
+            return
         chunks = screen_text_chunks(text, 2800)
         page = min(max(page, 0), len(chunks) - 1)
         rows = [[
@@ -4783,30 +5122,56 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 text="📥 Загрузить с диска",
                 callback_data=f"service:service_excel:{service_id}",
             ),
-        ], [readiness_button("🗳 Опрос", "open", service_id)]]
+        ], [
+            readiness_button("🗳 Опрос", "open", service_id),
+            readiness_button(
+                "🧮 Авто", "pfree", service_id, month.strftime("%Y%m"),
+            ),
+        ], [readiness_button("📊 Сводка", "summary", service_id)]]
+        if summary:
+            following = month_end(current_month.year, current_month.month) + timedelta(days=1)
+            rows = [[
+                readiness_button("📅 Текущий месяц", "summary", service_id,
+                                 current_month.strftime("%Y%m")),
+                readiness_button("📅 Следующий месяц", "summary", service_id,
+                                 following.strftime("%Y%m")),
+            ]]
         paging = []
+        action = "summary" if summary else "month"
+
+        def page_arg(number):
+            return f"{month:%Y%m}.{number}" if summary else str(number)
+
         if page:
             paging.append(readiness_button(
-                "⬅️ Предыдущее", "month", service_id, str(page - 1),
+                "⬅️ Предыдущее", action, service_id, page_arg(page - 1),
             ))
         if page + 1 < len(chunks):
             paging.append(readiness_button(
-                "➡️ Далее", "month", service_id, str(page + 1),
+                "➡️ Далее", action, service_id, page_arg(page + 1),
             ))
         if paging:
             rows.append(paging)
-        rows.append([InlineKeyboardButton(
-            text="⬅️ К служению",
-            callback_data=f"service:service_settings:{service_id}",
-        )])
+        if summary:
+            rows += [
+                [readiness_button("🔄 Обновить", "summary", service_id, page_arg(page))],
+                [readiness_button("⬅️ К графику", "month", service_id)],
+            ]
+        else:
+            rows.append([InlineKeyboardButton(
+                text="⬅️ К служению",
+                callback_data=f"service:service_settings:{service_id}",
+            )])
         await _send_dialog(
             message,
-            f"📅 {service_label(service)} › График\n"
+            f"📅 {service_label(service)} › График"
+            + (" › Сводка" if summary else "") + "\n"
             f"{month_title(month.year, month.month)}\n\n{chunks[page]}"
             + (f"\n\nСтраница {page + 1}/{len(chunks)}" if len(chunks) > 1 else ""),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None, _dialog_text_limit=4000,
-            _dialog_keyboard_limit=6, _dialog_keep_rows=True,
+            _dialog_keyboard_limit=max(6, sum(len(row) for row in rows)),
+            _dialog_keep_rows=True,
         )
 
     async def show_readiness(
@@ -5354,7 +5719,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     PLAN_ACTIONS = {
         "plan", "precalc", "precalcok", "pedit", "pdate", "ptask", "padd",
         "prem", "pclear", "pok", "pokok", "pfree", "pnew", "pday", "pdset",
-        "pprev",
+        "pprev", "phelp",
     }
 
     def plan_month(arg: str | None, now: datetime) -> str | None:
@@ -5456,7 +5821,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )]
                 for answer in summary.outside[:20]
             ]
-        rows.append([readiness_button("⬅️ К опросу", "open", service_id)])
+        if plan.get("run_id") is None:
+            current = datetime.now(context.timezone).date().replace(day=1)
+            following = month_end(current.year, current.month) + timedelta(days=1)
+            other = following if month_arg == current.strftime("%Y%m") else current
+            rows.append([readiness_button(
+                f"🧮 Авто {month_title(other.year, other.month).split()[0][:3]}",
+                "pfree", service_id, other.strftime("%Y%m"),
+            )])
+        rows.append([readiness_button("❓ Справка", "phelp", service_id, month_arg)])
+        rows.append([readiness_button(
+            "⬅️ К графику" if plan.get("run_id") is None else "⬅️ К опросу",
+            "month" if plan.get("run_id") is None else "open",
+            service_id,
+        )])
         await _send_dialog(
             message, text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -5878,6 +6256,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         """Действия «📋 График» (этап 5.4–5.5)."""
         registry = service_registry()
         service_id = service["id"]
+        if action in {"plan", "pok"}:
+            pending = pending_inputs.get(actor_id) or {}
+            if pending.get("operation") == "plan_warning":
+                pending_inputs.pop(actor_id, None)
         if action in {"padd", "prem", "pclear", "pnew", "pday", "pdset"}:
             pending = pending_inputs.get(actor_id) or {}
             key = plan_month((pending.get("month") or "").replace("-", ""), now)
@@ -5908,7 +6290,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else:
                     plan = await schedule_plan.build_draft(
                         registry, schedule_plan.free_run(service_id, year, month),
-                        loader, debug,
+                        None, debug,
                     )
             if plan is None:
                 await show_readiness(callback.message, service_id, notice)
@@ -5978,7 +6360,34 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             del parts[1]
-        if action == "plan":
+        if action == "phelp":
+            await _send_dialog(
+                callback.message,
+                f"❓ {service_label(service)} › График › Справка\n\n"
+                "«Авто» открывает существующий график выбранного месяца. "
+                "Если его нет, создаёт черновик без Excel и опроса: "
+                "все участники считаются доступными по воскресеньям.\n\n"
+                "✏️ Изменить — вручную выбрать ответственных и дни; "
+                "автоподбор не запускается.\n\n"
+                "🔄 Пересчитать — заново распределить задачи по текущему "
+                "составу, допускам и ограничениям. Для графика по опросу "
+                "учитываются ответы; без опроса — доступность всех участников. "
+                "Если есть ручные правки, бот попросит подтвердить их сброс.\n\n"
+                "✅ Утвердить / Утвердить изменения — сохранить проверенный "
+                "график как действующий и опубликовать его в чате служения. "
+                "До утверждения правки не заменяют прежний утверждённый график.\n\n"
+                "🧮 Авто с названием месяца — открыть или составить график "
+                "другого месяца отдельно, не меняя этот. Если для месяца "
+                "уже есть опрос, бот направит к нему.\n\n"
+                "⬅️ К графику — вернуться на основной экран с «Сводкой».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [readiness_button("⬅️ К графику месяца", "plan", service_id,
+                                      key.replace("-", ""))],
+                ]),
+                _dialog_keep_rows=True, _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                parse_mode=None,
+            )
+        elif action == "plan":
             await show_plan(callback.message, service, run, plan)
         elif action == "precalc" and plan["edited"]:
             month_arg = key.replace("-", "")
@@ -6229,7 +6638,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
         elif action == "pokok":
-            await _answer_callback(callback, "⏳ Публикую…")
+            await _answer_callback(callback, "⏳ Проверяю график…")
             rev = schedule_plan.revision(plan)
             async with readiness.service_lock(service_id):
                 run = registry.get_readiness_run(service_id, key)
@@ -6248,9 +6657,55 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     notice = "ℹ️ Изменений нет — график уже опубликован"
                 else:
                     try:
+                        warnings = registry.task_assignment_warnings(
+                            service_id, plan["slots"], complete=True, month=key,
+                            days=plan.get("days"),
+                        )
+                        pending = pending_inputs.get(actor_id) or {}
+                        warning_token = parts[1] if len(parts) == 2 else None
+                        acknowledged = (
+                            warnings if warning_token
+                            and pending.get("operation") == "plan_warning"
+                            and pending.get("service_id") == service_id
+                            and pending.get("month") == key
+                            and pending.get("revision") == rev
+                            and pending.get("token") == warning_token
+                            and pending.get("warnings") == warnings
+                            else None
+                        )
+                        if warnings and acknowledged is None:
+                            token = secrets.token_hex(4)
+                            pending_inputs[actor_id] = {
+                                "operation": "plan_warning", "service_id": service_id,
+                                "month": key, "revision": rev, "token": token,
+                                "warnings": warnings,
+                            }
+                            await _send_dialog(
+                                callback.message,
+                                "⚠️ График требует внимания\n\n"
+                                + "\n".join(warnings)
+                                + "\n\nОтветственные не будут удалены или заменены. "
+                                "График можно утвердить как есть, приняв эти "
+                                "предупреждения, или вернуться и исправить его.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [readiness_button(
+                                        "⚠️ Утвердить с предупреждениями", "pokok",
+                                        service_id, plan_arg(plan, token),
+                                    )],
+                                    [readiness_button(
+                                        "⬅️ К графику", "plan", service_id,
+                                        key.replace("-", ""),
+                                    )],
+                                ]),
+                                _dialog_keep_rows=True,
+                                _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                                parse_mode=None,
+                            )
+                            return
                         plan = await schedule_plan.publish(
                             context.bot, registry, service, plan, actor_id,
                             debug, TELEGRAM_TEXT_LIMIT,
+                            acknowledged_warnings=acknowledged,
                         )
                     except ValueError as exc:
                         notice = f"⚠️ {exc}"
@@ -6266,7 +6721,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         debug.exception("Не удалось опубликовать график")
                         notice = "❌ Не удалось опубликовать график в чате"
                     else:
+                        if pending_inputs.get(actor_id, {}).get("operation") == "plan_warning":
+                            pending_inputs.pop(actor_id, None)
                         notice = "✅ График утверждён и опубликован в чате служения"
+                        if plan.get("approval_warnings"):
+                            notice += "\n⚠️ Предупреждения сохранены вместе с графиком."
                         if not plan.get("pinned", True):
                             notice += (
                                 "\n⚠️ Закрепить не удалось — сделайте бота "
@@ -6424,7 +6883,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ):
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
-            if action in {
+            if (action == "pokok" and member_pending
+                    and member_pending.get("operation") == "plan_warning"):
+                await clean_previous_menu(callback.message, debug)
+                member_pending.pop("menu_message_id", None)
+            elif action in {
                 "addmt", "addms", "padd", "prem", "pclear", "pnew", "pday",
                 "pdset", "ownp", "owns",
             }:
@@ -6435,6 +6898,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await clean_and_clear_pending_actor(actor_id)
                 await clean_previous_menu(callback.message, debug)
             notice = None
+            if action == "summary":
+                current = now.date().replace(day=1)
+                following = month_end(current.year, current.month) + timedelta(days=1)
+                raw_month, separator, raw_page = (arg or current.strftime("%Y%m")).partition(".")
+                if raw_month not in {current.strftime("%Y%m"), following.strftime("%Y%m")}:
+                    raise ValueError("Сводка доступна только за текущий и следующий месяц.")
+                if separator and not raw_page.isdecimal():
+                    raise ValueError("Некорректная страница сводки.")
+                await show_month_graph(
+                    callback.message, actor_id, service_id, int(raw_page or 0),
+                    summary=True, month=date(int(raw_month[:4]), int(raw_month[4:]), 1),
+                )
+                await _answer_callback(callback)
+                return
             if action == "month":
                 if arg is not None and not arg.isdecimal():
                     raise ValueError("Некорректная страница графика.")
@@ -7319,7 +7796,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             pending = pending_inputs.get(actor_id)
             if (
-                action not in {"ok", "no"} or pending is None
+                action not in {"ok", "warnok", "no"} or pending is None
                 or pending.get("operation") != "excel_import"
                 or pending.get("service_id") != service_id
                 or pending.get("token") != arg
@@ -7363,7 +7840,47 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     {**loaded, "service_id": service_id},
                     people,
                 )
-                pending_inputs.pop(actor_id, None)
+                warnings = registry.task_assignment_warnings(
+                    service_id, loaded["slots"], tasks=loaded["tasks"],
+                    complete=True, month=pending["month"], days=loaded["days"],
+                    approved_slot_days=approved_days,
+                )
+                acknowledged = (
+                    warnings if action == "warnok"
+                    and pending.get("warnings") == warnings else None
+                )
+                if warnings and acknowledged is None:
+                    token = secrets.token_urlsafe(6)
+                    pending.update(token=token, warnings=warnings)
+                    lines = [
+                        "⚠️ График из Excel требует внимания", "",
+                        *warnings, "",
+                        "Ответственные сохранятся как в Excel. "
+                        "Утвердить график с этими предупреждениями?",
+                    ]
+                    rows = [
+                        [InlineKeyboardButton(
+                            text="⚠️ Утвердить с предупреждениями",
+                            callback_data=f"xls:warnok:{service_id}:{token}",
+                        )],
+                        [InlineKeyboardButton(
+                            text="⬅️ К загрузке графика",
+                            callback_data=f"xls:no:{service_id}:{token}",
+                        )],
+                    ]
+                    chunks = _telegram_text_chunks("\n".join(lines))
+                    for index, chunk in enumerate(chunks):
+                        if pending_inputs.get(actor_id) is not pending:
+                            return
+                        await _send_dialog(
+                            message, chunk, parse_mode=None,
+                            reply_markup=(
+                                InlineKeyboardMarkup(inline_keyboard=rows)
+                                if index == len(chunks) - 1 else None
+                            ),
+                            _dialog_keep_rows=True,
+                        )
+                    return
                 registry.import_excel_plan(
                     actor_id, service_id, pending["month"],
                     dates=loaded["dates"], tasks=loaded["tasks"],
@@ -7371,7 +7888,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     served_offsets=offsets,
                     approved_slot_days=approved_days,
                     expected_version=pending["version"],
+                    acknowledged_warnings=acknowledged,
                 )
+                pending_inputs.pop(actor_id, None)
             year, month = map(int, pending["month"].split("-"))
             await show_excel_schedule(
                 message, actor_id, service,
@@ -7380,12 +7899,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         except (PermissionError, ValueError) as exc:
             await _send_dialog(
-                message, _status_text(str(exc), "❌"), parse_mode=None
+                message, _status_text(str(exc), "❌")
+                + "\n\nЗагрузите исправленный график заново.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="⬅️ К загрузке графика",
+                        callback_data=f"service:service_excel:{service_id}",
+                    ),
+                ]]),
+                parse_mode=None,
             )
         except sqlite3.Error:
             debug.exception("Не удалось сохранить график из Excel")
             await _send_dialog(
-                message, "❌ Ошибка базы данных.", parse_mode=None
+                message,
+                "❌ Ошибка базы данных. Загрузите график заново и повторите.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="⬅️ К загрузке графика",
+                        callback_data=f"service:service_excel:{service_id}",
+                    ),
+                ]]),
+                parse_mode=None,
             )
 
     @admin_router.callback_query(F.data.startswith("svc_tasks:"))
@@ -7446,6 +7981,52 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_service_reminder_tasks(
                     callback.message, service_id, session_id
                 )
+                await _answer_callback(callback)
+                return
+            if action in {"dep", "danchor", "dpage", "dsave", "dclear", "dback"}:
+                if len(parts) != (5 if action in {"danchor", "dpage"} else 4):
+                    raise ValueError("Некорректная кнопка — откройте задачу заново.")
+                expected = "task_card" if action == "dep" else "task_dependency"
+                if pending.get("step") != expected:
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                task = next(
+                    (item for item in registry.list_service_tasks(service_id)
+                     if item["position"] == pending.get("task_position")), None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                if action == "dep":
+                    pending.pop("dependency_anchors", None)
+                    pending.pop("dependency_page", None)
+                elif action == "dpage":
+                    pending["dependency_page"] = int(parts[3])
+                elif action == "danchor":
+                    anchor = next(
+                        (item for item in registry.list_service_tasks(service_id)
+                         if str(item["position"]) == parts[3] and item["enabled"]),
+                        None,
+                    )
+                    if anchor is None or anchor["name"] == task["name"]:
+                        raise ValueError("Выберите основную задачу из списка.")
+                    selected = pending["dependency_anchors"]
+                    if anchor["name"] in selected:
+                        selected.remove(anchor["name"])
+                    else:
+                        selected.append(anchor["name"])
+                elif action in {"dsave", "dclear"}:
+                    selected = pending["dependency_anchors"] if action == "dsave" else []
+                    if action == "dsave" and not selected:
+                        raise ValueError("Выберите хотя бы одну основную задачу.")
+                    registry.set_task_dependency(actor_id, service_id, task["name"], selected)
+                if action in {"dsave", "dclear", "dback"}:
+                    task = next(
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["name"] == task["name"]
+                    )
+                    await show_service_task_card(callback.message, actor_id, service_id, task)
+                else:
+                    await show_task_dependency(callback.message, actor_id, service_id)
                 await _answer_callback(callback)
                 return
             if action in {
@@ -9093,7 +9674,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = (
             f"Введите индивидуальный текст напоминания для задачи "
             f"«{display_task}». Шаблоны: {{name}}, {{task}}, {{service_name}}, "
-            f"{{sunday_date}}, {{telegram_id}}, {{username}}.\n\n"
+            f"{{sunday_date}}, {{telegram_id}}, {{username}}, {{event_notes}}.\n\n"
             + await notification_template_preview(
                 actor_id, service_id, task
             )
@@ -13370,7 +13951,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "Отправьте текст напоминания. Заголовок «🔔 служение · "
                     "задача · дата» бот добавит сам. Можно использовать поля "
                     "{name}, {task}, {service_name}, {sunday_date}, "
-                    "{telegram_id}, {username}."
+                    "{telegram_id}, {username}, {event_notes}."
                     if action_name == "rule_text"
                     else "Введите, за сколько дней до первого воскресенья "
                     "месяца (0–6) и во сколько прислать сводку, например: 2 18:30."
@@ -13514,6 +14095,75 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             # Кнопка устарела и нового экрана нет — не оставлять пустоту.
             await drop_screen(message, actor_id, screen.message_id)
             await show_start(message, message.from_user)
+
+    @admin_router.message(
+        F.text & ~F.text.startswith("/"),
+        lambda message: bool(
+            message.from_user
+            and (
+                pending_inputs.get(message.from_user.id) or {}
+            ).get("operation") == "event_note_input"
+        ),
+    )
+    async def on_event_note_text(message: Message) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+            or not message.text
+        ):
+            return
+        actor_id = message.from_user.id
+        pending = pending_inputs.get(actor_id)
+        registry = service_registry()
+        if (
+            not pending
+            or pending.get("operation") != "event_note_input"
+            or registry is None
+            or not is_service_admin(actor_id, "assembly")
+        ):
+            pending_inputs.pop(actor_id, None)
+            await _send_dialog(
+                message, "Этот ввод устарел. Откройте заметки заново.",
+                parse_mode=None,
+            )
+            return
+        try:
+            registry.save_event_note_draft(
+                actor_id,
+                pending["event_sunday"],
+                message.text,
+                pending.get("targets"),
+                expected_revision=pending["revision"],
+            )
+        except (ValueError, PermissionError) as exc:
+            await _send_dialog(
+                message,
+                f"❌ {exc}\n\nОтправьте текст заметки ещё раз "
+                "или нажмите «Отмена».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="⬅️ К заметке",
+                        callback_data=(
+                            f"evn:edit:{pending['token']}:"
+                        ),
+                    ),
+                ]]),
+                parse_mode=None,
+            )
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось сохранить черновик заметки")
+            await _send_dialog(
+                message, "❌ Не удалось сохранить заметку. Попробуйте ещё раз.",
+                parse_mode=None,
+            )
+            return
+        await show_event_note_detail(
+            message,
+            actor_id,
+            pending["event_sunday"],
+            "Черновик сохранён. Он пока не виден в напоминаниях.",
+        )
 
     @admin_router.message(F.text & ~F.text.startswith("/"))
     async def on_service_parameter(message: Message) -> None:
@@ -14552,10 +15202,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         status = "confirmed" if kind == "c" else "declined"
         try:
-            name, changed = registry.set_confirmation(
+            answers = registry.set_assignment_answer(
                 service_id, event_date.isoformat(), task, cb.from_user.id,
                 status, name=schedule_name,
             )
+            _, name, _ = answers[0]
+            changed = any(item[2] for item in answers)
         except PermissionError:
             await _answer_callback(cb, "❌ Вы не привязаны к этой задаче")
             return
@@ -14569,10 +15221,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         admins_told = None
         if changed and status == "declined" and service:
             try:
-                admins_told = await notify_admins_declined(
-                    context.bot, registry, service, event_date, task,
-                    name, context.admin_id, debug,
-                )
+                admins_told = 0
+                for answered_task, answered_name, answer_changed in answers:
+                    if answer_changed:
+                        admins_told += await notify_admins_declined(
+                            context.bot, registry, service, event_date, answered_task,
+                            answered_name, context.admin_id, debug,
+                        )
             except Exception:  # noqa: BLE001
                 debug.exception("Не удалось сообщить админам об отказе")
                 admins_told = 0
@@ -14592,6 +15247,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "🚫 Ответ сохранён, но сообщить админам не удалось — "
                 "предупредите их сами."
             )
+        if status == "declined" and len(answers) > 1:
+            note += "\nТакже снята готовность к обязанности: " + ", ".join(
+                item[0] for item in answers[1:]
+            ) + ". Администратор должен переназначить её внутри смены."
         await _mark_answered_reminder(cb, note, debug)
         if changed:
             interaction.info(
@@ -14618,10 +15277,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 on_declined = getattr(context, "on_assignment_declined", None)
                 if callable(on_declined):
                     try:
-                        await on_declined(
-                            service_id, event_date, task, name,
-                            telegram_id=cb.from_user.id,
-                        )
+                        for answered_task, answered_name, answer_changed in answers:
+                            if answer_changed:
+                                await on_declined(
+                                    service_id, event_date, answered_task, answered_name,
+                                    telegram_id=cb.from_user.id,
+                                )
                     except Exception:  # noqa: BLE001
                         debug.exception("Не удалось запустить поиск замены")
             try:

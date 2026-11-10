@@ -3693,9 +3693,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "нет прав администратора",
                 command.answer.await_args.args[0].lower(),
             )
-            self.assertIsNone(
-                command.answer.await_args.kwargs.get("reply_markup")
-            )
+            self.assertEqual(self.callback_data_list(command), ["menu:start", "menu:start"])
 
         asyncio.run(run())
 
@@ -4318,8 +4316,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "только администратору",
                 denied.message.answer.await_args.args[0],
             )
-            self.assertIsNone(
-                denied.message.answer.await_args.kwargs.get("reply_markup")
+            self.assertEqual(
+                self.callback_data_list(denied.message), ["menu:start", "menu:start"]
             )
             for action in ("group", "preview"):
                 foreign = callback(13579, f"test_action:{action}:sound")
@@ -5402,7 +5400,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "супер-администратор", denied.message.answer.await_args.args[0]
             )
-            self.assertEqual(self.callback_data_list(denied.message), [])
+            self.assertEqual(
+                self.callback_data_list(denied.message), ["menu:start", "menu:start"]
+            )
 
         asyncio.run(run())
 
@@ -6696,6 +6696,285 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         self.context.bot.stop_poll = AsyncMock()
         asyncio.run(run())
 
+    def test_auto_button_builds_current_month_without_poll_or_excel(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Алексей", ("звук",)),
+        ]})
+        self.context.load_upcoming_service_events = AsyncMock(side_effect=AssertionError("Excel"))
+        self.context.bot.send_poll = AsyncMock()
+        month = datetime.now(ZoneInfo("UTC")).strftime("%Y%m")
+
+        async def run():
+            async def press(data):
+                cb = SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=67890),
+                    message=self.message(67890, ""), answer=AsyncMock(),
+                )
+                await self.callback_handler("on_readiness")(cb)
+                return cb
+
+            screen = await press("rdy:month:sound")
+            rows = screen.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            row = next(row for row in rows if any(b.text == "🧮 Авто" for b in row))
+            self.assertEqual([b.text for b in row], ["🗳 Опрос", "🧮 Авто"])
+            auto = next(b.callback_data for b in row if b.text == "🧮 Авто")
+            self.assertEqual(auto, f"rdy:pfree:sound:{month}")
+            built = await press(auto)
+            self.assertIn("Без опроса", built.message.answer.await_args.args[0])
+            def back_button(callback):
+                return next(
+                    button for row in callback.message.answer.await_args.kwargs[
+                        "reply_markup"
+                    ].inline_keyboard for button in row
+                    if button.text.startswith("⬅️ К ")
+                )
+
+            back = back_button(built)
+            self.assertEqual((back.text, back.callback_data), ("⬅️ К графику", "rdy:month:sound"))
+            returned = await press(back.callback_data)
+            self.assertIn("ЗВУК › График", returned.message.answer.await_args.args[0])
+            self.assertNotIn("График › Опрос", returned.message.answer.await_args.args[0])
+            key = month[:4] + "-" + month[4:]
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertIsNone(plan["run_id"])
+            self.assertIsNone(plan["approved"])
+            self.assertIsNone(self.registry.get_readiness_run("sound", key))
+            self.assertTrue(any(values.get("звук") for values in plan["slots"].values()))
+            reopened = await press(auto)
+            self.assertEqual(back_button(reopened).callback_data, "rdy:month:sound")
+            dates = await press(f"rdy:pedit:sound:{month}")
+            self.assertEqual(back_button(dates).callback_data, f"rdy:plan:sound:{month}")
+            edited_back = await press(back_button(dates).callback_data)
+            self.assertEqual(back_button(edited_back).callback_data, "rdy:month:sound")
+            self.assertEqual(self.registry.get_schedule_plan("sound", key)["slots"], plan["slots"])
+            self.context.load_upcoming_service_events.assert_not_awaited()
+            self.context.bot.send_poll.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_manual_duty_outside_team_is_available_and_saved_in_draft(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_service_task_enabled(67890, "kitchen", "пироги", False)
+        self.registry.add_service_task(67890, "kitchen", "Скатерти")
+        self.registry.set_task_dependency(
+            67890, "kitchen", "Скатерти", ["старший", "в смене"],
+        )
+        self.registry.sync_service_rosters({"kitchen": [
+            RosterMember("А", ("старший",)), RosterMember("Б", ("в смене",)),
+            RosterMember("В", ("Скатерти",)),
+        ]})
+        month = datetime.now(ZoneInfo("UTC")).strftime("%Y%m")
+        key = month[:4] + "-" + month[4:]
+
+        async def run():
+            async def press(data):
+                cb = SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=67890),
+                    message=self.message(67890, ""), answer=AsyncMock(),
+                )
+                await self.callback_handler("on_readiness")(cb)
+                return cb
+
+            def button(cb, prefix):
+                return next(data for data in self.callback_data_list(cb.message)
+                            if data.startswith(prefix))
+
+            await press(f"rdy:pfree:kitchen:{month}")
+            plan = self.registry.get_schedule_plan("kitchen", key)
+            self.assertTrue(all(not values.get("Скатерти")
+                                for values in plan["slots"].values()))
+            dates = await press(f"rdy:pedit:kitchen:{month}")
+            day = await press(button(dates, "rdy:pdate:"))
+            task_button = next(
+                b.callback_data
+                for row in day.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                for b in row if "Скатерти" in b.text
+            )
+            slot = await press(task_button)
+            added = await press(button(slot, "rdy:padd:"))
+            text = "".join(call.args[0] for call in added.message.answer.await_args_list)
+            self.assertIn("Поставлен(а): В", text)
+            self.assertIn("не входит в смену", text)
+            plan = self.registry.get_schedule_plan("kitchen", key)
+            self.assertEqual(plan["slots"][plan["dates"][0]]["Скатерти"], ["В"])
+            self.assertIsNone(plan["approved"])
+            shown = await press(f"rdy:plan:kitchen:{month}")
+            ask = await press(button(shown, "rdy:pok:"))
+            warning = await press(button(ask, "rdy:pokok:"))
+            self.assertIn("не входит в смену", "".join(
+                call.args[0] for call in warning.message.answer.await_args_list
+            ))
+            self.assertIsNone(self.registry.get_schedule_plan("kitchen", key)["approved"])
+
+        asyncio.run(run())
+
+    def test_incomplete_plan_extra_confirmation_and_cancel(self):
+        from bot import schedule_plan
+        from bot.excel_parser import RosterMember
+        from unittest.mock import patch
+
+        self.registry.set_service_task_enabled(67890, "kitchen", "пироги", False)
+        self.registry.add_service_task(67890, "kitchen", "Скатерти")
+        self.registry.set_task_dependency(
+            67890, "kitchen", "Скатерти", ["старший", "в смене"],
+        )
+        self.registry.sync_service_rosters({"kitchen": [
+            RosterMember("А", ("старший",)), RosterMember("Б", ("в смене",)),
+        ]})
+        month = datetime.now(ZoneInfo("UTC")).strftime("%Y%m")
+
+        async def run():
+            async def press(data):
+                cb = SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=67890),
+                    message=self.message(67890, ""), answer=AsyncMock(),
+                )
+                await self.callback_handler("on_readiness")(cb)
+                return cb
+
+            def button(cb, prefix):
+                return next(data for data in self.callback_data_list(cb.message)
+                            if data.startswith(prefix))
+
+            built = await press(f"rdy:pfree:kitchen:{month}")
+            ask = await press(button(built, "rdy:pok:"))
+            ordinary = button(ask, "rdy:pokok:")
+            with patch.object(schedule_plan, "publish", new=AsyncMock()) as publish:
+                warning = await press(ordinary)
+                self.assertIn("не назначен", "".join(
+                    call.args[0] for call in warning.message.answer.await_args_list
+                ))
+                confirm = button(warning, "rdy:pokok:")
+                self.assertIn("menu:start", self.callback_data_list(warning.message))
+                publish.assert_not_awaited()
+                await press(button(warning, "rdy:plan:"))
+                await press(confirm)
+                publish.assert_not_awaited()
+                warning = await press(ordinary)
+                current = self.registry.get_schedule_plan(
+                    "kitchen", month[:4] + "-" + month[4:],
+                )
+                changed_warnings = self.registry.task_assignment_warnings(
+                    "kitchen", current["slots"], complete=True, month=current["month"],
+                ) + ["Дополнительное предупреждение"]
+                with patch.object(self.registry, "task_assignment_warnings",
+                                  return_value=changed_warnings):
+                    await press(button(warning, "rdy:pokok:"))
+                publish.assert_not_awaited()
+                warning = await press(ordinary)
+                publish.return_value = {**current, "approval_warnings": ["saved"]}
+                self.context.bot.send_document = AsyncMock()
+                await press(button(warning, "rdy:pokok:"))
+                publish.assert_awaited_once()
+                self.assertTrue(publish.await_args.kwargs["acknowledged_warnings"])
+
+        asyncio.run(run())
+
+    def test_excel_warning_confirmation_and_validation_error_keep_navigation(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_service_task_enabled(67890, "kitchen", "пироги", False)
+        self.registry.add_service_task(67890, "kitchen", "Скатерти")
+        self.registry.set_task_dependency(
+            67890, "kitchen", "Скатерти", ["старший", "в смене"],
+        )
+        self.registry.sync_service_rosters({"kitchen": [
+            RosterMember("А", ("старший", "Скатерти")),
+            RosterMember("Б", ("в смене",)),
+        ]})
+        self.context.load_upcoming_service_events = AsyncMock(return_value=[
+            ServiceEvent("kitchen", date(2026, 11, 1), (
+                ServiceAssignment("старший", "А"), ServiceAssignment("в смене", "Б"),
+            )),
+        ])
+
+        async def run():
+            async def press(data):
+                cb = SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=67890),
+                    message=self.message(67890, ""), answer=AsyncMock(),
+                )
+                await self.callback_handler("on_excel_schedule")(cb)
+                return cb
+
+            def button(cb, prefix):
+                return next(data for data in self.callback_data_list(cb.message)
+                            if data.startswith(prefix))
+
+            loaded = await press("xls:load:kitchen:202611")
+            warning = await press(button(loaded, "xls:ok:"))
+            self.assertIsNone(self.registry.get_schedule_plan("kitchen", "2026-11"))
+            confirm = button(warning, "xls:warnok:")
+            self.assertIn("menu:start", self.callback_data_list(warning.message))
+            await press(button(warning, "xls:no:"))
+            await press(confirm)
+            self.assertIsNone(self.registry.get_schedule_plan("kitchen", "2026-11"))
+            loaded = await press("xls:load:kitchen:202611")
+            warning = await press(button(loaded, "xls:ok:"))
+            confirm = button(warning, "xls:warnok:")
+            # A hard validation error cannot be bypassed by confirming warnings.
+            with patch.object(self.registry, "import_excel_plan",
+                              side_effect=ValueError("test validation")):
+                error = await press(confirm)
+            self.assertTrue(any(data.startswith("service:") for data in
+                                self.callback_data_list(error.message)))
+            self.assertIn("test validation", "".join(
+                call.args[0] for call in error.message.answer.await_args_list
+            ))
+            with patch.object(self.registry, "import_excel_plan",
+                              side_effect=sqlite3.OperationalError("test database")):
+                error = await press(confirm)
+            self.assertIn("menu:start", self.callback_data_list(error.message))
+            self.assertIn("service:service_excel:kitchen",
+                          self.callback_data_list(error.message))
+            await press(confirm)
+            saved = self.registry.get_schedule_plan("kitchen", "2026-11")
+            self.assertIsNotNone(saved["approved"])
+            self.assertTrue(saved["approval_warnings"])
+
+        asyncio.run(run())
+
+    def test_error_screen_preserves_back_and_home(self):
+        from bot.navigation import back_callback
+
+        async def run():
+            screen = SimpleNamespace(
+                data="service:service_setup:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""), answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(screen)
+            self.registry.add_service_admin(67890, "sound", 24680)
+            denied = SimpleNamespace(
+                data="menu:service_admins",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""), answer=AsyncMock(),
+            )
+            # An error with no earlier screen still has both exits.
+            await self.callback_handler("on_start_menu")(denied)
+            rows = denied.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual([b.text for row in rows for b in row],
+                             ["⬅️ Назад", "🏠 В начало"])
+            screen.from_user.id = 24680
+            screen.message = self.message(24680, "")
+            await self.callback_handler("on_service_selected")(screen)
+            previous_back = back_callback(
+                screen.message.answer.await_args.kwargs["reply_markup"],
+            )
+            self.assertIsNotNone(previous_back)
+            denied.message = self.message(24680, "")
+            await self.callback_handler("on_start_menu")(denied)
+            rows = denied.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual(
+                [b.callback_data for row in rows for b in row],
+                [previous_back, "menu:start"],
+            )
+
+        asyncio.run(run())
+
     def test_schedule_without_poll_and_telegram_user(self):
         from bot.excel_parser import RosterMember
 
@@ -7031,6 +7310,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             plan_screen = await press(f"rdy:plan:sound:{month_arg}")
             self.assertIn("📋 ЗВУК › График › Опрос", text_of(plan_screen))
             self.assertIn("📝 Черновик", text_of(plan_screen))
+            self.assertTrue(any(
+                button.text == "⬅️ К опросу" and button.callback_data == "rdy:open:sound"
+                for button in buttons(plan_screen)
+            ))
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей"])
 
