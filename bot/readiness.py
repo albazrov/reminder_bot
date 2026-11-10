@@ -447,6 +447,20 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             for person in people
             if person.get("month_limit") or common
         }
+        dependencies = {
+            task["name"]: tuple(task["requires_any"])
+            for task in catalog if task.get("requires_any")
+        }
+        last_duty = {}
+        if dependencies:
+            previous = min(week_dates).replace(day=1) - timedelta(days=1)
+            saved = registry.get_schedule_plan(
+                run["service_id"], previous.strftime("%Y-%m"),
+            )
+            for day, assignments in ((saved or {}).get("approved") or {}).items():
+                for duty in dependencies:
+                    for key in assignments.get(duty, []):
+                        last_duty[key] = max(last_duty.get(key, date.min), date.fromisoformat(day))
         summary.plan = build_plan(PlanInput(
             dates=tuple(sorted(week_dates)),
             needed={task["name"]: task["needed"] for task in catalog},
@@ -462,6 +476,8 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             last_served=dict(last_served or {}),
             limits=limits,
             bundles=summary.bundles,
+            dependencies=dependencies,
+            last_duty=last_duty,
             # Ответы — по времени ответа: кто раньше, тот первее при
             # конкуренции за дату (решение 16).
             answer_order={} if assume_free else {

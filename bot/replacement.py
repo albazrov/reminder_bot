@@ -239,6 +239,13 @@ def choose_volunteer(registry, poll: dict) -> dict | None:
         and substitute_from_answer(registry, poll, answer)["name"]
         != poll["old_name"]
     ]
+    volunteers = [
+        answer for answer in volunteers
+        if not registry.replacement_assignment_errors(
+            poll["service_id"], poll["event_date"], poll["task"], poll["old_name"],
+            substitute_from_answer(registry, poll, answer)["name"],
+        )
+    ]
     if not volunteers:
         return None
     task_people = registry.task_member_ids(poll["service_id"], poll["task"])
@@ -309,8 +316,9 @@ async def finish_replacement(
         await _notify(
             bot, admins,
             f"⚠️ Замена не найдена: «{poll['task']}» · {service['name']} · "
-            f"{date_text} вместо {poll['old_name']} — никто не ответил "
-            f"«Могу».\nНазначьте сами: /change {poll['task']} @username",
+            f"{date_text} вместо {poll['old_name']} — нет подходящего участника "
+            f"среди ответивших «Могу». Проверьте допуск и обязанности внутри смены."
+            f"\nНазначьте сами: /change {poll['task']} @username",
             logger,
         )
         return True
@@ -505,4 +513,3 @@ def parse_event_date(text: str, today: date | None = None) -> date:
     except ValueError:
         pass
     raise ValueError("Дата — в формате дд.мм или дд.мм.гггг. " + CHANGE_USAGE)
-

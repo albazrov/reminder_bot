@@ -1,0 +1,338 @@
+import asyncio
+import logging
+import tempfile
+import unittest
+from dataclasses import replace
+from datetime import date, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
+
+from bot import handlers, readiness, schedule_plan
+from bot.excel_parser import RosterMember
+from bot.schedule_planner import PlanInput, build_plan
+from bot.service_registry import ServiceRegistry
+from bot.task_rules import assignment_errors
+
+
+SUNDAYS = tuple(date(2026, 11, 1) + timedelta(weeks=i) for i in range(5))
+DUTY = "Скатерти"
+HEAD = "старший"
+TEAM = "в смене"
+
+
+class DependentPlannerTest(unittest.TestCase):
+    def data(self, tasks, dates=SUNDAYS):
+        return PlanInput(
+            dates=dates, needed={HEAD: 1, TEAM: 1, DUTY: 1},
+            free={person: frozenset(dates) for person in tasks},
+            tasks={person: frozenset(names) for person, names in tasks.items()},
+            dependencies={DUTY: (HEAD, TEAM)},
+        )
+
+    def test_selects_team_to_cover_duty_and_counts_one_service_day(self):
+        data = self.data({
+            "A": [HEAD], "B": [TEAM], "C": [TEAM, DUTY],
+        }, SUNDAYS[:1])
+        plan = build_plan(data)
+        self.assertEqual(plan.slots[(SUNDAYS[0], TEAM)], ["C"])
+        self.assertEqual(plan.slots[(SUNDAYS[0], DUTY)], ["C"])
+        self.assertEqual(plan.load(), {"A": 1, "C": 1})
+        self.assertFalse(plan.gaps())
+
+    def test_duty_rotates_separately_and_respects_previous_month(self):
+        data = self.data({"A": [HEAD, DUTY], "B": [TEAM, DUTY]})
+        plan = build_plan(data)
+        counts = {person: sum(
+            person in plan.slots[(day, DUTY)] for day in SUNDAYS
+        ) for person in "AB"}
+        self.assertLessEqual(abs(counts["A"] - counts["B"]), 1)
+        previous = replace(data, dates=SUNDAYS[:1], last_duty={"A": date(2026, 10, 25)})
+        self.assertEqual(build_plan(previous).slots[(SUNDAYS[0], DUTY)], ["B"])
+
+    def test_no_permit_or_no_primary_role_leaves_explicit_gap(self):
+        for skills in (
+            {"A": [HEAD], "B": [TEAM]},
+            {"A": [HEAD], "B": [TEAM], "C": [DUTY]},
+        ):
+            with self.subTest(skills=skills):
+                plan = build_plan(self.data(skills, SUNDAYS[:1]))
+                self.assertEqual(plan.slots[(SUNDAYS[0], DUTY)], [])
+                self.assertIn((SUNDAYS[0], DUTY, 1), plan.gaps())
+
+    def test_unavailable_duty_candidate_not_used_and_reserve_is_last(self):
+        data = self.data({
+            "A": [HEAD, DUTY], "B": [TEAM, DUTY], "C": [TEAM, DUTY],
+        }, SUNDAYS[:2])
+        data = replace(
+            data, reluctant=frozenset({"C"}),
+            unavailable={"A": frozenset({(SUNDAYS[0], DUTY)})},
+        )
+        plan = build_plan(data)
+        self.assertEqual(plan.slots[(SUNDAYS[0], DUTY)], ["B"])
+        self.assertNotIn("C", plan.load())
+
+    def test_all_small_eligibility_combinations_obey_rules(self):
+        for mask in range(1, 64):
+            skills = {
+                person: ([HEAD, TEAM] + ([DUTY] if mask & (1 << index) else []))
+                for index, person in enumerate("ABCDEF")
+            }
+            data = self.data(skills, SUNDAYS[:1])
+            plan = build_plan(data)
+            tasks = [{"name": HEAD}, {"name": TEAM}, {
+                "name": DUTY, "requires_any": [HEAD, TEAM],
+            }]
+            slots = {SUNDAYS[0].isoformat(): {
+                task: people for (day, task), people in plan.slots.items()
+            }}
+            self.assertEqual(assignment_errors(
+                tasks, slots, {key: set(value) for key, value in skills.items()},
+                complete=True,
+            ), [])
+
+    def test_rejects_self_dependency(self):
+        with self.assertRaises(ValueError):
+            build_plan(replace(
+                self.data({"A": [HEAD, DUTY]}),
+                dependencies={DUTY: (DUTY,)},
+            ))
+
+    def test_unrelated_week_bundle_is_preserved(self):
+        day = SUNDAYS[0]
+        data = self.data({
+            "A": [HEAD, DUTY], "B": [TEAM], "C": ["X", "Y"], "D": ["Y"],
+        }, (day,))
+        data = replace(
+            data, needed={**data.needed, "X": 1, "Y": 1},
+            bundles={"C": frozenset({"X", "Y"})},
+            slot_dates={(day, "Y", key): day + timedelta(days=2) for key in "CD"},
+        )
+        plan = build_plan(data)
+        self.assertEqual(plan.slots[(day, "X")], ["C"])
+        self.assertEqual(plan.slots[(day, "Y")], ["C"])
+        self.assertEqual(plan.slots[(day, DUTY)], ["A"])
+
+
+class DependentRegistryTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.registry = ServiceRegistry(Path(temp.name) / "registry.sqlite3")
+        self.registry.initialize(1001, -10001)
+        self.registry.set_service_task_enabled(1001, "kitchen", "пироги", False)
+        self.registry.add_service_task(1001, "kitchen", DUTY)
+        self.registry.set_task_dependency(1001, "kitchen", DUTY, [HEAD, TEAM])
+        self.registry.sync_service_rosters({"kitchen": [
+            RosterMember("A", (HEAD, DUTY)),
+            RosterMember("B", (TEAM, DUTY)),
+            RosterMember("C", (TEAM,)),
+        ]})
+        for index, (person, tasks) in enumerate((
+            ("A", [HEAD, DUTY]), ("B", [TEAM, DUTY]), ("C", [TEAM]),
+        ), 501):
+            for task in tasks:
+                self.registry.set_responsible_contact(1001, "kitchen", task, person, index)
+        self.slots = {day.isoformat(): {HEAD: ["A"], TEAM: ["B"], DUTY: ["A"]}
+                      for day in SUNDAYS}
+        self.registry.save_schedule_draft(
+            "kitchen", "2026-11", run_id=None, dates=list(self.slots),
+            tasks=schedule_plan.plan_tasks(self.registry, "kitchen"),
+            slots=self.slots, last_served={},
+        )
+
+    def approve(self):
+        return self.registry.approve_schedule_plan(
+            1001, "kitchen", "2026-11", self.slots, chat_id=None, message_id=None,
+        )
+
+    def test_editor_rejects_outsider_duplicate_and_primary_conflicts(self):
+        for changes, error in (
+            ({DUTY: ["C"]}, "в смене"),
+            ({DUTY: ["B", "A"]}, "ровно один"),
+            ({HEAD: ["A", "A"]}, "дважды"),
+            ({TEAM: ["A"]}, "разными"),
+            ({TEAM: ["C"], DUTY: ["C"]}, "допуска"),
+        ):
+            slots = {**self.slots, SUNDAYS[0].isoformat(): {
+                **self.slots[SUNDAYS[0].isoformat()], **changes,
+            }}
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, error):
+                self.registry.set_schedule_slots(1001, "kitchen", "2026-11", slots)
+        self.assertEqual(self.registry.get_schedule_plan("kitchen", "2026-11")["slots"], self.slots)
+
+    def test_missing_duty_or_sunday_or_team_blocks_import_and_approval(self):
+        for slots in (
+            {day: {**values, DUTY: []} for day, values in self.slots.items()},
+            {day: values for day, values in self.slots.items() if day != "2026-11-08"},
+            {day: {**values, TEAM: []} for day, values in self.slots.items()},
+        ):
+            with self.subTest(slots=slots), self.assertRaises(ValueError):
+                self.registry.approve_schedule_plan(
+                    1001, "kitchen", "2026-11", slots, chat_id=None, message_id=None,
+                )
+            with self.assertRaises(ValueError):
+                self.registry.import_excel_plan(
+                    1001, "kitchen", "2026-11", dates=list(slots),
+                    tasks=schedule_plan.plan_tasks(self.registry, "kitchen"),
+                    slots=slots, days={},
+                )
+
+    def test_publish_validates_before_any_telegram_call(self):
+        plan = self.registry.get_schedule_plan("kitchen", "2026-11")
+        plan["slots"]["2026-11-01"][DUTY] = []
+        bot = SimpleNamespace(send_message=AsyncMock(), edit_message_text=AsyncMock())
+        with self.assertRaises(ValueError):
+            asyncio.run(schedule_plan.publish(
+                bot, self.registry,
+                {**self.registry.get_service("kitchen"), "enabled": True, "group_chat_id": -123},
+                plan, 1001, logging.getLogger("test-dependencies"), 4096,
+            ))
+        bot.send_message.assert_not_awaited()
+
+    def test_sunday_is_enforced_and_setting_guards_preserve_rule(self):
+        with self.assertRaisesRegex(ValueError, "воскресенье"):
+            self.registry.set_schedule_day(
+                1001, "kitchen", "2026-11", "2026-11-01", "A", -1,
+            )
+        for change in (
+            lambda: self.registry.set_service_task_day(1001, "kitchen", HEAD, 2),
+            lambda: self.registry.set_service_task_enabled(1001, "kitchen", TEAM, False),
+            lambda: self.registry.set_service_task_people_needed(1001, "kitchen", DUTY, 2),
+            lambda: self.registry.set_service_task_same_week(1001, "kitchen", DUTY, True),
+        ):
+            with self.assertRaises(ValueError):
+                change()
+        with self.assertRaises(PermissionError):
+            self.registry.set_task_dependency(501, "kitchen", DUTY, [])
+        with self.assertRaises(ValueError):
+            self.registry.set_task_dependency(1001, "kitchen", HEAD, [DUTY])
+
+    def test_replacements_require_duty_to_stay_inside_team(self):
+        self.approve()
+        replace_person = self.registry.set_replacement
+        with self.assertRaisesRegex(ValueError, "в смене"):
+            replace_person("kitchen", "2026-11-01", HEAD, "A", "C", 503, "", "admin", 1001)
+        with self.assertRaisesRegex(ValueError, "допуска"):
+            replace_person("kitchen", "2026-11-01", DUTY, "A", "C", 503, "", "admin", 1001)
+        self.assertTrue(replace_person(
+            "kitchen", "2026-11-01", DUTY, "A", "B", 502, "", "admin", 1001,
+        ))
+        self.assertTrue(replace_person(
+            "kitchen", "2026-11-01", HEAD, "A", "C", 503, "", "admin", 1001,
+        ))
+
+    def test_primary_decline_cascades_but_duty_decline_does_not(self):
+        self.approve()
+        duty = self.registry.set_assignment_answer(
+            "kitchen", "2026-11-01", DUTY, 501, "declined",
+        )
+        self.assertEqual([item[0] for item in duty], [DUTY])
+        self.assertIsNone(self.registry.get_confirmation("kitchen", "2026-11-01", HEAD, 501))
+        primary = self.registry.set_assignment_answer(
+            "kitchen", "2026-11-08", HEAD, 501, "declined",
+        )
+        self.assertEqual([item[0] for item in primary], [HEAD, DUTY])
+        self.assertEqual(self.registry.get_confirmation("kitchen", "2026-11-08", DUTY, 501), "declined")
+
+    def test_rule_changes_leave_approved_snapshot_and_guards_intact(self):
+        approved = self.approve()
+        self.registry.initialize(1001, -10001)
+        duty = next(item for item in self.registry.plan_tasks("kitchen") if item["name"] == DUTY)
+        self.assertEqual(duty["requires_any"], [HEAD, TEAM])
+        self.registry.set_task_dependency(1001, "kitchen", DUTY, [])
+        current = self.registry.get_schedule_plan("kitchen", "2026-11")
+        self.assertEqual(current["approved_tasks"], approved["approved_tasks"])
+        self.assertTrue(self.registry.replacement_assignment_errors(
+            "kitchen", "2026-11-01", HEAD, "A", "C",
+        ))
+        self.registry.initialize(1001, -10001)
+        self.assertEqual(self.registry.get_schedule_plan("kitchen", "2026-11")["approved"], self.slots)
+
+    def test_valid_excel_import_preserves_rule_and_rejects_hidden_day_override(self):
+        tasks = schedule_plan.plan_tasks(self.registry, "kitchen")
+        with self.assertRaisesRegex(ValueError, "воскресенье"):
+            self.registry.import_excel_plan(
+                1001, "kitchen", "2026-11", dates=list(self.slots), tasks=tasks,
+                slots=self.slots, days={},
+                approved_slot_days={"2026-11-01": {DUTY: {"A": -1}}},
+            )
+        with self.assertRaisesRegex(ValueError, "отсутствуют"):
+            self.registry.import_excel_plan(
+                1001, "kitchen", "2026-11", dates=list(self.slots),
+                tasks=[task for task in tasks if task["name"] != DUTY],
+                slots=self.slots, days={},
+            )
+        saved = self.registry.import_excel_plan(
+            1001, "kitchen", "2026-11", dates=list(self.slots), tasks=tasks,
+            slots=self.slots, days={},
+        )
+        self.assertEqual(saved["approved"], self.slots)
+        duty = next(item for item in saved["approved_tasks"] if item["name"] == DUTY)
+        self.assertEqual(duty["requires_any"], [HEAD, TEAM])
+
+    def test_readiness_and_manual_candidate_share_rule(self):
+        run = schedule_plan.free_run("kitchen", 2026, 11)
+        summary = readiness.summarize(self.registry, run, assume_free=True)
+        self.assertFalse(summary.plan.gaps())
+        plan = self.registry.get_schedule_plan("kitchen", "2026-11")
+        plan["slots"]["2026-11-01"][DUTY] = []
+        candidates = schedule_plan.candidates(plan, summary, "2026-11-01", DUTY)
+        self.assertEqual(set(sum(candidates, [])), {"A", "B"})
+
+
+class DependentHandlerTest(unittest.TestCase):
+    def setUp(self):
+        DependentRegistryTest.setUp(self)
+
+    def test_dependency_configuration_checks_session_and_permissions(self):
+        for task in ("X", "Y", "Z"):
+            self.registry.add_service_task(1001, "kitchen", task)
+        log = logging.getLogger("test-dependencies")
+        context = SimpleNamespace(
+            service_registry=self.registry, admin_id=1001, group_chat_id=-10001,
+            timezone=ZoneInfo("UTC"), interaction_logger=log, debug_logger=log,
+            bot=SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(message_id=55)),
+                delete_message=AsyncMock(),
+            ),
+        )
+        dispatcher = SimpleNamespace(include_router=MagicMock())
+        handlers.register(dispatcher, context)
+        admin = dispatcher.include_router.call_args_list[0].args[0]
+        handler = next(item.callback for item in admin.callback_query.handlers
+                       if item.callback.__name__ == "on_service_tasks")
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1001),
+            chat=SimpleNamespace(id=1001, type="private"),
+            message_id=1, answer=AsyncMock(return_value=SimpleNamespace(message_id=22)),
+        )
+
+        def click(data, actor=1001):
+            callback = SimpleNamespace(
+                data=data, from_user=SimpleNamespace(id=actor),
+                message=message, answer=AsyncMock(),
+            )
+            asyncio.run(handler(callback))
+            return callback
+
+        def button(prefix, text=None):
+            markup = message.answer.await_args.kwargs["reply_markup"]
+            return next(item.callback_data for row in markup.inline_keyboard
+                        for item in row if item.callback_data.startswith(prefix)
+                        and (text is None or text in item.text))
+
+        click("svc_tasks:open:kitchen")
+        click(button("svc_tasks:card:", DUTY))
+        click(button("svc_tasks:dep:"))
+        click(button("svc_tasks:danchor:", HEAD))
+        click(button("svc_tasks:dpage:", "➡️"))
+        save = button("svc_tasks:dsave:")
+        click(save)
+        task = next(item for item in self.registry.plan_tasks("kitchen") if item["name"] == DUTY)
+        self.assertEqual(task["requires_any"], [TEAM])
+        stale = click(save)
+        self.assertIn("устарел", stale.answer.await_args.args[0])
+        forbidden = click("svc_tasks:open:kitchen", 501)
+        self.assertIn("прав", forbidden.answer.await_args.args[0])

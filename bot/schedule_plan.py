@@ -22,6 +22,7 @@ from aiogram.types import ReplyParameters
 
 from .excel_parser import ServiceAssignment, ServiceEvent, _schedule_sheet_name
 from .group_send import send_to_service_group
+from . import task_rules
 from .month_summary import month_end, month_key, month_title
 from .presentation import (
     apply_replacements, display_name, format_task_assignments,
@@ -63,7 +64,7 @@ def revision(plan: dict) -> str:
     кнопки с прежней версией считаются устаревшими."""
     data = json.dumps(
         [plan["updated_at"], plan["run_id"], plan["slots"],
-         plan.get("days", {})],
+         plan.get("days", {}), plan.get("tasks", [])],
         ensure_ascii=False, sort_keys=True,
     )
     return hashlib.sha1(data.encode()).hexdigest()[:6]
@@ -162,6 +163,8 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
         {
             "name": task["name"], "needed": task["needed"], "max": task["max"],
             "implicit": task["implicit"], "day": task.get("day"),
+            **({"requires_any": task["requires_any"]}
+               if task.get("requires_any") else {}),
         }
         for task in registry.plan_tasks(service_id)
     ]
@@ -718,6 +721,7 @@ def busy_on(plan: dict, day: str, task: str,
         if other != task
         for person in people
         if not {task, other} <= (bundles or {}).get(person, frozenset())
+        and not task_rules.compatible(plan["tasks"], task, other)
     }
 
 
@@ -734,6 +738,12 @@ def candidates(
     for person in summary.people:
         key = person["key"]
         if key in taken or not person["tasks"]:
+            continue
+        anchors = task_rules.dependent_tasks(plan["tasks"]).get(task)
+        if anchors and (
+            task not in person["tasks"]
+            or not any(key in slot_people(plan, day, anchor) for anchor in anchors)
+        ):
             continue
         if key in silent:
             (quiet if task in person["tasks"] else rest).append(key)
@@ -1406,6 +1416,10 @@ async def publish(
     if not service.get("enabled", True):
         raise ValueError("Служение выключено — график не опубликован.")
     people = registry.readiness_people(service["id"])
+    registry.validate_task_assignments(
+        service["id"], plan["slots"], complete=True, month=plan["month"],
+        days=plan.get("days"),
+    )
     settings = registry.get_readiness_settings(service["id"])
     text = publication_text(
         service, plan, people, window_of(registry, service["id"]), settings,

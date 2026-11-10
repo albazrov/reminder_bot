@@ -279,6 +279,7 @@ TEMPLATE_FIELD_HELP = {
     "sunday_date": "дата собрания (воскресенье)",
     "task_assignments": "задачи и ответственные",
     "informational_notes": "информационные заметки графика",
+    "event_notes": "опубликованные заметки к собранию",
     "task": "задача напоминания",
     "task_responsibles": "ответственные этой задачи",
     "delivery_status": "кому включены личные уведомления",
@@ -289,7 +290,7 @@ TEMPLATE_FIELD_HELP = {
     "people": "упоминания опрашиваемых",
 }
 GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments",
-                "informational_notes")
+                "informational_notes", "event_notes")
 REPORT_FIELDS = ("service_name", "sunday_date", "task_assignments",
                  "delivery_status", "confirmation_status")
 READINESS_INTRO_HELP = ("service_name", "month", "deadline", "people")
@@ -741,7 +742,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
-                        "🔢", "🔤", "⛔", "↔️", "📥",
+                        "🔢", "🔤", "⛔", "↔️", "📥", "🌐",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -1567,6 +1568,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         назначение и снятие админов."""
         registry = service_registry()
         items = [("📡 Групповой чат", "service_chat")]
+        if service_id == "assembly":
+            items.append(("📝 Заметки к собранию", "event_notes"))
         if registry and registry.is_super_admin(actor_id):
             items += [
                 ("👤 Назначить админа", "service_admin_add"),
@@ -1574,7 +1577,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ]
         rows = [
             [InlineKeyboardButton(
-                text=label, callback_data=f"service:{operation}:{service_id}",
+                text=label,
+                callback_data=(
+                    "evn:home" if operation == "event_notes"
+                    else f"service:{operation}:{service_id}"
+                ),
             )]
             for label, operation in items
         ]
@@ -4275,6 +4282,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             f"📋 {task['name']}\n\n"
             f"Статус: {'🟢 включена' if task['enabled'] else '🔴 выключена'}.\n"
+            + (
+                "Дополнительная обязанность: ровно один человек из назначенных на "
+                + ", ".join(task["requires_any"]) + ".\n"
+                if task.get("requires_any") else "Основная задача.\n"
+            ) +
             "Выключенные задачи не читаются из графика. "
             "Для настройки напоминаний сначала включите задачу.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -4294,12 +4306,295 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ),
                 )],
                 [InlineKeyboardButton(
+                    text="🔗 Обязанность внутри смены",
+                    callback_data=f"svc_tasks:dep:{service_id}:{session_id}",
+                )],
+                [InlineKeyboardButton(
                     text="⬅️ К задачам",
                     callback_data=f"svc_tasks:open:{service_id}",
                 )],
             ]),
             parse_mode=None,
         )
+
+    async def show_task_dependency(message, actor_id, service_id, page=None):
+        registry = service_registry()
+        pending = pending_inputs[actor_id]
+        tasks = registry.list_service_tasks(service_id)
+        task = next(
+            (item for item in tasks if item["position"] == pending["task_position"]), None,
+        )
+        if task is None:
+            raise ValueError("Задача больше не существует — откройте список заново.")
+        pending["step"] = "task_dependency"
+        selected = pending.setdefault("dependency_anchors", list(task.get("requires_any", [])))
+        session = pending["session_id"]
+        choices = [item for item in tasks if item["name"] != task["name"] and item["enabled"]]
+        page = pending.get("dependency_page", 0) if page is None else page
+        page = max(0, min(page, max(0, (len(choices) - 1) // 3)))
+        pending["dependency_page"] = page
+        rows = layout_buttons([
+            InlineKeyboardButton(
+                text=("✅ " if item["name"] in selected else "⬜ ") + item["name"],
+                callback_data=f"svc_tasks:danchor:{service_id}:{item['position']}:{session}",
+            )
+            for item in choices[page * 3:(page + 1) * 3]
+        ])
+        if len(choices) > 3:
+            rows.append([
+                InlineKeyboardButton(
+                    text="⬅️ Стр.",
+                    callback_data=f"svc_tasks:dpage:{service_id}:{max(0, page - 1)}:{session}",
+                ),
+                InlineKeyboardButton(
+                    text="➡️ Стр.",
+                    callback_data=f"svc_tasks:dpage:{service_id}:{page + 1}:{session}",
+                ),
+            ])
+        rows += [
+            [InlineKeyboardButton(text="✅ Сохранить",
+                                  callback_data=f"svc_tasks:dsave:{service_id}:{session}")],
+            [InlineKeyboardButton(text="Убрать зависимость",
+                                  callback_data=f"svc_tasks:dclear:{service_id}:{session}")],
+            [InlineKeyboardButton(text="⬅️ К задаче",
+                                  callback_data=f"svc_tasks:dback:{service_id}:{session}")],
+        ]
+        await _send_dialog(
+            message,
+            f"📋 {task['name']} › Обязанность внутри смены\n\n"
+            "Выберите основные задачи. Ответственным будет ровно один "
+            "допущенный человек, назначенный на любую из выбранных задач "
+            "в это воскресенье. Например: «старший» или «в смене».\n"
+            "Одна дополнительная обязанность на служение. После сохранения "
+            "пересчитайте черновик; утверждённый график автоматически не меняется.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    def event_note_state(actor_id, **values):
+        state = {
+            "operation": "event_note", "service_id": "assembly",
+            "token": secrets.token_hex(4), **values,
+        }
+        pending_inputs[actor_id] = state
+        return state
+
+    def event_note_button(label, action, state, value=""):
+        return InlineKeyboardButton(
+            text=label,
+            callback_data=f"evn:{action}:{state['token']}:{value}",
+        )
+
+    async def show_event_note_month(message, actor_id, month=None):
+        month = month or datetime.now(context.timezone).date().replace(day=1)
+        state = event_note_state(actor_id, month=month.isoformat())
+        rows = layout_buttons([
+            event_note_button(
+                f"📝 {day:%d.%m}", "day", state, day.isoformat(),
+            )
+            for day in (
+                date.fromisoformat(value)
+                for value in schedule_plan.free_run("assembly", month.year, month.month)["dates"]
+            )
+        ])
+        rows.append([
+            event_note_button("⬅️ Месяц", "month", state,
+                              (month - timedelta(days=1)).replace(day=1).isoformat()),
+            event_note_button("➡️ Месяц", "month", state,
+                              (month_end(month.year, month.month) + timedelta(days=1)).isoformat()),
+        ])
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К настройкам Собрания",
+            callback_data="service:service_setup:assembly",
+        )])
+        await _send_dialog(
+            message, f"СОБРАНИЕ › Заметки › {month_title(month.year, month.month)}\n\n"
+            "Выберите воскресное событие. Опубликованный текст можно включить "
+            "в напоминания других служений полем {event_notes}. "
+            "Публикация сама ничего не рассылает.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    async def show_event_note_detail(message, actor_id, sunday, notice=""):
+        note = service_registry().get_event_note(sunday)
+        state = event_note_state(
+            actor_id, event_sunday=sunday,
+            revision=note["revision"] if note else 0,
+            targets=note["draft_targets"] if note else None,
+        )
+        targets = state["targets"]
+        names = {item["id"]: item["name"] for item in service_registry().list_services()}
+        audience = "все служения" if targets is None else ", ".join(
+            names.get(item, item) for item in targets
+        )
+        text = (
+            f"СОБРАНИЕ › Заметка › {date.fromisoformat(sunday):%d.%m.%Y}\n\n"
+            f"{notice}\n\n" if notice else
+            f"СОБРАНИЕ › Заметка › {date.fromisoformat(sunday):%d.%m.%Y}\n\n"
+        )
+        text += (
+            f"Статус: {'опубликована' if note and note['published'] else 'черновик'}.\n"
+            f"Адресаты черновика: {audience}.\n\n"
+            + (note["draft_body"] if note else "Текста пока нет. Нажмите «Изменить текст».")
+            + "\n\nИзменения черновика видны в напоминаниях только после публикации."
+        )
+        buttons = [
+            event_note_button("✏️ Изменить текст", "text", state),
+            event_note_button("👥 Адресаты", "targets", state),
+            event_note_button("👁 Предпросмотр", "preview", state),
+            event_note_button("✅ Опубликовать", "publish", state),
+        ]
+        if note and note["published"]:
+            buttons.append(event_note_button("⛔ Снять с публикации", "unpublish", state))
+        buttons.append(event_note_button("⬅️ К датам", "dates", state))
+        await _send_dialog(
+            message, text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[item] for item in buttons]),
+            parse_mode=None,
+        )
+
+    async def show_event_note_targets(message, actor_id, page=0):
+        state = pending_inputs[actor_id]
+        services = [item for item in service_registry().list_services() if item["enabled"]]
+        selected = state["targets"]
+        state["token"] = secrets.token_hex(4)
+        state["step"] = "targets"
+        page = max(0, min(page, (len(services) - 1) // 5))
+        state["page"] = page
+        rows = [[event_note_button(
+            ("✅ " if selected is None or item["id"] in selected else "⬜ ") + item["name"],
+            "target", state, item["id"],
+        )] for item in services[page * 5:(page + 1) * 5]]
+        if len(services) > 5:
+            rows.append([
+                event_note_button("⬅️ Стр.", "page", state, str(max(0, page - 1))),
+                event_note_button("➡️ Стр.", "page", state, str(page + 1)),
+            ])
+        rows += [
+            [event_note_button("🌐 Все служения", "all", state)],
+            [event_note_button("✅ Сохранить адресатов", "targetsok", state)],
+            [event_note_button("⬅️ К заметке", "edit", state)],
+        ]
+        await _send_dialog(
+            message, "СОБРАНИЕ › Заметка › Адресаты\n\n"
+            "Выберите служения. «Все служения» включает и добавленные в будущем. "
+            "Адресаты сохранятся в черновике; публикация — отдельным действием.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
+            parse_mode=None,
+        )
+
+    @admin_router.callback_query(F.data.startswith("evn:"))
+    async def on_event_notes(callback: CallbackQuery) -> None:
+        if (not callback.from_user or not callback.message
+                or callback.message.chat.type != ChatType.PRIVATE):
+            await _answer_callback(callback)
+            return
+        actor_id = callback.from_user.id
+        registry = service_registry()
+        try:
+            if registry is None or not is_service_admin(actor_id, "assembly"):
+                raise PermissionError("Заметки доступны администраторам Собрания.")
+            if callback.data == "evn:home":
+                await clean_and_clear_pending_actor(actor_id)
+                await show_event_note_month(callback.message, actor_id)
+            else:
+                parts = callback.data.split(":")
+                state = pending_inputs.get(actor_id) or {}
+                if (len(parts) != 4 or state.get("operation") not in
+                        {"event_note", "event_note_input"} or state.get("token") != parts[2]):
+                    raise ValueError("Этот экран устарел. Откройте заметки заново.")
+                _, action, _, value = parts
+                sunday = state.get("event_sunday")
+                if action == "month":
+                    await show_event_note_month(callback.message, actor_id, date.fromisoformat(value))
+                elif action == "day":
+                    await show_event_note_detail(callback.message, actor_id, value)
+                elif action == "dates":
+                    await show_event_note_month(
+                        callback.message, actor_id, date.fromisoformat(sunday).replace(day=1),
+                    )
+                elif action == "edit":
+                    await show_event_note_detail(callback.message, actor_id, sunday)
+                elif action == "text":
+                    state.update(operation="event_note_input", token=secrets.token_hex(4))
+                    await _send_dialog(
+                        callback.message, "Отправьте текст заметки (до 2000 символов).\n"
+                        "Например: «После собрания общение в большом зале».\n"
+                        "Это текст без автоматических упоминаний людей.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            event_note_button("⬅️ К заметке", "edit", state),
+                        ]]), parse_mode=None,
+                    )
+                elif action in {"targets", "target", "all", "page"}:
+                    if action == "target":
+                        available = {item["id"] for item in registry.list_services() if item["enabled"]}
+                        if value not in available:
+                            raise ValueError("Служение недоступно — откройте заметку заново.")
+                        selected = set(available if state["targets"] is None else state["targets"])
+                        selected.symmetric_difference_update({value})
+                        state["targets"] = sorted(selected)
+                    elif action == "all":
+                        state["targets"] = None
+                    await show_event_note_targets(
+                        callback.message, actor_id, int(value) if action == "page" else state.get("page", 0),
+                    )
+                elif action == "targetsok":
+                    note = registry.get_event_note(sunday)
+                    if not note:
+                        raise ValueError("Сначала сохраните текст заметки.")
+                    registry.save_event_note_draft(
+                        actor_id, sunday, note["draft_body"], state["targets"],
+                        expected_revision=state["revision"],
+                    )
+                    await show_event_note_detail(callback.message, actor_id, sunday, "Адресаты сохранены в черновике.")
+                elif action == "preview":
+                    note = registry.get_event_note(sunday)
+                    state["token"] = secrets.token_hex(4)
+                    await _send_dialog(
+                        callback.message,
+                        "👁 Черновик:\n" + (note["draft_body"] if note else "Нет текста.")
+                        + "\n\nСейчас опубликовано:\n"
+                        + (note["published_body"] if note and note["published"] else "Не опубликовано."),
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            event_note_button("⬅️ К заметке", "edit", state),
+                        ]]), parse_mode=None,
+                    )
+                elif action in {"publish", "unpublish"}:
+                    state["token"] = secrets.token_hex(4)
+                    state["step"] = action
+                    await _send_dialog(
+                        callback.message,
+                        ("Опубликовать черновик для выбранных служений?"
+                         if action == "publish" else "Убрать заметку из будущих напоминаний?")
+                        + "\nУже отправленные сообщения не меняются. Рассылка не запускается.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [event_note_button("✅ Подтвердить", action + "ok", state)],
+                            [event_note_button("⬅️ К заметке", "edit", state)],
+                        ]), parse_mode=None,
+                    )
+                elif action in {"publishok", "unpublishok"}:
+                    if state.get("step") != action[:-2]:
+                        raise ValueError("Подтверждение устарело.")
+                    method = registry.publish_event_note if action == "publishok" else registry.unpublish_event_note
+                    method(actor_id, sunday, expected_revision=state["revision"])
+                    await show_event_note_detail(callback.message, actor_id, sunday, "✅ Сохранено.")
+                else:
+                    raise ValueError("Неизвестное действие — откройте заметки заново.")
+        except (ValueError, PermissionError) as exc:
+            await _answer_callback(callback, f"❌ {exc}")
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось открыть или изменить заметку события")
+            await _answer_callback(callback, "❌ Ошибка базы данных. Попробуйте ещё раз.")
+            return
+        await _answer_callback(callback)
 
     async def show_personal_reminder_summary(
         message: Message,
@@ -7448,6 +7743,52 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 await _answer_callback(callback)
                 return
+            if action in {"dep", "danchor", "dpage", "dsave", "dclear", "dback"}:
+                if len(parts) != (5 if action in {"danchor", "dpage"} else 4):
+                    raise ValueError("Некорректная кнопка — откройте задачу заново.")
+                expected = "task_card" if action == "dep" else "task_dependency"
+                if pending.get("step") != expected:
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                task = next(
+                    (item for item in registry.list_service_tasks(service_id)
+                     if item["position"] == pending.get("task_position")), None,
+                )
+                if task is None:
+                    raise ValueError("Задача больше не существует.")
+                if action == "dep":
+                    pending.pop("dependency_anchors", None)
+                    pending.pop("dependency_page", None)
+                elif action == "dpage":
+                    pending["dependency_page"] = int(parts[3])
+                elif action == "danchor":
+                    anchor = next(
+                        (item for item in registry.list_service_tasks(service_id)
+                         if str(item["position"]) == parts[3] and item["enabled"]),
+                        None,
+                    )
+                    if anchor is None or anchor["name"] == task["name"]:
+                        raise ValueError("Выберите основную задачу из списка.")
+                    selected = pending["dependency_anchors"]
+                    if anchor["name"] in selected:
+                        selected.remove(anchor["name"])
+                    else:
+                        selected.append(anchor["name"])
+                elif action in {"dsave", "dclear"}:
+                    selected = pending["dependency_anchors"] if action == "dsave" else []
+                    if action == "dsave" and not selected:
+                        raise ValueError("Выберите хотя бы одну основную задачу.")
+                    registry.set_task_dependency(actor_id, service_id, task["name"], selected)
+                if action in {"dsave", "dclear", "dback"}:
+                    task = next(
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["name"] == task["name"]
+                    )
+                    await show_service_task_card(callback.message, actor_id, service_id, task)
+                else:
+                    await show_task_dependency(callback.message, actor_id, service_id)
+                await _answer_callback(callback)
+                return
             if action in {
                 "card", "notify", "pick_notify", "tog"
             } and len(parts) == 5:
@@ -9093,7 +9434,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = (
             f"Введите индивидуальный текст напоминания для задачи "
             f"«{display_task}». Шаблоны: {{name}}, {{task}}, {{service_name}}, "
-            f"{{sunday_date}}, {{telegram_id}}, {{username}}.\n\n"
+            f"{{sunday_date}}, {{telegram_id}}, {{username}}, {{event_notes}}.\n\n"
             + await notification_template_preview(
                 actor_id, service_id, task
             )
@@ -13370,7 +13711,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "Отправьте текст напоминания. Заголовок «🔔 служение · "
                     "задача · дата» бот добавит сам. Можно использовать поля "
                     "{name}, {task}, {service_name}, {sunday_date}, "
-                    "{telegram_id}, {username}."
+                    "{telegram_id}, {username}, {event_notes}."
                     if action_name == "rule_text"
                     else "Введите, за сколько дней до первого воскресенья "
                     "месяца (0–6) и во сколько прислать сводку, например: 2 18:30."
@@ -13514,6 +13855,75 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             # Кнопка устарела и нового экрана нет — не оставлять пустоту.
             await drop_screen(message, actor_id, screen.message_id)
             await show_start(message, message.from_user)
+
+    @admin_router.message(
+        F.text & ~F.text.startswith("/"),
+        lambda message: bool(
+            message.from_user
+            and (
+                pending_inputs.get(message.from_user.id) or {}
+            ).get("operation") == "event_note_input"
+        ),
+    )
+    async def on_event_note_text(message: Message) -> None:
+        if (
+            not message.from_user
+            or message.chat.type != ChatType.PRIVATE
+            or not message.text
+        ):
+            return
+        actor_id = message.from_user.id
+        pending = pending_inputs.get(actor_id)
+        registry = service_registry()
+        if (
+            not pending
+            or pending.get("operation") != "event_note_input"
+            or registry is None
+            or not is_service_admin(actor_id, "assembly")
+        ):
+            pending_inputs.pop(actor_id, None)
+            await _send_dialog(
+                message, "Этот ввод устарел. Откройте заметки заново.",
+                parse_mode=None,
+            )
+            return
+        try:
+            registry.save_event_note_draft(
+                actor_id,
+                pending["event_sunday"],
+                message.text,
+                pending.get("targets"),
+                expected_revision=pending["revision"],
+            )
+        except (ValueError, PermissionError) as exc:
+            await _send_dialog(
+                message,
+                f"❌ {exc}\n\nОтправьте текст заметки ещё раз "
+                "или нажмите «Отмена».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="⬅️ К заметке",
+                        callback_data=(
+                            f"evn:edit:{pending['token']}:"
+                        ),
+                    ),
+                ]]),
+                parse_mode=None,
+            )
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось сохранить черновик заметки")
+            await _send_dialog(
+                message, "❌ Не удалось сохранить заметку. Попробуйте ещё раз.",
+                parse_mode=None,
+            )
+            return
+        await show_event_note_detail(
+            message,
+            actor_id,
+            pending["event_sunday"],
+            "Черновик сохранён. Он пока не виден в напоминаниях.",
+        )
 
     @admin_router.message(F.text & ~F.text.startswith("/"))
     async def on_service_parameter(message: Message) -> None:
@@ -14552,10 +14962,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         status = "confirmed" if kind == "c" else "declined"
         try:
-            name, changed = registry.set_confirmation(
+            answers = registry.set_assignment_answer(
                 service_id, event_date.isoformat(), task, cb.from_user.id,
                 status, name=schedule_name,
             )
+            _, name, _ = answers[0]
+            changed = any(item[2] for item in answers)
         except PermissionError:
             await _answer_callback(cb, "❌ Вы не привязаны к этой задаче")
             return
@@ -14569,10 +14981,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         admins_told = None
         if changed and status == "declined" and service:
             try:
-                admins_told = await notify_admins_declined(
-                    context.bot, registry, service, event_date, task,
-                    name, context.admin_id, debug,
-                )
+                admins_told = 0
+                for answered_task, answered_name, answer_changed in answers:
+                    if answer_changed:
+                        admins_told += await notify_admins_declined(
+                            context.bot, registry, service, event_date, answered_task,
+                            answered_name, context.admin_id, debug,
+                        )
             except Exception:  # noqa: BLE001
                 debug.exception("Не удалось сообщить админам об отказе")
                 admins_told = 0
@@ -14592,6 +15007,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "🚫 Ответ сохранён, но сообщить админам не удалось — "
                 "предупредите их сами."
             )
+        if status == "declined" and len(answers) > 1:
+            note += "\nТакже снята готовность к обязанности: " + ", ".join(
+                item[0] for item in answers[1:]
+            ) + ". Администратор должен переназначить её внутри смены."
         await _mark_answered_reminder(cb, note, debug)
         if changed:
             interaction.info(
@@ -14618,10 +15037,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 on_declined = getattr(context, "on_assignment_declined", None)
                 if callable(on_declined):
                     try:
-                        await on_declined(
-                            service_id, event_date, task, name,
-                            telegram_id=cb.from_user.id,
-                        )
+                        for answered_task, answered_name, answer_changed in answers:
+                            if answer_changed:
+                                await on_declined(
+                                    service_id, event_date, answered_task, answered_name,
+                                    telegram_id=cb.from_user.id,
+                                )
                     except Exception:  # noqa: BLE001
                         debug.exception("Не удалось запустить поиск замены")
             try:

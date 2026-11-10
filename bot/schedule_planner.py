@@ -100,6 +100,8 @@ class PlanInput:
     limits: Mapping[str, tuple[int, int | None]] = field(default_factory=dict)
     # Человек → задачи, которые он берёт в одну неделю (звук + спевка).
     bundles: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    dependencies: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    last_duty: Mapping[str, date] = field(default_factory=dict)
     # Человек → порядок ответа на опрос (0 — первый); нет записи — после.
     answer_order: Mapping[str, int] = field(default_factory=dict)
     # Фактический день задачи в неделе графика, с учётом личного дня.
@@ -466,11 +468,13 @@ def _min_cost_matching(
 def _seats(data: PlanInput) -> tuple[list[str], list[str]]:
     """Места на дату: обязательные (минимум задачи) и сверх минимума."""
     required = [
-        task for task, count in data.needed.items() for _ in range(max(0, count))
+        task for task, count in data.needed.items()
+        if task not in data.dependencies for _ in range(max(0, count))
     ]
     optional = [
         task for task, count in data.extra.items()
-        if task in data.needed for _ in range(max(0, count))
+        if task in data.needed and task not in data.dependencies
+        for _ in range(max(0, count))
     ]
     return required, optional
 
@@ -481,6 +485,20 @@ BUNDLE_SEPARATOR = "\x1f"
 
 def build_plan(data: PlanInput) -> Plan:
     """Максимальное покрытие по фактическим дням, не по неделям."""
+    if data.dependencies:
+        if len(data.dependencies) != 1:
+            raise ValueError("Поддерживается одна дополнительная обязанность на служение.")
+        duty, anchors = next(iter(data.dependencies.items()))
+        if (duty not in data.needed or data.needed[duty] != 1 or not anchors
+                or duty in anchors or any(anchor not in data.needed for anchor in anchors)):
+            raise ValueError("Обязанность требует одну основную роль и ровно одного ответственного.")
+        plan = _build_plan(data)
+        protected = {duty, *anchors}
+        _prefer_bundles(plan, replace(data, bundles={
+            person: bundle for person, bundle in data.bundles.items()
+            if not bundle & protected
+        }))
+        return plan
     plan = _build_plan(data)
     _spread_soft_limits(plan, data)
     _prefer_bundles(plan, data)
@@ -975,6 +993,8 @@ def _build_plan(data: PlanInput) -> Plan:
     rank = _priority(data)
     used_days: dict[str, set[date]] = {}
     served_weeks: dict[str, set[date]] = {}
+    duty_counts: dict[str, int] = {}
+    duty_choices: dict[date, str] = {}
 
     def assign_week(event_date: date, seats: list[str], *, required_pass: bool):
         if not seats:
@@ -1068,6 +1088,46 @@ def _build_plan(data: PlanInput) -> Plan:
         ) if not required_pass else _min_cost_matching(
             tokens, seats, allowed, costs
         )
+        if required_pass and data.dependencies:
+            duty, anchors = next(iter(data.dependencies.items()))
+            choices = []
+            for token in tokens:
+                person = token_person[token]
+                if (
+                    token_day[token] != event_date
+                    or duty not in data.tasks.get(person, ())
+                    or not _can_serve(data, person, event_date, duty)
+                    or data.slot_dates.get((event_date, duty, person), event_date) != event_date
+                ):
+                    continue
+                for seat in sorted(allowed[token]):
+                    if seats[seat] not in anchors:
+                        continue
+                    remaining = [
+                        other for other in tokens
+                        if token_person[other] != person or token_day[other] != event_date
+                    ]
+                    candidate = _min_cost_matching(
+                        remaining, seats,
+                        {other: allowed[other] - {seat} for other in remaining},
+                        costs,
+                    )
+                    candidate[seat] = token
+                    score = (
+                        -len(candidate),
+                        sum(costs[value] // scale for value in candidate.values()),
+                        duty_counts.get(person, 0),
+                        data.last_duty.get(person, date.min),
+                        sum(costs[value] for value in candidate.values()),
+                        person, seats[seat],
+                    )
+                    choices.append((score, candidate, person))
+            if choices:
+                _, chosen, person = min(choices, key=lambda item: item[0])
+                if len(chosen) >= len(matching):
+                    matching = chosen
+                    duty_choices[event_date] = person
+                    duty_counts[person] = duty_counts.get(person, 0) + 1
         for seat, token in sorted(matching.items()):
             person = token_person[token]
             task = seats[seat]
@@ -1082,7 +1142,7 @@ def _build_plan(data: PlanInput) -> Plan:
     # могут назначаться одному человеку, только если это разные фактические дни.
     for event_date in sorted(set(data.dates)):
         assign_week(event_date, required, required_pass=True)
-    if plan.gaps():
+    if plan.gaps() and not data.dependencies:
         repair_gaps(plan, data)
         used_days.clear()
         served_weeks.clear()
@@ -1097,13 +1157,18 @@ def _build_plan(data: PlanInput) -> Plan:
         load = plan.load()
     for event_date in sorted(set(data.dates)):
         optional_seats = [
-            task for task, extra in data.extra.items() if task in data.needed
+            task for task, extra in data.extra.items()
+            if task in data.needed and task not in data.dependencies
             for _ in range(max(
                 0, data.needed[task] + extra
                 - len(plan.slots[(event_date, task)])
             ))
         ]
         assign_week(event_date, optional_seats, required_pass=False)
+    if data.dependencies:
+        duty = next(iter(data.dependencies))
+        for event_date, person in duty_choices.items():
+            plan.slots[(event_date, duty)] = [person]
     for people in plan.slots.values():
         people.sort()
     return plan

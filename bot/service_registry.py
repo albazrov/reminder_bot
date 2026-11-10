@@ -8,14 +8,14 @@ import re
 import secrets
 import sqlite3
 import stat
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from string import Formatter
 from dataclasses import replace
 from typing import Callable
 
-from .presentation import is_replaced
+from .presentation import apply_replacements, is_replaced, task_assignment_names
 from .scheduler import periods_overlap, reminder_day_offset
 from .secure_fs import open_private_directory
 from .services import (
@@ -25,6 +25,7 @@ from .services import (
     normalized_name,
     split_day_key,
 )
+from .task_rules import assignment_errors, dependent_tasks
 
 
 GROUP_TEMPLATE_FIELDS = frozenset(
@@ -33,6 +34,7 @@ GROUP_TEMPLATE_FIELDS = frozenset(
         "sunday_date",
         "task_assignments",
         "informational_notes",
+        "event_notes",
         "task",
         "task_responsibles",
     }
@@ -41,7 +43,10 @@ GROUP_TEMPLATE_FIELDS = frozenset(
 # напоминании и шаблоне служения они были бы пустыми.
 GENERAL_GROUP_TEMPLATE_FIELDS = GROUP_TEMPLATE_FIELDS - {"task", "task_responsibles"}
 PERSONAL_TEMPLATE_FIELDS = frozenset(
-    {"name", "task", "service_name", "sunday_date", "telegram_id", "username"}
+    {
+        "name", "task", "service_name", "sunday_date", "telegram_id",
+        "username", "event_notes",
+    }
 )
 DEFAULT_GROUP_TEMPLATE = (
     "Напоминание о служении «{service_name}» в воскресенье "
@@ -569,6 +574,29 @@ class ServiceRegistry:
                     name TEXT PRIMARY KEY
                 );
 
+                CREATE TABLE IF NOT EXISTS event_notes (
+                    event_sunday TEXT PRIMARY KEY,
+                    draft_body TEXT NOT NULL DEFAULT '',
+                    draft_targets_json TEXT NOT NULL DEFAULT 'null',
+                    published_body TEXT,
+                    published_targets_json TEXT,
+                    updated_by INTEGER NOT NULL CHECK (updated_by > 0),
+                    updated_at TEXT NOT NULL,
+                    published_by INTEGER CHECK (
+                        published_by IS NULL OR published_by > 0
+                    ),
+                    published_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS service_task_dependencies (
+                    service_id TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    anchors_json TEXT NOT NULL,
+                    PRIMARY KEY (service_id, task),
+                    FOREIGN KEY (service_id, task)
+                        REFERENCES service_tasks(service_id, name) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS service_members (
                     service_id TEXT NOT NULL REFERENCES services(id)
                         ON DELETE CASCADE,
@@ -977,6 +1005,7 @@ class ServiceRegistry:
                 ("readiness_runs", "options_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("readiness_runs", "reverse_poll",
                  "INTEGER NOT NULL DEFAULT 0"),
+                ("event_notes", "revision", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 columns = {
                     row["name"]
@@ -1667,9 +1696,9 @@ class ServiceRegistry:
             None,
         )
 
-    def list_service_tasks(self, service_id: str) -> list[dict]:
+    def list_service_tasks(self, service_id: str, *, connection=None) -> list[dict]:
         """Задачи служения в порядке каталога, включая выключенные."""
-        with self._connection() as connection:
+        with nullcontext(connection) if connection is not None else self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
                 "people_needed, people_max, day_offset, same_week "
@@ -1677,6 +1706,13 @@ class ServiceRegistry:
                 "ORDER BY position, name",
                 (service_id,),
             ).fetchall()
+            dependencies = {
+                row["task"]: json.loads(row["anchors_json"])
+                for row in connection.execute(
+                    "SELECT task, anchors_json FROM service_task_dependencies "
+                    "WHERE service_id = ?", (service_id,),
+                )
+            }
         return [
             {
                 "name": row["name"],
@@ -1693,21 +1729,24 @@ class ServiceRegistry:
                 # Свой день задачи; None — дни служения раздела «📅 График».
                 "day_offset": row["day_offset"],
                 "same_week": bool(row["same_week"]),
+                "requires_any": dependencies.get(row["name"], []),
             }
             for row in rows
         ]
 
-    def plan_tasks(self, service_id: str) -> list[dict]:
+    def plan_tasks(self, service_id: str, *, connection=None) -> list[dict]:
         """Задачи графика: включённые задачи служения; у служения без задач
         (Уборка, Книги) — одна задача с названием служения и «Нужно людей»
         из настроек раздела «📅 График»."""
-        tasks = self.list_service_tasks(service_id)
+        tasks = self.list_service_tasks(service_id, connection=connection)
         if tasks:
             return [
                 {
                     "name": task["name"], "needed": task["people_needed"],
                     "max": task["people_max"], "position": str(task["position"]),
                     "implicit": False, "day": task["day_offset"],
+                    **({"requires_any": task["requires_any"]}
+                       if task["requires_any"] else {}),
                 }
                 for task in tasks if task["enabled"]
             ]
@@ -1766,6 +1805,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            if not enabled:
+                self._guard_dependency_setting(connection, service_id, task)
             cursor = connection.execute(
                 "UPDATE service_tasks SET enabled = ? "
                 "WHERE service_id = ? AND name = ?",
@@ -1797,6 +1838,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            if count != 1 or maximum != 1:
+                self._guard_dependency_setting(connection, service_id, task, duty_only=True)
             cursor = connection.execute(
                 "UPDATE service_tasks SET people_needed = ?, people_max = ? "
                 "WHERE service_id = ? AND name = ? "
@@ -1833,6 +1876,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            if offset != 0:
+                self._guard_dependency_setting(connection, service_id, task)
             row = connection.execute(
                 "SELECT day_offset FROM service_tasks "
                 "WHERE service_id = ? AND name = ?",
@@ -1897,6 +1942,8 @@ class ServiceRegistry:
         with self._connection() as connection:
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            if flag:
+                self._guard_dependency_setting(connection, service_id, task)
             cursor = connection.execute(
                 "UPDATE service_tasks SET same_week = ? "
                 "WHERE service_id = ? AND name = ?",
@@ -1908,6 +1955,236 @@ class ServiceRegistry:
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "same_week": flag},
             )
+
+    @staticmethod
+    def _guard_dependency_setting(connection, service_id, task, *, duty_only=False):
+        for row in connection.execute(
+            "SELECT task, anchors_json FROM service_task_dependencies WHERE service_id=?",
+            (service_id,),
+        ):
+            if task == row["task"] or (
+                not duty_only and task in json.loads(row["anchors_json"])
+            ):
+                raise ValueError(
+                    "Сначала уберите связь дополнительной обязанности в карточке задачи."
+                )
+
+    def set_task_dependency(
+        self, actor_id: int, service_id: str, task: str, anchors: list[str],
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        if not isinstance(anchors, list) or not all(isinstance(a, str) for a in anchors):
+            raise ValueError("Выберите основные задачи из списка.")
+        anchors = list(dict.fromkeys(anchors))
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_service_editor(connection, actor_id, service_id)
+            rows = connection.execute(
+                "SELECT name, enabled, day_offset FROM service_tasks WHERE service_id=?",
+                (service_id,),
+            ).fetchall()
+            available = {row["name"]: row for row in rows}
+            if task not in available or any(a not in available for a in anchors):
+                raise ValueError("Задача больше не существует.")
+            existing = connection.execute(
+                "SELECT task FROM service_task_dependencies WHERE service_id=?",
+                (service_id,),
+            ).fetchall()
+            if anchors:
+                if any(row["task"] != task for row in existing):
+                    raise ValueError("В служении пока поддерживается одна дополнительная обязанность.")
+                if task in anchors:
+                    raise ValueError("Задача не может зависеть от самой себя.")
+                if any(not available[a]["enabled"] for a in [task, *anchors]):
+                    raise ValueError("Сначала включите выбранные задачи.")
+                if any(available[a]["day_offset"] not in (None, 0) for a in [task, *anchors]):
+                    raise ValueError("Дополнительная обязанность и смена должны быть в воскресенье.")
+                connection.execute(
+                    "INSERT INTO service_task_dependencies VALUES (?, ?, ?) "
+                    "ON CONFLICT(service_id, task) DO UPDATE SET anchors_json=excluded.anchors_json",
+                    (service_id, task, json.dumps(anchors, ensure_ascii=False)),
+                )
+                connection.execute(
+                    "UPDATE service_tasks SET people_needed=1, people_max=1, "
+                    "day_offset=0, same_week=0 WHERE service_id=? AND name=?",
+                    (service_id, task),
+                )
+                for anchor in anchors:
+                    connection.execute(
+                        "UPDATE service_tasks SET day_offset=0, same_week=0 "
+                        "WHERE service_id=? AND name=?", (service_id, anchor),
+                    )
+            else:
+                connection.execute(
+                    "DELETE FROM service_task_dependencies WHERE service_id=? AND task=?",
+                    (service_id, task),
+                )
+            current_tasks = {
+                item["name"]: item
+                for item in self.plan_tasks(service_id, connection=connection)
+            }
+            for row in connection.execute(
+                "SELECT month, tasks_json FROM schedule_plans "
+                "WHERE service_id=? AND month>=?",
+                (service_id, date.today().strftime("%Y-%m")),
+            ).fetchall():
+                snapshot = json.loads(row["tasks_json"])
+                for item in snapshot:
+                    item.pop("requires_any", None)
+                    current = current_tasks.get(item["name"])
+                    if current and current.get("requires_any"):
+                        item["requires_any"] = current["requires_any"]
+                    if current and item["name"] in [task, *anchors]:
+                        item.update(day=current["day"], needed=current["needed"],
+                                    max=current["max"])
+                connection.execute(
+                    "UPDATE schedule_plans SET tasks_json=?, updated_at=?, "
+                    "republish=CASE WHEN approved_json IS NOT NULL THEN 1 ELSE republish END "
+                    "WHERE service_id=? AND month=?",
+                    (json.dumps(snapshot, ensure_ascii=False), _utc_now(),
+                     service_id, row["month"]),
+                )
+            self._audit(connection, actor_id, "task_dependency", service_id,
+                        {"task": task, "anchors": anchors})
+
+    def validate_task_assignments(
+        self, service_id: str, slots: dict, *, tasks: list[dict] | None = None,
+        complete: bool = False, month: str | None = None, days: dict | None = None,
+        connection=None, approved_slot_days: dict | None = None,
+    ) -> None:
+        tasks = self.plan_tasks(service_id, connection=connection) if tasks is None else tasks
+        if not dependent_tasks(tasks):
+            return
+        people = self.readiness_people(service_id, connection=connection)
+        skills = {person["key"]: set(person["tasks"]) for person in people}
+        for person in people:
+            if sum(other["name"] == person["name"] for other in people) == 1:
+                skills.setdefault(person["name"], set()).update(person["tasks"])
+        errors = assignment_errors(tasks, slots, skills, complete=complete)
+        if complete and month:
+            first = date.fromisoformat(month + "-01")
+            sunday = first + timedelta(days=(6 - first.weekday()) % 7)
+            while sunday.month == first.month:
+                if sunday.isoformat() not in slots:
+                    errors.append(f"{sunday:%d.%m.%Y}: обязательная смена отсутствует.")
+                sunday += timedelta(days=7)
+        for day, assigned in slots.items():
+            for duty, anchors in dependent_tasks(tasks).items():
+                if date.fromisoformat(day).weekday() != 6:
+                    errors.append(f"{day}: дополнительная обязанность требуется в воскресенье.")
+                for task in (duty, *anchors):
+                    metadata = next((item for item in tasks if item["name"] == task), {})
+                    if metadata.get("day") not in (None, 0):
+                        errors.append(f"{day} · {task}: обязанность и смена должны быть в воскресенье.")
+                    for person in assigned.get(task, []):
+                        overrides = (days or {}).get(day, {})
+                        frozen = (approved_slot_days or {}).get(day, {}).get(task, {})
+                        if (overrides.get(f"{person}\x1f{task}", overrides.get(person, 0))
+                                or frozen.get(person, 0)):
+                            errors.append(f"{day} · {task}: обязанность и смена должны быть в воскресенье.")
+        if errors:
+            raise ValueError("\n".join(errors))
+
+    def effective_assignments(self, service_id: str, event_date: str, *,
+                              connection=None) -> dict[str, list[str]]:
+        from .schedule_plan import plan_events
+
+        target = date.fromisoformat(event_date)
+        people = self.readiness_people(service_id, connection=connection)
+        result: dict[str, list[str]] = {}
+        with nullcontext(connection) if connection is not None else self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM schedule_plans WHERE service_id=? AND approved_json IS NOT NULL "
+                "AND month BETWEEN ? AND ?",
+                (service_id, (target - timedelta(days=7)).strftime("%Y-%m"),
+                 (target + timedelta(days=7)).strftime("%Y-%m")),
+            ).fetchall()
+            replacements = self.list_replacements(
+                service_id, event_date, connection=connection,
+            )
+        for row in rows:
+            plan = self._schedule_plan(row)
+            for event in plan_events(plan, people):
+                if event.event_date == target:
+                    for assignment in event.assignments:
+                        names = result.setdefault(assignment.task, [])
+                        if assignment.name not in names:
+                            names.append(assignment.name)
+        return {
+            task: list(task_assignment_names(info))
+            for task, info in apply_replacements(
+                result, replacements,
+            ).items()
+        }
+
+    def replacement_assignment_errors(
+        self, service_id: str, event_date: str, task: str, old_name: str, new_name: str,
+        *, connection=None,
+    ) -> list[str]:
+        tasks = self.assignment_tasks(service_id, event_date, connection=connection)
+        if not dependent_tasks(tasks):
+            return []
+        assigned = self.effective_assignments(service_id, event_date, connection=connection)
+        current = assigned.get(task, [])
+        if old_name not in current:
+            return ["Назначение изменилось — откройте график заново."]
+        assigned[task] = [new_name if name == old_name else name for name in current]
+        people = self.readiness_people(service_id, connection=connection)
+        skills = {
+            person["name"]: set(person["tasks"]) for person in people
+            if sum(other["name"] == person["name"] for other in people) == 1
+        }
+        return assignment_errors(tasks, {event_date: assigned}, skills, complete=False)
+
+    def assignment_tasks(self, service_id: str, event_date: str, *,
+                         connection=None) -> list[dict]:
+        with nullcontext(connection) if connection is not None else self._connection() as connection:
+            row = connection.execute(
+                "SELECT approved_tasks_json FROM schedule_plans WHERE service_id=? "
+                "AND month=? AND approved_json IS NOT NULL",
+                (service_id, event_date[:7]),
+            ).fetchone()
+            if row and row["approved_tasks_json"] is not None:
+                return json.loads(row["approved_tasks_json"])
+            return self.plan_tasks(service_id, connection=connection)
+
+    def decline_scope_tasks(
+        self, service_id: str, event_date: str, task: str, telegram_id: int,
+        *, connection=None, name: str | None = None,
+    ) -> list[str]:
+        rules = dependent_tasks(self.assignment_tasks(service_id, event_date, connection=connection))
+        if not rules:
+            return [task]
+        person = self.service_person(service_id, telegram_id, task)
+        if person is None:
+            return [task]
+        assigned = self.effective_assignments(service_id, event_date, connection=connection)
+        scheduled_name = name or person["name"]
+        own = [task_name for task_name, people in assigned.items() if scheduled_name in people]
+        if task not in own:
+            return [task]
+        return [task] + [
+            duty for duty, anchors in rules.items()
+            if task in anchors and duty in own
+        ]
+
+    def set_assignment_answer(
+        self, service_id: str, event_date: str, task: str, telegram_id: int,
+        status: str, *, name: str | None = None,
+    ) -> list[tuple[str, str, bool]]:
+        """A primary-role decline also declines its duty, in one transaction."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            tasks = self.decline_scope_tasks(
+                service_id, event_date, task, telegram_id, connection=connection, name=name,
+            ) if status == "declined" else [task]
+            return [
+                (other, *self.set_confirmation(
+                    service_id, event_date, other, telegram_id, status,
+                    name=name, connection=connection,
+                ))
+                for other in tasks
+            ]
 
     def add_service_task(
         self, actor_id: int, service_id: str, name: str
@@ -2547,6 +2824,8 @@ class ServiceRegistry:
         telegram_id: int,
         status: str,
         name: str | None = None,
+        *,
+        connection=None,
     ) -> tuple[str, bool]:
         """Ответ человека на личное напоминание: (имя, ответ изменился).
 
@@ -2558,7 +2837,7 @@ class ServiceRegistry:
         if status not in {"confirmed", "declined"}:
             raise ValueError("Некорректный ответ")
         date.fromisoformat(event_date)
-        with self._connection() as connection:
+        with nullcontext(connection) if connection is not None else self._connection() as connection:
             self._require_service(connection, service_id)
             contact = connection.execute(
                 "SELECT name FROM responsible_contacts "
@@ -3100,6 +3379,15 @@ class ServiceRegistry:
                 ).fetchall()
                 if is_replaced([dict(row) for row in rows], task, old_name):
                     return False
+            errors = self.replacement_assignment_errors(
+                service_id, event_date, task, old_name, new_name,
+                connection=connection,
+            )
+            if errors:
+                raise ValueError(
+                    "\n".join(errors)
+                    + "\nСначала назначьте дополнительную обязанность другому участнику смены."
+                )
             connection.execute(
                 """
                 INSERT INTO service_replacements (
@@ -3144,10 +3432,11 @@ class ServiceRegistry:
                 )
         return True
 
-    def list_replacements(self, service_id: str, event_date: str) -> list[dict]:
+    def list_replacements(self, service_id: str, event_date: str, *,
+                          connection=None) -> list[dict]:
         """Замены на дату в порядке назначения (цепочки применяются по
         очереди)."""
-        with self._connection() as connection:
+        with nullcontext(connection) if connection is not None else self._connection() as connection:
             rows = connection.execute(
                 "SELECT task, old_name, new_name, telegram_id, username, "
                 "source FROM service_replacements "
@@ -5908,11 +6197,11 @@ class ServiceRegistry:
             )
         return new
 
-    def readiness_people(self, service_id: str) -> list[dict]:
+    def readiness_people(self, service_id: str, *, connection=None) -> list[dict]:
         """Опрашиваемые: состав («Списки» и добавленные в боте) и привязки
         к задачам. Задачи — только включённые; без задач человек в
         распределении не участвует."""
-        with self._connection() as connection:
+        with nullcontext(connection) if connection is not None else self._connection() as connection:
             enabled = {
                 row["name"]
                 for row in connection.execute(
@@ -6378,9 +6667,10 @@ class ServiceRegistry:
         ):
             raise ValueError("День: от вс −6 до вс +6.")
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
             row = connection.execute(
-                "SELECT days_json FROM schedule_plans "
+                "SELECT days_json, slots_json FROM schedule_plans "
                 "WHERE service_id = ? AND month = ?",
                 (service_id, month),
             ).fetchone()
@@ -6398,6 +6688,10 @@ class ServiceRegistry:
                     days.pop(day, None)
             else:
                 days.setdefault(day, {})[key] = offset
+            self.validate_task_assignments(
+                service_id, json.loads(row["slots_json"]), days=days,
+                connection=connection,
+            )
             connection.execute(
                 "UPDATE schedule_plans SET days_json = ?, edited = 1, "
                 "updated_at = ? WHERE service_id = ? AND month = ?",
@@ -6415,6 +6709,7 @@ class ServiceRegistry:
         дни убранных из даты людей отбрасываются."""
         _validate_positive_id(actor_id, "actor_id")
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
             row = connection.execute(
                 "SELECT days_json FROM schedule_plans "
@@ -6442,6 +6737,9 @@ class ServiceRegistry:
                 }
                 if kept:
                     days[day] = kept
+            self.validate_task_assignments(
+                service_id, slots, days=days, connection=connection,
+            )
             connection.execute(
                 "UPDATE schedule_plans SET slots_json = ?, days_json = ?, "
                 "edited = 1, updated_at = ? WHERE service_id = ? AND month = ?",
@@ -6505,6 +6803,22 @@ class ServiceRegistry:
             connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
+            current_rules = dependent_tasks(self.plan_tasks(service_id, connection=connection))
+            names = {task["name"] for task in tasks}
+            if any(
+                not {duty, *anchors} <= names for duty, anchors in current_rules.items()
+            ):
+                raise ValueError("В импорте отсутствуют задачи обязательной смены.")
+            tasks = [
+                {**{key: value for key, value in task.items() if key != "requires_any"},
+                 **({"requires_any": list(current_rules[task["name"]])}
+                    if task["name"] in current_rules else {})}
+                for task in tasks
+            ]
+            self.validate_task_assignments(
+                service_id, slots, complete=True, month=month, days=days,
+                connection=connection, tasks=tasks, approved_slot_days=approved_slot_days,
+            )
             if expected_version is not None:
                 row = connection.execute(
                     "SELECT p.*, s.group_chat_id AS service_chat, "
@@ -6623,7 +6937,12 @@ class ServiceRegistry:
         if message_ids is None and message_id is not None:
             message_ids = [message_id]
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
+            self.validate_task_assignments(
+                service_id, slots, complete=True, month=month, days=days,
+                connection=connection, approved_slot_days=approved_slot_days,
+            )
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
                 "approved_tasks_json = tasks_json, "
@@ -6827,6 +7146,189 @@ class ServiceRegistry:
                 json.dumps(details, ensure_ascii=False, sort_keys=True),
                 _utc_now(),
             ),
+        )
+
+    # Event notes are authored against a Sunday and published as an immutable
+    # snapshot; changing a draft never changes what reminder renderers read.
+    @staticmethod
+    def _event_note_sunday(value: str | date) -> str:
+        from .event_notes import validate_event_sunday
+        return validate_event_sunday(value).isoformat()
+
+    @staticmethod
+    def _event_note_text(body: str) -> str:
+        from .event_notes import validate_event_note_text
+        return validate_event_note_text(body)
+
+    @staticmethod
+    def _check_event_note_revision(connection, sunday, expected_revision):
+        row = connection.execute(
+            "SELECT revision FROM event_notes WHERE event_sunday=?", (sunday,),
+        ).fetchone()
+        actual = row["revision"] if row else 0
+        if expected_revision is not None and actual != expected_revision:
+            raise ValueError("Заметка изменилась. Откройте её заново.")
+
+    @staticmethod
+    def _event_note_dict(row) -> dict | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["draft_targets"] = json.loads(
+            result.pop("draft_targets_json")
+        )
+        published = result.pop("published_targets_json")
+        result["published_targets"] = (
+            json.loads(published) if published is not None else None
+        )
+        result["published"] = result["published_body"] is not None
+        result["source_service_id"] = "assembly"
+        return result
+
+    def get_event_note(self, event_sunday: str | date) -> dict | None:
+        sunday = self._event_note_sunday(event_sunday)
+        with self._connection(notify=False) as connection:
+            row = connection.execute(
+                "SELECT * FROM event_notes WHERE event_sunday = ?", (sunday,)
+            ).fetchone()
+        return self._event_note_dict(row)
+
+    def list_event_notes(self) -> list[dict]:
+        with self._connection(notify=False) as connection:
+            rows = connection.execute(
+                "SELECT * FROM event_notes "
+                "ORDER BY event_sunday DESC"
+            ).fetchall()
+        return [self._event_note_dict(row) for row in rows]
+
+    def save_event_note_draft(
+        self,
+        actor_id: int,
+        event_sunday: str | date,
+        body: str,
+        targets: list[str] | None = None,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict:
+        _validate_positive_id(actor_id, "actor_id")
+        sunday = self._event_note_sunday(event_sunday)
+        body = self._event_note_text(body)
+        if targets is not None:
+            if (
+                not isinstance(targets, (list, tuple))
+                or not targets
+                or any(not isinstance(service_id, str) or not service_id
+                       for service_id in targets)
+            ):
+                raise ValueError("Выберите хотя бы одно служение.")
+            targets = list(dict.fromkeys(targets))
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_service_editor(connection, actor_id, "assembly")
+            self._check_event_note_revision(connection, sunday, expected_revision)
+            if targets is not None:
+                available = {
+                    row["id"] for row in connection.execute(
+                        "SELECT id FROM services WHERE archived=0 AND enabled=1"
+                    )
+                }
+                if not set(targets) <= available:
+                    raise ValueError("Выбрано неизвестное или отключённое служение.")
+            connection.execute(
+                "INSERT INTO event_notes "
+                "(event_sunday, draft_body, draft_targets_json, updated_by, "
+                "updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(event_sunday) DO UPDATE SET "
+                "draft_body=excluded.draft_body, "
+                "draft_targets_json=excluded.draft_targets_json, "
+                "updated_by=excluded.updated_by, updated_at=excluded.updated_at, "
+                "revision=event_notes.revision+1",
+                (
+                    sunday, body,
+                    json.dumps(targets, ensure_ascii=False),
+                    actor_id, now,
+                ),
+            )
+            self._audit(
+                connection, actor_id, "event_note_draft", "assembly",
+                {"event_sunday": sunday},
+            )
+        return self.get_event_note(sunday)
+
+    def publish_event_note(
+        self, actor_id: int, event_sunday: str | date, *,
+        expected_revision: int | None = None,
+    ) -> dict:
+        _validate_positive_id(actor_id, "actor_id")
+        sunday = self._event_note_sunday(event_sunday)
+        now = _utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_service_editor(connection, actor_id, "assembly")
+            self._check_event_note_revision(connection, sunday, expected_revision)
+            row = connection.execute(
+                "SELECT draft_body, draft_targets_json FROM event_notes "
+                "WHERE event_sunday = ?", (sunday,),
+            ).fetchone()
+            if row is None or not row["draft_body"].strip():
+                raise ValueError("Сначала сохраните текст заметки.")
+            connection.execute(
+                "UPDATE event_notes SET published_body=draft_body, "
+                "published_targets_json=draft_targets_json, published_by=?, "
+                "published_at=?, revision=revision+1 WHERE event_sunday=?",
+                (actor_id, now, sunday),
+            )
+            self._audit(
+                connection, actor_id, "event_note_publish", "assembly",
+                {"event_sunday": sunday},
+            )
+        return self.get_event_note(sunday)
+
+    def unpublish_event_note(
+        self, actor_id: int, event_sunday: str | date, *,
+        expected_revision: int | None = None,
+    ) -> bool:
+        _validate_positive_id(actor_id, "actor_id")
+        sunday = self._event_note_sunday(event_sunday)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_service_editor(connection, actor_id, "assembly")
+            self._check_event_note_revision(connection, sunday, expected_revision)
+            cursor = connection.execute(
+                "UPDATE event_notes SET published_body=NULL, "
+                "published_targets_json=NULL, published_by=NULL, "
+                "published_at=NULL, revision=revision+1 WHERE event_sunday=? "
+                "AND published_body IS NOT NULL",
+                (sunday,),
+            )
+            if cursor.rowcount:
+                self._audit(
+                    connection, actor_id, "event_note_unpublish", "assembly",
+                    {"event_sunday": sunday},
+                )
+        return cursor.rowcount > 0
+
+    def resolve_event_note(self, service_id: str, event_sunday: str | date) -> str:
+        """Return the published note for a service without changing registry state."""
+        sunday = self._event_note_sunday(event_sunday)
+        with self._connection(notify=False) as connection:
+            row = connection.execute(
+                "SELECT published_body, published_targets_json "
+                "FROM event_notes WHERE event_sunday = ?",
+                (sunday,),
+            ).fetchone()
+        if row is None or row["published_body"] is None:
+            return ""
+        targets = (
+            json.loads(row["published_targets_json"])
+            if row["published_targets_json"] is not None
+            else None
+        )
+        return (
+            row["published_body"]
+            if targets is None or service_id in targets
+            else ""
         )
 
 
