@@ -66,6 +66,7 @@ from .replacement import (
 )
 from .notifier import CONFIRM_PREFIX, TELEGRAM_TEXT_LIMIT, _notify_admin
 from . import readiness, schedule_plan
+from .personal_reminders import personal_reminder_forecast
 from .month_summary import (
     linked_assignments,
     month_summary_text,
@@ -4135,8 +4136,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def show_personal_reminder_summary(
         message: Message,
+        actor_id: int,
         service_id: str,
         back_callback_data: str,
+        *,
+        month: date | None = None,
+        page: int = 0,
     ) -> None:
         registry = service_registry()
         service = service_by_id(registry, service_id) if registry else None
@@ -4144,55 +4149,112 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Служение не найдено.", parse_mode=None)
             return
 
-        schedules = [
-            item
-            for item in registry.list_enabled_user_reminder_schedules()
-            if item["service_id"] == service_id
-        ]
-        by_person: dict[tuple[int, str], list[str]] = {}
-        for item in schedules:
-            by_person.setdefault(
-                (item["actor_id"], item["name"]), []
-            ).append(
-                f"{item['task']} — "
-                f"{_rule_label(item['reminder_days'], item['reminder_time'])}"
+        now = datetime.now(context.timezone)
+        current = now.date().replace(day=1)
+        following = date(*next_month(current.year, current.month), 1)
+        month = month or current
+        if month not in (current, following):
+            raise ValueError("Доступны только текущий и следующий месяц.")
+        pending = pending_inputs[actor_id]
+        token = secrets.token_urlsafe(8)
+        pending["step"] = "personal_summary"
+        pending["personal_summary"] = {
+            "token": token, "service_id": service_id,
+            "back": back_callback_data,
+        }
+        try:
+            entries = personal_reminder_forecast(
+                registry, actor_id, service_id, month, now,
+            )
+        except (sqlite3.Error, OSError, RuntimeError, ValueError):
+            debug.exception("Не удалось построить сводку личных напоминаний")
+            entries = [
+                "❌ Не удалось прочитать график и настройки уведомлений. "
+                "Прогноз недоступен. Нажмите «Обновить» или вернитесь позже."
+            ]
+        pages = [""]
+        for entry in entries:
+            for chunk in _telegram_text_chunks(entry, 2800):
+                combined = "\n\n".join(filter(None, (pages[-1], chunk)))
+                if visible_units(combined) > 2800:
+                    pages.append(chunk)
+                else:
+                    pages[-1] = combined
+        page = min(max(page, 0), len(pages) - 1)
+
+        def action(
+            label: str, selected: date, number: int = 0,
+        ) -> InlineKeyboardButton:
+            return InlineKeyboardButton(
+                text=label,
+                callback_data=f"psum:{token}:{selected:%Y%m}:{number}",
             )
 
-        lines = [
-            f"📊 {service_label(service)} · сводка личных напоминаний",
-            "",
-        ]
-        if by_person:
-            lines.extend(
-                f"• {name}: {'; '.join(sorted(rules))}"
-                for (_, name), rules in sorted(
-                    by_person.items(),
-                    key=lambda entry: (entry[0][1].casefold(), entry[0][0]),
-                )
-            )
-        else:
-            lines.append(
-                "ℹ️ Нет ответственных, у которых сейчас включены личные "
-                "уведомления."
-            )
-        lines += [
-            "",
-            "Время указано относительно даты служения. Напоминание будет "
-            "отправлено, если на эту дату есть утверждённый в боте график "
-            "и человек назначен на задачу.",
-        ]
+        rows = [[
+            action("📅 Текущий месяц", current),
+            action("📅 Следующий месяц", following),
+        ]]
+        paging = []
+        if page:
+            paging.append(action("⬅️ Предыдущее", month, page - 1))
+        if page + 1 < len(pages):
+            paging.append(action("➡️ Далее", month, page + 1))
+        if paging:
+            rows.append(paging)
+        rows.append([action("🔄 Обновить", month, page)])
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К напоминаниям", callback_data=back_callback_data,
+        )])
         await _send_dialog(
             message,
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="⬅️ К напоминаниям",
-                    callback_data=back_callback_data,
-                )
-            ]]),
+            f"📊 {service_label(service)} › Напомнить › Сводка\n"
+            f"{month_title(month.year, month.month)} · часовой пояс: {context.timezone}\n"
+            f"Прогноз на {now:%d.%m.%Y %H:%M}, не гарантия доставки Telegram.\n\n"
+            f"{pages[page]}\n\nСтраница {page + 1}/{len(pages)}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None,
             _dialog_text_limit=4000,
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=6,
         )
+
+    @admin_router.callback_query(F.data.startswith("psum:"))
+    async def on_personal_summary_page(callback: CallbackQuery) -> None:
+        if (
+            not callback.from_user or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        parts = callback.data.split(":")
+        pending = pending_inputs.get(callback.from_user.id)
+        state = pending.get("personal_summary") if pending else None
+        if (
+            len(parts) != 4 or state is None
+            or pending.get("step") != "personal_summary"
+            or state["token"] != parts[1]
+        ):
+            await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+            return
+        try:
+            if not is_service_admin(callback.from_user.id, state["service_id"]):
+                raise PermissionError("Недостаточно прав.")
+            month = datetime.strptime(parts[2], "%Y%m").date()
+            page = int(parts[3])
+            if page < 0:
+                raise ValueError("Некорректная страница.")
+            await show_personal_reminder_summary(
+                callback.message, callback.from_user.id, state["service_id"],
+                state["back"], month=month, page=page,
+            )
+        except (PermissionError, ValueError) as exc:
+            await _answer_callback(callback, f"⚠️ {exc}")
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось проверить права на сводку")
+            await _answer_callback(callback, "❌ Не удалось проверить права.")
+            return
+        await _answer_callback(callback)
 
     async def show_service_reminder_choices(
         message: Message, actor_id: int, service_id: str,
@@ -7753,6 +7815,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending["step"] = "personal_summary"
                 await show_personal_reminder_summary(
                     callback.message,
+                    actor_id,
                     service_id,
                     f"group_reminder:summary_back:{service_id}:{session_id}",
                 )
@@ -9950,8 +10013,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise PermissionError(
                         "Настройки доступны только администратору этого служения."
                     )
+                pending_inputs[callback.from_user.id] = {
+                    "operation": "personal_summary", "service_id": service_id,
+                }
                 await show_personal_reminder_summary(
                     callback.message,
+                    callback.from_user.id,
                     service_id,
                     f"service:service_reminders:{service_id}",
                 )

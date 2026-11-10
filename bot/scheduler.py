@@ -31,6 +31,12 @@ def reminder_send_date(event_date: date, reminder_days: int) -> date:
     return event_date - timedelta(days=reminder_days)
 
 
+def reminder_send_datetime(event_date: date, days: int, clock: str, tz) -> datetime:
+    return datetime.combine(
+        reminder_send_date(event_date, days), time.fromisoformat(clock), tzinfo=tz
+    )
+
+
 def _period_bound(value) -> date | None:
     if value is None or isinstance(value, date):
         return value
@@ -106,7 +112,6 @@ def next_reminder_occurrence(
     """Ближайшее (день события, дата отправки); None — период завершён.
     День события — воскресенье, а у задачи со своим днём — воскресенье
     плюс day_offset. Период «с — по» — по воскресеньям недели."""
-    send_time = time.fromisoformat(reminder_time)
     # Первое воскресенье, день события которого — сегодня или позже.
     start = now.date() - timedelta(days=day_offset)
     sunday = start + timedelta(days=(6 - start.weekday()) % 7)
@@ -120,8 +125,8 @@ def next_reminder_occurrence(
             return None
         event_date = sunday + timedelta(days=day_offset)
         send_date = reminder_send_date(event_date, reminder_days)
-        send_datetime = datetime.combine(
-            send_date, send_time, tzinfo=now.tzinfo
+        send_datetime = reminder_send_datetime(
+            event_date, reminder_days, reminder_time, now.tzinfo
         )
         if send_datetime >= now:
             return event_date, send_date

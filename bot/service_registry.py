@@ -5372,6 +5372,87 @@ class ServiceRegistry:
                 })
         return result
 
+    def list_service_user_reminder_schedules(
+        self, actor_id: int, service_id: str,
+    ) -> list[dict]:
+        """All rules, including disabled ones and rules without a contact."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            rows = connection.execute(
+                "SELECT s.id AS schedule_id, s.text_id, s.reminder_days, "
+                "s.reminder_time, t.actor_id, t.service_id, t.task, "
+                "s.body, s.origin, services.name AS service_name, "
+                "services.enabled AS service_enabled, "
+                "p.enabled AS notifications_enabled, s.enabled AS schedule_enabled "
+                "FROM user_reminder_schedules s "
+                "JOIN user_reminder_texts t ON t.id = s.text_id "
+                "JOIN services ON services.id = t.service_id "
+                "LEFT JOIN user_notification_prefs p "
+                "ON p.service_id = t.service_id AND p.actor_id = t.actor_id "
+                "WHERE t.service_id = ? ORDER BY s.id",
+                (service_id,),
+            ).fetchall()
+            contacts = connection.execute(
+                "SELECT task, telegram_id, name, username "
+                "FROM responsible_contacts WHERE service_id = ? ORDER BY name",
+                (service_id,),
+            ).fetchall()
+        by_contact = {}
+        for contact in contacts:
+            by_contact.setdefault((contact["task"], contact["telegram_id"]), contact)
+        result = []
+        for row in rows:
+            contact = by_contact.get((row["task"], row["actor_id"]))
+            result.append({
+                **dict(row),
+                "notifications_enabled": bool(row["notifications_enabled"]),
+                "name": contact["name"] if contact else None,
+                "username": contact["username"] if contact else "",
+            })
+        return result
+
+    def get_personal_reminder_forecast_state(
+        self, actor_id: int, service_id: str, first: date, last: date,
+    ) -> tuple[
+        set[tuple[int, str]], dict[tuple[str, str, int], str], set[int],
+    ]:
+        """Read deliveries, answers and enabled recipients in bulk."""
+        _validate_positive_id(actor_id, "actor_id")
+        if last < first:
+            raise ValueError("Конец периода не может быть раньше начала.")
+        parameters = (service_id, first.isoformat(), last.isoformat())
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            deliveries = connection.execute(
+                "SELECT d.schedule_id, d.event_date "
+                "FROM user_reminder_deliveries d "
+                "JOIN user_reminder_schedules s ON s.id = d.schedule_id "
+                "JOIN user_reminder_texts t ON t.id = s.text_id "
+                "WHERE t.service_id = ? AND d.event_date BETWEEN ? AND ?",
+                parameters,
+            ).fetchall()
+            confirmations = connection.execute(
+                "SELECT event_date, task, telegram_id, status "
+                "FROM service_confirmations "
+                "WHERE service_id = ? AND event_date BETWEEN ? AND ?",
+                parameters,
+            ).fetchall()
+            preferences = connection.execute(
+                "SELECT actor_id FROM user_notification_prefs "
+                "WHERE service_id = ? AND enabled = 1",
+                (service_id,),
+            ).fetchall()
+        return (
+            {(row["schedule_id"], row["event_date"]) for row in deliveries},
+            {
+                (row["event_date"], row["task"], row["telegram_id"]): row["status"]
+                for row in confirmations
+            },
+            {row["actor_id"] for row in preferences},
+        )
+
     def get_user_reminder_schedule(self, schedule_id: int) -> dict | None:
         _validate_positive_id(schedule_id, "schedule_id")
         with self._connection() as connection:

@@ -14,8 +14,10 @@ from aiogram.types import ReplyKeyboardRemove
 
 from bot.excel_parser import ServiceAssignment, ServiceEvent
 from bot.handlers import register, router
+from bot.month_summary import month_title, next_month
 from bot.navigation import NAV_CANCEL_TEXT, NAV_HINT, NAV_HOME_TEXT
 from bot.service_registry import ServiceRegistry
+from bot.ui import visible_units
 
 
 def _confirmation_handler():
@@ -2028,6 +2030,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             handler_name = "on_notification_setting_cancel"
         elif button.callback_data.startswith("rdy:"):
             handler_name = "on_readiness"
+        elif button.callback_data.startswith("psum:"):
+            handler_name = "on_personal_summary_page"
         else:
             handler_name = "on_group_reminder_action"
         await self.callback_handler(handler_name)(callback)
@@ -7235,7 +7239,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_service_reminder_summary_lists_enabled_recipients_and_times(self):
+    def test_service_reminder_summary_includes_disabled_recipients_and_no_approval(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)
             self.registry.set_group_chat(
@@ -7285,9 +7289,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text = summary.message.answer.await_args.args[0]
             self.assertIn("Алексей", text)
             self.assertIn("Микшер", text)
-            self.assertIn("за 2 дн. в 18:30", text)
-            self.assertIn("утверждённый в боте график", text)
-            self.assertNotIn("Мария", text)
+            self.assertIn("за 2 дня в 18:30", text)
+            self.assertIn("не утверждён", text)
+            self.assertIn("Мария", text)
+            self.assertIn("часовой пояс: UTC", text)
+            self.assertIn("Прогноз на", text)
             self.assertNotIn("24680", text)
 
         asyncio.run(run())
@@ -7321,6 +7327,121 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 picker.message, lambda button: button.text.endswith("🎚️ звук")
             )
             self.assertIn("звук", task.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_summary_month_refresh_paging_stale_buttons_and_revoked_access(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            for index in range(70):
+                person = 30000 + index
+                self.registry.set_responsible_contact(
+                    67890, "sound", "Микшер", f"Участник {index:02}", person,
+                )
+                text_id = self.registry.ensure_user_text(person, "sound", "Микшер")
+                self.registry.add_schedule(text_id, 1, "18:00")
+            opening = SimpleNamespace(
+                data="service:service_reminder_summary:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""), answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(opening)
+            shown_names = set()
+            page_message = opening.message
+            while True:
+                page_text = page_message.answer.await_args.args[0]
+                self.assertLessEqual(visible_units(page_text), 4000)
+                shown_names.update(
+                    f"Участник {index:02}" for index in range(70)
+                    if f"Участник {index:02}" in page_text
+                )
+                page_markup = page_message.answer.await_args.kwargs["reply_markup"]
+                if not any(
+                    item.text == "➡️ Далее"
+                    for row in page_markup.inline_keyboard for item in row
+                ):
+                    break
+                moved = await self._click(
+                    page_message, lambda item: item.text == "➡️ Далее",
+                    actor_id=24680,
+                )
+                page_message = moved.message
+            self.assertEqual(len(shown_names), 70)
+            # Start a fresh screen before exercising token invalidation.
+            opening = SimpleNamespace(
+                data="service:service_reminder_summary:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""), answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(opening)
+            original = opening.message.answer.await_args.kwargs["reply_markup"]
+            original_next = next(
+                item for row in original.inline_keyboard for item in row
+                if item.text == "➡️ Далее"
+            )
+            second = await self._click(
+                opening.message, lambda item: item.text == "➡️ Далее", actor_id=24680,
+            )
+            text = second.message.answer.await_args.args[0]
+            self.assertIn("Страница 2/", text)
+            stale = SimpleNamespace(
+                data=original_next.callback_data,
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""), answer=AsyncMock(),
+            )
+            await self.callback_handler("on_personal_summary_page")(stale)
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            stale.message.answer.assert_not_awaited()
+            following = await self._click(
+                second.message, lambda item: item.text == "📅 Следующий месяц",
+                actor_id=24680,
+            )
+            now = datetime.now(self.context.timezone)
+            expected = date(*next_month(now.year, now.month), 1)
+            self.assertIn(
+                month_title(expected.year, expected.month),
+                following.message.answer.await_args.args[0],
+            )
+            refreshed = await self._click(
+                following.message, lambda item: item.text == "🔄 Обновить",
+                actor_id=24680,
+            )
+            markup = refreshed.message.answer.await_args.kwargs["reply_markup"]
+            self.assertLessEqual(sum(map(len, markup.inline_keyboard)), 6)
+            self.registry.remove_service_admin(67890, "sound", 24680)
+            denied = await self._click(
+                refreshed.message, lambda item: item.text == "🔄 Обновить",
+                actor_id=24680,
+            )
+            denied.message.answer.assert_not_awaited()
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+            self.context.bot.send_message.assert_not_awaited()
+            self.context.load_service_task_assignments.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_summary_database_failure_is_an_error_with_retry(self):
+        async def run():
+            self.registry.add_service_admin(67890, "sound", 24680)
+            opening = SimpleNamespace(
+                data="service:service_reminder_summary:sound",
+                from_user=SimpleNamespace(id=24680),
+                message=self.message(24680, ""), answer=AsyncMock(),
+            )
+            with patch.object(
+                self.registry, "get_schedule_plan",
+                side_effect=sqlite3.OperationalError("database unavailable"),
+            ):
+                await self.callback_handler("on_service_selected")(opening)
+            text = opening.message.answer.await_args.args[0]
+            self.assertIn("Прогноз недоступен", text)
+            self.assertNotIn("Нет ответственных", text)
+            self.context.debug_logger.exception.assert_called()
+            retry = await self._click(
+                opening.message, lambda item: item.text == "🔄 Обновить",
+                actor_id=24680,
+            )
+            self.assertNotIn("Прогноз недоступен", retry.message.answer.await_args.args[0])
 
         asyncio.run(run())
 
