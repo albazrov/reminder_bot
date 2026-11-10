@@ -706,6 +706,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if chat_type == ChatType.PRIVATE
             else None
         )
+        if (chat_type == ChatType.PRIVATE
+                and text.lstrip().startswith(("❌", "⚠️"))
+                and (markup is None or isinstance(markup, InlineKeyboardMarkup))):
+            rows = (
+                [list(row) for row in markup.inline_keyboard]
+                if isinstance(markup, InlineKeyboardMarkup) else []
+            )
+            previous_back = (nav_state.get(actor_id) or {}).get("back")
+            if not rows or back_callback(InlineKeyboardMarkup(inline_keyboard=rows)) is None:
+                rows.append([InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=previous_back or "menu:start",
+                )])
+            if not any(
+                button.text == "🏠 В начало"
+                for row in rows for button in row
+            ):
+                rows.append([InlineKeyboardButton(
+                    text="🏠 В начало", callback_data="menu:start",
+                )])
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
         # Карточка после /here не сбрасывает листание других меню админа.
         if chat_type != SERVICE_CARD_CHAT_TYPE:
             for token, page_state in list(pending_dialog_pages.items()):
@@ -742,7 +763,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
-                        "🔢", "🔤", "⛔", "↔️", "📥", "🌐",
+                        "🔢", "🔤", "⛔", "↔️", "📥", "🌐", "🧮",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -767,7 +788,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if button.text.startswith((
                         "⬅️ К ", "↩️ К ", "📅 К графику",
                         "👤 Выбрать пользователя Telegram",
+                        "🏠 В начало",
                     ))
+                    or (
+                        button.text == "⬅️ Назад"
+                        and text.lstrip().startswith(("❌", "⚠️"))
+                    )
                 ]
                 pageable_buttons = [
                     button for button in buttons
@@ -5078,7 +5104,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 text="📥 Загрузить с диска",
                 callback_data=f"service:service_excel:{service_id}",
             ),
-        ], [readiness_button("🗳 Опрос", "open", service_id)]]
+        ], [
+            readiness_button("🗳 Опрос", "open", service_id),
+            readiness_button(
+                "🧮 Авто", "pfree", service_id, month.strftime("%Y%m"),
+            ),
+        ]]
         paging = []
         if page:
             paging.append(readiness_button(
@@ -6173,6 +6204,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         """Действия «📋 График» (этап 5.4–5.5)."""
         registry = service_registry()
         service_id = service["id"]
+        if action in {"plan", "pok"}:
+            pending = pending_inputs.get(actor_id) or {}
+            if pending.get("operation") == "plan_warning":
+                pending_inputs.pop(actor_id, None)
         if action in {"padd", "prem", "pclear", "pnew", "pday", "pdset"}:
             pending = pending_inputs.get(actor_id) or {}
             key = plan_month((pending.get("month") or "").replace("-", ""), now)
@@ -6203,7 +6238,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else:
                     plan = await schedule_plan.build_draft(
                         registry, schedule_plan.free_run(service_id, year, month),
-                        loader, debug,
+                        None, debug,
                     )
             if plan is None:
                 await show_readiness(callback.message, service_id, notice)
@@ -6524,7 +6559,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parse_mode=None,
             )
         elif action == "pokok":
-            await _answer_callback(callback, "⏳ Публикую…")
+            await _answer_callback(callback, "⏳ Проверяю график…")
             rev = schedule_plan.revision(plan)
             async with readiness.service_lock(service_id):
                 run = registry.get_readiness_run(service_id, key)
@@ -6543,9 +6578,55 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     notice = "ℹ️ Изменений нет — график уже опубликован"
                 else:
                     try:
+                        warnings = registry.task_assignment_warnings(
+                            service_id, plan["slots"], complete=True, month=key,
+                            days=plan.get("days"),
+                        )
+                        pending = pending_inputs.get(actor_id) or {}
+                        warning_token = parts[1] if len(parts) == 2 else None
+                        acknowledged = (
+                            warnings if warning_token
+                            and pending.get("operation") == "plan_warning"
+                            and pending.get("service_id") == service_id
+                            and pending.get("month") == key
+                            and pending.get("revision") == rev
+                            and pending.get("token") == warning_token
+                            and pending.get("warnings") == warnings
+                            else None
+                        )
+                        if warnings and acknowledged is None:
+                            token = secrets.token_hex(4)
+                            pending_inputs[actor_id] = {
+                                "operation": "plan_warning", "service_id": service_id,
+                                "month": key, "revision": rev, "token": token,
+                                "warnings": warnings,
+                            }
+                            await _send_dialog(
+                                callback.message,
+                                "⚠️ График требует внимания\n\n"
+                                + "\n".join(warnings)
+                                + "\n\nОтветственные не будут удалены или заменены. "
+                                "График можно утвердить как есть, приняв эти "
+                                "предупреждения, или вернуться и исправить его.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [readiness_button(
+                                        "⚠️ Утвердить с предупреждениями", "pokok",
+                                        service_id, plan_arg(plan, token),
+                                    )],
+                                    [readiness_button(
+                                        "⬅️ К графику", "plan", service_id,
+                                        key.replace("-", ""),
+                                    )],
+                                ]),
+                                _dialog_keep_rows=True,
+                                _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                                parse_mode=None,
+                            )
+                            return
                         plan = await schedule_plan.publish(
                             context.bot, registry, service, plan, actor_id,
                             debug, TELEGRAM_TEXT_LIMIT,
+                            acknowledged_warnings=acknowledged,
                         )
                     except ValueError as exc:
                         notice = f"⚠️ {exc}"
@@ -6561,7 +6642,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         debug.exception("Не удалось опубликовать график")
                         notice = "❌ Не удалось опубликовать график в чате"
                     else:
+                        if pending_inputs.get(actor_id, {}).get("operation") == "plan_warning":
+                            pending_inputs.pop(actor_id, None)
                         notice = "✅ График утверждён и опубликован в чате служения"
+                        if plan.get("approval_warnings"):
+                            notice += "\n⚠️ Предупреждения сохранены вместе с графиком."
                         if not plan.get("pinned", True):
                             notice += (
                                 "\n⚠️ Закрепить не удалось — сделайте бота "
@@ -6719,7 +6804,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ):
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
-            if action in {
+            if (action == "pokok" and member_pending
+                    and member_pending.get("operation") == "plan_warning"):
+                await clean_previous_menu(callback.message, debug)
+                member_pending.pop("menu_message_id", None)
+            elif action in {
                 "addmt", "addms", "padd", "prem", "pclear", "pnew", "pday",
                 "pdset", "ownp", "owns",
             }:
@@ -7614,7 +7703,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             pending = pending_inputs.get(actor_id)
             if (
-                action not in {"ok", "no"} or pending is None
+                action not in {"ok", "warnok", "no"} or pending is None
                 or pending.get("operation") != "excel_import"
                 or pending.get("service_id") != service_id
                 or pending.get("token") != arg
@@ -7658,7 +7747,47 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     {**loaded, "service_id": service_id},
                     people,
                 )
-                pending_inputs.pop(actor_id, None)
+                warnings = registry.task_assignment_warnings(
+                    service_id, loaded["slots"], tasks=loaded["tasks"],
+                    complete=True, month=pending["month"], days=loaded["days"],
+                    approved_slot_days=approved_days,
+                )
+                acknowledged = (
+                    warnings if action == "warnok"
+                    and pending.get("warnings") == warnings else None
+                )
+                if warnings and acknowledged is None:
+                    token = secrets.token_urlsafe(6)
+                    pending.update(token=token, warnings=warnings)
+                    lines = [
+                        "⚠️ График из Excel требует внимания", "",
+                        *warnings, "",
+                        "Ответственные сохранятся как в Excel. "
+                        "Утвердить график с этими предупреждениями?",
+                    ]
+                    rows = [
+                        [InlineKeyboardButton(
+                            text="⚠️ Утвердить с предупреждениями",
+                            callback_data=f"xls:warnok:{service_id}:{token}",
+                        )],
+                        [InlineKeyboardButton(
+                            text="⬅️ К загрузке графика",
+                            callback_data=f"xls:no:{service_id}:{token}",
+                        )],
+                    ]
+                    chunks = _telegram_text_chunks("\n".join(lines))
+                    for index, chunk in enumerate(chunks):
+                        if pending_inputs.get(actor_id) is not pending:
+                            return
+                        await _send_dialog(
+                            message, chunk, parse_mode=None,
+                            reply_markup=(
+                                InlineKeyboardMarkup(inline_keyboard=rows)
+                                if index == len(chunks) - 1 else None
+                            ),
+                            _dialog_keep_rows=True,
+                        )
+                    return
                 registry.import_excel_plan(
                     actor_id, service_id, pending["month"],
                     dates=loaded["dates"], tasks=loaded["tasks"],
@@ -7666,7 +7795,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     served_offsets=offsets,
                     approved_slot_days=approved_days,
                     expected_version=pending["version"],
+                    acknowledged_warnings=acknowledged,
                 )
+                pending_inputs.pop(actor_id, None)
             year, month = map(int, pending["month"].split("-"))
             await show_excel_schedule(
                 message, actor_id, service,
@@ -7675,12 +7806,28 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         except (PermissionError, ValueError) as exc:
             await _send_dialog(
-                message, _status_text(str(exc), "❌"), parse_mode=None
+                message, _status_text(str(exc), "❌")
+                + "\n\nЗагрузите исправленный график заново.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="⬅️ К загрузке графика",
+                        callback_data=f"service:service_excel:{service_id}",
+                    ),
+                ]]),
+                parse_mode=None,
             )
         except sqlite3.Error:
             debug.exception("Не удалось сохранить график из Excel")
             await _send_dialog(
-                message, "❌ Ошибка базы данных.", parse_mode=None
+                message,
+                "❌ Ошибка базы данных. Загрузите график заново и повторите.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="⬅️ К загрузке графика",
+                        callback_data=f"service:service_excel:{service_id}",
+                    ),
+                ]]),
+                parse_mode=None,
             )
 
     @admin_router.callback_query(F.data.startswith("svc_tasks:"))

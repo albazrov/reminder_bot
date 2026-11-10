@@ -25,7 +25,7 @@ from .services import (
     normalized_name,
     split_day_key,
 )
-from .task_rules import assignment_errors, dependent_tasks
+from .task_rules import AssignmentWarnings, assignment_errors, assignment_issues, dependent_tasks
 
 
 GROUP_TEMPLATE_FIELDS = frozenset(
@@ -992,6 +992,7 @@ class ServiceRegistry:
                 ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("schedule_plans", "approved_tasks_json", "TEXT"),
                 ("schedule_plans", "approved_slot_days_json", "TEXT"),
+                ("schedule_plans", "approval_warnings_json", "TEXT"),
                 ("schedule_plans", "message_ids_json", "TEXT"),
                 ("schedule_plans", "baseline_json", "TEXT"),
                 ("schedule_plans", "thread_id", "INTEGER"),
@@ -2047,26 +2048,26 @@ class ServiceRegistry:
             self._audit(connection, actor_id, "task_dependency", service_id,
                         {"task": task, "anchors": anchors})
 
-    def validate_task_assignments(
+    def task_assignment_warnings(
         self, service_id: str, slots: dict, *, tasks: list[dict] | None = None,
         complete: bool = False, month: str | None = None, days: dict | None = None,
         connection=None, approved_slot_days: dict | None = None,
-    ) -> None:
+    ) -> list[str]:
         tasks = self.plan_tasks(service_id, connection=connection) if tasks is None else tasks
         if not dependent_tasks(tasks):
-            return
+            return []
         people = self.readiness_people(service_id, connection=connection)
         skills = {person["key"]: set(person["tasks"]) for person in people}
         for person in people:
             if sum(other["name"] == person["name"] for other in people) == 1:
                 skills.setdefault(person["name"], set()).update(person["tasks"])
-        errors = assignment_errors(tasks, slots, skills, complete=complete)
+        errors, warnings = assignment_issues(tasks, slots, skills, complete=complete)
         if complete and month:
             first = date.fromisoformat(month + "-01")
             sunday = first + timedelta(days=(6 - first.weekday()) % 7)
             while sunday.month == first.month:
                 if sunday.isoformat() not in slots:
-                    errors.append(f"{sunday:%d.%m.%Y}: обязательная смена отсутствует.")
+                    warnings.append(f"{sunday:%d.%m.%Y}: обязательная смена отсутствует.")
                 sunday += timedelta(days=7)
         for day, assigned in slots.items():
             for duty, anchors in dependent_tasks(tasks).items():
@@ -2084,6 +2085,21 @@ class ServiceRegistry:
                             errors.append(f"{day} · {task}: обязанность и смена должны быть в воскресенье.")
         if errors:
             raise ValueError("\n".join(errors))
+        return warnings
+
+    def validate_task_assignments(
+        self, service_id: str, slots: dict, *, tasks: list[dict] | None = None,
+        complete: bool = False, month: str | None = None, days: dict | None = None,
+        connection=None, approved_slot_days: dict | None = None,
+        acknowledged_warnings: list[str] | None = None,
+    ) -> list[str]:
+        warnings = self.task_assignment_warnings(
+            service_id, slots, tasks=tasks, complete=complete, month=month,
+            days=days, connection=connection, approved_slot_days=approved_slot_days,
+        )
+        if warnings and warnings != acknowledged_warnings:
+            raise AssignmentWarnings(warnings)
+        return warnings
 
     def effective_assignments(self, service_id: str, event_date: str, *,
                               connection=None) -> dict[str, list[str]]:
@@ -6524,6 +6540,9 @@ class ServiceRegistry:
         plan["approved_slot_days"] = (
             json.loads(approved_slot_days) if approved_slot_days else {}
         )
+        plan["approval_warnings"] = json.loads(
+            plan.pop("approval_warnings_json", None) or "[]"
+        )
         message_ids = plan.pop("message_ids_json", None)
         # Опубликован до шага 5б — известна только первая часть.
         plan["message_ids"] = (
@@ -6688,7 +6707,7 @@ class ServiceRegistry:
                     days.pop(day, None)
             else:
                 days.setdefault(day, {})[key] = offset
-            self.validate_task_assignments(
+            self.task_assignment_warnings(
                 service_id, json.loads(row["slots_json"]), days=days,
                 connection=connection,
             )
@@ -6737,7 +6756,7 @@ class ServiceRegistry:
                 }
                 if kept:
                     days[day] = kept
-            self.validate_task_assignments(
+            self.task_assignment_warnings(
                 service_id, slots, days=days, connection=connection,
             )
             connection.execute(
@@ -6792,6 +6811,7 @@ class ServiceRegistry:
         served_offsets: dict | None = None,
         approved_slot_days: dict | None = None,
         expected_version: str | None = None,
+        acknowledged_warnings: list[str] | None = None,
     ) -> dict:
         """«📊 График Excel» → «✅ Подтвердить» (решение 15): график месяца
         из Excel как есть — итоговый график в боте (утверждён, без
@@ -6815,9 +6835,10 @@ class ServiceRegistry:
                     if task["name"] in current_rules else {})}
                 for task in tasks
             ]
-            self.validate_task_assignments(
+            warnings = self.validate_task_assignments(
                 service_id, slots, complete=True, month=month, days=days,
                 connection=connection, tasks=tasks, approved_slot_days=approved_slot_days,
+                acknowledged_warnings=acknowledged_warnings,
             )
             if expected_version is not None:
                 row = connection.execute(
@@ -6842,9 +6863,9 @@ class ServiceRegistry:
                 "last_served_json, note, edited, approved_json, approved_by, "
                 "approved_at, chat_id, message_id, republish, days_json, "
                 "approved_days_json, served_offsets_json, approved_tasks_json, "
-                "approved_slot_days_json, updated_at) "
+                "approved_slot_days_json, approval_warnings_json, updated_at) "
                 "VALUES (?, ?, NULL, 'excel', ?, ?, ?, '{}', NULL, 0, ?, ?, ?, "
-                "NULL, NULL, 0, ?, ?, ?, ?, ?, ?) "
+                "NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id, month) DO UPDATE SET run_id = NULL, "
                 "source = 'excel', dates_json = excluded.dates_json, "
                 "tasks_json = excluded.tasks_json, "
@@ -6860,6 +6881,7 @@ class ServiceRegistry:
                 "served_offsets_json = excluded.served_offsets_json, "
                 "approved_tasks_json = excluded.approved_tasks_json, "
                 "approved_slot_days_json = excluded.approved_slot_days_json, "
+                "approval_warnings_json = excluded.approval_warnings_json, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, month, values[0], values[1], values[2],
@@ -6867,12 +6889,13 @@ class ServiceRegistry:
                     json.dumps(served_offsets or {}, ensure_ascii=False),
                     values[1],
                     json.dumps(approved_slot_days or {}, ensure_ascii=False),
+                    json.dumps(warnings, ensure_ascii=False),
                     now,
                 ),
             )
             self._audit(
                 connection, actor_id, "schedule_plan_excel", service_id,
-                {"month": month},
+                {"month": month, "warnings": warnings},
             )
         return self.get_schedule_plan(service_id, month)
 
@@ -6897,6 +6920,7 @@ class ServiceRegistry:
                 "approved_by = NULL, approved_at = NULL, "
                 "approved_days_json = NULL, approved_tasks_json = NULL, "
                 "served_offsets_json = NULL, approved_slot_days_json = NULL, "
+                "approval_warnings_json = NULL, "
                 "baseline_json = NULL, "
                 # Загруженный из Excel перестаёт быть итоговым: дальше
                 # график — по новому опросу.
@@ -6927,6 +6951,7 @@ class ServiceRegistry:
         baseline: dict | None = None,
         thread_id: int | None = None,
         target_thread_id: int | None = None,
+        acknowledged_warnings: list[str] | None = None,
     ) -> dict:
         """«✅ Утвердить»: опубликованная копия = slots. updated_at —
         версия опубликованного графика: если дни служения сменились, пока
@@ -6939,9 +6964,10 @@ class ServiceRegistry:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
-            self.validate_task_assignments(
+            warnings = self.validate_task_assignments(
                 service_id, slots, complete=True, month=month, days=days,
                 connection=connection, approved_slot_days=approved_slot_days,
+                acknowledged_warnings=acknowledged_warnings,
             )
             cursor = connection.execute(
                 "UPDATE schedule_plans SET approved_json = ?, approved_by = ?, "
@@ -6951,6 +6977,7 @@ class ServiceRegistry:
                 "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
                 "approved_slot_days_json = ?, "
+                "approval_warnings_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
                 "WHERE service_id = ? AND month = ?",
@@ -6964,6 +6991,7 @@ class ServiceRegistry:
                     json.dumps(days or {}, ensure_ascii=False),
                     json.dumps(served_offsets or {}, ensure_ascii=False),
                     json.dumps(approved_slot_days or {}, ensure_ascii=False),
+                    json.dumps(warnings, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,
                 ),
             )
@@ -6971,7 +6999,7 @@ class ServiceRegistry:
                 raise ValueError("График не найден — откройте его заново.")
             self._audit(
                 connection, actor_id, "schedule_plan_approved", service_id,
-                {"month": month},
+                {"month": month, "warnings": warnings},
             )
         return self.get_schedule_plan(service_id, month)
 

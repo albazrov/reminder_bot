@@ -123,7 +123,7 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertIn("неутверждённые правки", text)
             self.assertEqual(
                 [item.text for item in self.buttons(shown)],
-                ["🔁 Замены", "📥 Загрузить с диска", "🗳 Опрос", "⬅️ К служению"],
+                ["🔁 Замены", "📥 Загрузить с диска", "🗳 Опрос", "🧮 Авто", "⬅️ К служению"],
             )
             self.context.load_upcoming_service_events.assert_not_awaited()
             self.context.load_service_task_assignments.assert_not_awaited()

@@ -671,6 +671,8 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     problems = gaps(plan)
     if problems:
         lines += [""] + problems
+    if plan.get("approval_warnings") and plan["approved"] is not None:
+        lines += ["", "⚠️ При утверждении приняты предупреждения:"] + plan["approval_warnings"]
     # Задача без людей во все даты, хотя её выполняют люди состава, —
     # обычно её включили после составления черновика.
     able = {task for person in summary.people for task in person["tasks"]}
@@ -740,10 +742,7 @@ def candidates(
         if key in taken or not person["tasks"]:
             continue
         anchors = task_rules.dependent_tasks(plan["tasks"]).get(task)
-        if anchors and (
-            task not in person["tasks"]
-            or not any(key in slot_people(plan, day, anchor) for anchor in anchors)
-        ):
+        if anchors and task not in person["tasks"]:
             continue
         if key in silent:
             (quiet if task in person["tasks"] else rest).append(key)
@@ -778,6 +777,12 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
         notes.append(f"⚠️ не отметил(а) {service_day:%d.%m}")
     if person is not None and task not in person["tasks"]:
         notes.append(f"⚠️ не приписан(а) к «{task}»")
+    anchors = task_rules.dependent_tasks(plan["tasks"]).get(task)
+    if anchors and not any(
+        key in slot_people(plan, day, anchor) for anchor in anchors
+    ):
+        notes.append("⚠️ ответственный не входит в смену; "
+                     "при утверждении потребуется подтверждение")
     near = [
         other for other in sorted(served_days(plan, summary.people).get(key, ()))
         if other != service_day
@@ -979,6 +984,8 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                 f"  {task_emoji(task['name'])} {task['name']}", keys,
                 "    ", empty, mention,
             )
+    if plan.get("approval_warnings"):
+        lines += ["", "⚠️ Утверждено с предупреждениями:"] + plan["approval_warnings"]
     if update:
         baseline = published_baseline(plan)
         changes = change_lines(
@@ -1175,7 +1182,7 @@ def month_overview(registry, actor_id: int, service_id: str, month: date) -> str
     if selected is None:
         status = (
             "⚪ Графика на текущий месяц пока нет.\n"
-            "Загрузите его с диска или создайте через «Опрос»."
+            "Загрузите его с диска или создайте через «Опрос» / «Авто»."
         )
     elif selected["approved"] is None:
         status = "📝 Не утверждён.\nНапоминания по этому графику не отправляются."
@@ -1183,6 +1190,10 @@ def month_overview(registry, actor_id: int, service_id: str, month: date) -> str
         status = "✅ Утверждённый график с актуальными заменами."
         if selected["dirty"]:
             status += "\nЕсть неутверждённые правки; ниже действует прежний график."
+        if selected.get("approval_warnings"):
+            status += "\n\n⚠️ При утверждении приняты предупреждения:\n" + "\n".join(
+                selected["approval_warnings"]
+            )
     assignments: dict[date, dict[str, list[str]]] = {}
     cursor = (first - timedelta(days=7)).replace(day=1)
     while cursor <= last + timedelta(days=7):
@@ -1402,7 +1413,8 @@ async def _edit_publication(bot, chat_id: int, message_ids: list[int],
 
 async def publish(
     bot, registry, service: dict, plan: dict, actor_id: int,
-    logger: logging.Logger, text_limit: int,
+    logger: logging.Logger, text_limit: int, *,
+    acknowledged_warnings: list[str] | None = None,
 ) -> dict:
     """«✅ Утвердить»: график в чат служения, затем отметка в базе.
     Первая публикация закрепляется; обновление правит закреплённую и
@@ -1416,10 +1428,12 @@ async def publish(
     if not service.get("enabled", True):
         raise ValueError("Служение выключено — график не опубликован.")
     people = registry.readiness_people(service["id"])
-    registry.validate_task_assignments(
+    warnings = registry.validate_task_assignments(
         service["id"], plan["slots"], complete=True, month=plan["month"],
         days=plan.get("days"),
+        acknowledged_warnings=acknowledged_warnings,
     )
+    plan = {**plan, "approval_warnings": warnings}
     settings = registry.get_readiness_settings(service["id"])
     text = publication_text(
         service, plan, people, window_of(registry, service["id"]), settings,
@@ -1548,6 +1562,7 @@ async def publish(
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
                 served_offsets=served_offsets(plan, people),
                 approved_slot_days=approved_slot_days(plan, people),
+                acknowledged_warnings=warnings,
             )
             break
         except Exception as exc:  # noqa: BLE001

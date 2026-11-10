@@ -14,6 +14,7 @@ from bot.excel_parser import RosterMember
 from bot.schedule_planner import PlanInput, build_plan
 from bot.service_registry import ServiceRegistry
 from bot.task_rules import assignment_errors
+from bot.task_rules import AssignmentWarnings
 
 
 SUNDAYS = tuple(date(2026, 11, 1) + timedelta(weeks=i) for i in range(5))
@@ -147,9 +148,9 @@ class DependentRegistryTest(unittest.TestCase):
             1001, "kitchen", "2026-11", self.slots, chat_id=None, message_id=None,
         )
 
-    def test_editor_rejects_outsider_duplicate_and_primary_conflicts(self):
+    def test_editor_rejects_missing_permit_duplicate_and_primary_conflicts(self):
         for changes, error in (
-            ({DUTY: ["C"]}, "в смене"),
+            ({DUTY: ["C"]}, "допуска"),
             ({DUTY: ["B", "A"]}, "ровно один"),
             ({HEAD: ["A", "A"]}, "дважды"),
             ({TEAM: ["A"]}, "разными"),
@@ -161,6 +162,37 @@ class DependentRegistryTest(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, error):
                 self.registry.set_schedule_slots(1001, "kitchen", "2026-11", slots)
         self.assertEqual(self.registry.get_schedule_plan("kitchen", "2026-11")["slots"], self.slots)
+
+    def test_manual_outside_team_can_be_selected_edited_and_approved(self):
+        day = SUNDAYS[0].isoformat()
+        slots = {**self.slots, day: {HEAD: ["A"], TEAM: ["C"], DUTY: []}}
+        plan = self.registry.set_schedule_slots(1001, "kitchen", "2026-11", slots)
+        summary = schedule_plan.plan_summary(self.registry, plan, None)
+        self.assertIn("B", sum(schedule_plan.candidates(plan, summary, day, DUTY), []))
+        self.assertNotIn("C", sum(schedule_plan.candidates(plan, summary, day, DUTY), []))
+        slots[day][DUTY] = ["B"]
+        edited = self.registry.set_schedule_slots(1001, "kitchen", "2026-11", slots)
+        self.assertEqual(edited["slots"][day][DUTY], ["B"])
+        self.assertIsNone(edited["approved"])
+        self.assertTrue(any("не входит в смену" in note for note in
+                            schedule_plan.choice_notes(edited, summary, "B", day, DUTY)))
+        self.registry.set_schedule_day(1001, "kitchen", "2026-11", day, "B", 0)
+        with self.assertRaisesRegex(ValueError, "воскресенье"):
+            self.registry.set_schedule_day(1001, "kitchen", "2026-11", day, "B", -1)
+        warnings = self.registry.task_assignment_warnings(
+            "kitchen", slots, complete=True, month="2026-11",
+        )
+        self.assertEqual(warnings, [f"{day} · {DUTY}: ответственный не входит в смену."])
+        with self.assertRaises(AssignmentWarnings):
+            self.registry.approve_schedule_plan(
+                1001, "kitchen", "2026-11", slots, chat_id=None, message_id=None,
+            )
+        saved = self.registry.approve_schedule_plan(
+            1001, "kitchen", "2026-11", slots, chat_id=None, message_id=None,
+            acknowledged_warnings=warnings,
+        )
+        self.assertEqual(saved["approved"][day][DUTY], ["B"])
+        self.assertEqual(saved["approval_warnings"], warnings)
 
     def test_missing_duty_or_sunday_or_team_blocks_import_and_approval(self):
         for slots in (
@@ -212,7 +244,7 @@ class DependentRegistryTest(unittest.TestCase):
     def test_replacements_require_duty_to_stay_inside_team(self):
         self.approve()
         replace_person = self.registry.set_replacement
-        with self.assertRaisesRegex(ValueError, "в смене"):
+        with self.assertRaisesRegex(ValueError, "в смену"):
             replace_person("kitchen", "2026-11-01", HEAD, "A", "C", 503, "", "admin", 1001)
         with self.assertRaisesRegex(ValueError, "допуска"):
             replace_person("kitchen", "2026-11-01", DUTY, "A", "C", 503, "", "admin", 1001)
@@ -280,6 +312,98 @@ class DependentRegistryTest(unittest.TestCase):
         plan["slots"]["2026-11-01"][DUTY] = []
         candidates = schedule_plan.candidates(plan, summary, "2026-11-01", DUTY)
         self.assertEqual(set(sum(candidates, [])), {"A", "B"})
+
+    def test_incomplete_plan_requires_exact_warning_acknowledgement(self):
+        slots = {day: {**values, DUTY: [], TEAM: []}
+                 for day, values in self.slots.items()}
+        del slots["2026-11-08"]
+        warnings = self.registry.task_assignment_warnings(
+            "kitchen", slots, complete=True, month="2026-11",
+        )
+        self.assertTrue(any("не назначен" in item for item in warnings))
+        self.assertTrue(any("не хватает" in item for item in warnings))
+        self.assertTrue(any("отсутствует" in item for item in warnings))
+        for acknowledged in (None, warnings[:-1]):
+            with self.assertRaises(AssignmentWarnings):
+                self.registry.approve_schedule_plan(
+                    1001, "kitchen", "2026-11", slots, chat_id=None,
+                    message_id=None, acknowledged_warnings=acknowledged,
+                )
+        saved = self.registry.approve_schedule_plan(
+            1001, "kitchen", "2026-11", slots, chat_id=None,
+            message_id=None, acknowledged_warnings=warnings,
+        )
+        self.assertEqual(saved["approved"], slots)
+        self.assertEqual(saved["approval_warnings"], warnings)
+        self.registry.initialize(1001, -10001)
+        self.assertEqual(
+            self.registry.get_schedule_plan("kitchen", "2026-11")["approval_warnings"],
+            warnings,
+        )
+
+    def test_excel_outside_team_preserved_after_warning_confirmation(self):
+        slots = {day: {**values, TEAM: ["C"], DUTY: ["B"]}
+                 for day, values in self.slots.items()}
+        warnings = self.registry.task_assignment_warnings(
+            "kitchen", slots, complete=True, month="2026-11",
+        )
+        self.assertTrue(all("не входит в смену" in item for item in warnings))
+        kwargs = dict(
+            dates=list(slots), tasks=schedule_plan.plan_tasks(self.registry, "kitchen"),
+            slots=slots, days={},
+        )
+        with self.assertRaises(AssignmentWarnings):
+            self.registry.import_excel_plan(1001, "kitchen", "2026-11", **kwargs)
+        saved = self.registry.import_excel_plan(
+            1001, "kitchen", "2026-11", **kwargs,
+            acknowledged_warnings=warnings,
+        )
+        self.assertEqual(saved["approved"], slots)
+        self.assertEqual(saved["approval_warnings"], warnings)
+        self.assertIn("не входит в смену", schedule_plan.month_overview(
+            self.registry, 1001, "kitchen", SUNDAYS[0],
+        ))
+
+    def test_acknowledgement_does_not_override_structural_errors(self):
+        slots = {**self.slots, "2026-11-01": {
+            HEAD: ["A"], TEAM: ["B"], DUTY: ["A", "B"],
+        }}
+        with self.assertRaisesRegex(ValueError, "ровно один"):
+            self.registry.approve_schedule_plan(
+                1001, "kitchen", "2026-11", slots, chat_id=None, message_id=None,
+                acknowledged_warnings=["anything"],
+            )
+
+    def test_publish_keeps_accepted_warnings_in_message_and_snapshot(self):
+        plan = self.registry.get_schedule_plan("kitchen", "2026-11")
+        for assigned in plan["slots"].values():
+            assigned[DUTY] = []
+        warnings = self.registry.task_assignment_warnings(
+            "kitchen", plan["slots"], complete=True, month="2026-11",
+        )
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=55)),
+            pin_chat_message=AsyncMock(), delete_message=AsyncMock(),
+        )
+        service = {
+            **self.registry.get_service("kitchen"),
+            "enabled": True, "group_chat_id": -123,
+        }
+        with self.assertRaises(AssignmentWarnings):
+            asyncio.run(schedule_plan.publish(
+                bot, self.registry, service, plan, 1001,
+                logging.getLogger("test-dependencies"), 4096,
+            ))
+        bot.send_message.assert_not_awaited()
+        saved = asyncio.run(schedule_plan.publish(
+            bot, self.registry, service,
+            plan, 1001, logging.getLogger("test-dependencies"), 4096,
+            acknowledged_warnings=warnings,
+        ))
+        self.assertEqual(saved["approval_warnings"], warnings)
+        self.assertIn("Утверждено с предупреждениями", "".join(
+            call.args[1] for call in bot.send_message.await_args_list
+        ))
 
 
 class DependentHandlerTest(unittest.TestCase):
