@@ -368,6 +368,35 @@ class DependentRegistryTest(unittest.TestCase):
             "kitchen", "2026-11-08", TEAM, 502,
         ), [TEAM])
 
+    def test_unknown_account_cannot_inherit_namesakes_duty_permissions(self):
+        self.slots = {day: {HEAD: ["A"], TEAM: ["B"], DUTY: ["B"]}
+                      for day in self.slots}
+        self.registry.set_schedule_slots(1001, "kitchen", "2026-11", self.slots)
+        self.approve()
+        day = "2026-11-01"
+        poll = {
+            "poll_id": "test", "service_id": "kitchen", "event_date": day,
+            "task": DUTY, "old_name": "B", "old_telegram_id": 502,
+        }
+        stranger = {"telegram_id": 999, "can": True, "full_name": "A", "username": ""}
+        member = {**stranger, "telegram_id": 501}
+        with patch.object(self.registry, "list_poll_answers", return_value=[stranger]):
+            self.assertIsNone(replacement.choose_volunteer(self.registry, poll))
+        with patch.object(self.registry, "list_poll_answers", return_value=[stranger, member]):
+            self.assertEqual(replacement.choose_volunteer(self.registry, poll), member)
+        for task in (DUTY, TEAM):
+            with self.subTest(task=task), self.assertRaisesRegex(ValueError, "аккаунт"):
+                self.registry.set_replacement(
+                    "kitchen", day, task, "B", "A", 999, "", "admin", 1001,
+                )
+        self.assertEqual(self.registry.list_replacements("kitchen", day), [])
+        self.assertEqual(self.registry.replacement_assignment_errors(
+            "kitchen", day, DUTY, "B", "A", telegram_id=501,
+        ), [])
+        self.assertEqual(self.registry.replacement_assignment_errors(
+            "kitchen", day, HEAD, "A", "Гость", telegram_id=999,
+        ), [])
+
     def test_duty_rotation_uses_previous_month_replacements(self):
         days = readiness.month_sundays(2026, 10)
         slots = {day.isoformat(): {HEAD: ["A"], TEAM: ["B"], DUTY: ["A"]}

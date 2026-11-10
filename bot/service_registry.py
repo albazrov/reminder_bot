@@ -2155,6 +2155,13 @@ class ServiceRegistry:
         ]
         if len(candidates) > 1:
             return ["Уточните Telegram-аккаунт заменяющего участника."]
+        if telegram_id is not None and not candidates and any(
+            person["name"] == new_name or person["key"] == new_name for person in people
+        ):
+            return [
+                "Telegram-аккаунт заменяющего не совпадает с участником с таким именем. "
+                "Подключите его аккаунт в составе служения и выберите замену заново."
+            ]
         new_key = candidates[0] if candidates else new_name
         skills = {
             person["key"]: set(person["tasks"]) for person in people
