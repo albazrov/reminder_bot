@@ -124,7 +124,7 @@ async def last_served(
     try:
         # Под service_lock: зависшая загрузка не должна держать служение.
         events = await asyncio.wait_for(
-            events_loader(since=first, until=last), LOADER_TIMEOUT
+            events_loader(since=first, until=last, excel_only=True), LOADER_TIMEOUT
         )
     except Exception:  # noqa: BLE001
         logger.warning(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import signal
@@ -48,6 +49,8 @@ if __package__:
         SheetEmptyError,
         SheetNotFoundError,
         ServiceEvent,
+        ServiceAssignment,
+        parse_workbook_service_events,
         parse_service_events,
         parse_service_rosters,
         resolve_assignments,
@@ -89,7 +92,7 @@ if __package__:
     )
     from .service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from .state import StateCache
-    from .yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public
+    from .yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public, source_version
     from .backup import (
         BackupManager,
         application_instance_lock,
@@ -114,6 +117,8 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         SheetEmptyError,
         SheetNotFoundError,
         ServiceEvent,
+        ServiceAssignment,
+        parse_workbook_service_events,
         parse_service_events,
         parse_service_rosters,
         resolve_assignments,
@@ -155,7 +160,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
     from bot.state import StateCache
-    from bot.yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public
+    from bot.yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public, source_version
     from bot.backup import (
         BackupManager,
         application_instance_lock,
@@ -489,8 +494,14 @@ async def _download_schedule(
     logger: logging.Logger,
     *,
     backup_manager: BackupManager | None = None,
+    cache_dir: Path | None = None,
     **options: Any,
 ) -> Path:
+    if cache_dir is not None:
+        options.update(
+            cache_dir=cache_dir,
+            validate=lambda candidate: parse_workbook_service_events(candidate, logger),
+        )
     await download_public(public_url, path, logger, **options)
     if backup_manager is not None:
         try:
@@ -534,6 +545,7 @@ async def _prepare_test_notification_previews(
             attempts=1,
             interval=0,
             backup_manager=backup_manager,
+            cache_dir=shm_dir / "schedule-source",
         )
         schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
         people = parse_people(xlsx_path, debug_logger)
@@ -570,14 +582,85 @@ async def _download_backup_schedule(
     public_url: str,
     path: Path,
     logger: logging.Logger,
+    *,
+    shm_dir: Path | None = None,
+    registry: ServiceRegistry | None = None,
 ) -> None:
+    options = {}
+    if shm_dir is not None:
+        options = {
+            "cache_dir": shm_dir / "schedule-source",
+            "validate": lambda candidate: parse_workbook_service_events(candidate, logger),
+        }
     await download_public(
         public_url,
         path,
         logger,
         attempts=RETRY_ATTEMPTS,
         interval=RETRY_INTERVAL,
+        **options,
     )
+    if registry is not None:
+        await _refresh_schedule_reference_data(
+            registry, public_url, path, logger,
+            shm_dir / "schedule-source" if shm_dir is not None else None,
+        )
+
+
+async def _refresh_schedule_reference_data(
+    registry, public_url: str, path: Path, logger, cache_dir: Path | None = None,
+) -> None:
+    services = registry.service_catalog()
+    events = await asyncio.to_thread(parse_workbook_service_events, path, logger, services)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    current = source_version(public_url, cache_dir) if cache_dir is not None else None
+    if current is not None and current != digest:
+        logger.info("Устаревший результат обновления Excel пропущен")
+        return
+    notes = [
+        [event.service_id, event.event_date.isoformat(), item.task, item.name]
+        for event in events for item in event.assignments if item.is_informational
+    ]
+    source_key = hashlib.sha256(public_url.encode()).hexdigest()
+    registry.save_schedule_notes(source_key, digest, notes)
+    service_rows = registry.list_services()
+    for index, service in enumerate(service_rows):
+        assignments = _service_event_assignments([
+            event for event in events if event.service_id == service["id"]
+        ])
+        if index == 0:
+            _sync_rosters_and_contacts(
+                registry, path, service["id"], assignments, services, logger, None
+            )
+        else:
+            try:
+                registry.ensure_member_contacts(service["id"], assignments)
+            except Exception:
+                logger.exception("Не удалось дополнить привязки участников служения %s", service["id"])
+
+
+def _saved_note_events(registry, public_url: str, first: date, last: date) -> list:
+    notes = registry.get_schedule_notes(hashlib.sha256(public_url.encode()).hexdigest())
+    return [
+        ServiceEvent(service, date.fromisoformat(day), (
+            ServiceAssignment(task, name, is_informational=True),
+        ))
+        for service, day, task, name in notes
+        if first.isoformat() <= day <= last.isoformat()
+    ]
+
+
+def _approved_service_events(
+    registry, public_url: str, first: date, last: date, *,
+    with_replacements: bool = True,
+) -> list:
+    notes = _saved_note_events(registry, public_url, first, last)
+    events = _apply_bot_plans(notes, registry, first, last, approved_only=True)
+    for service_id in sorted({event.service_id for event in events}):
+        registry.ensure_member_contacts(service_id, _service_event_assignments([
+            event for event in events if event.service_id == service_id
+        ]))
+    return _apply_event_replacements(events, registry) if with_replacements else events
 
 
 async def _notify_super_admins(
@@ -641,21 +724,16 @@ async def _load_service_task_assignments(
 ) -> dict[str, dict[str, object]] | tuple[dict[str, dict[str, object]], bool]:
     """Назначения служения из графика; issues пополняется предупреждениями.
 
-    С registry заодно обновляется состав служений из «Списков», а люди,
-    уже привязанные к Telegram, получают привязки к новым задачам графика.
+    Люди с Telegram получают привязки к новым задачам графика из БД.
+    Только явная загрузка Excel обновляет состав из «Списков».
     """
     sunday_date = only_date or _next_sunday_in_tz(tz)
     planned: list = []
     covered: set = set()
     if registry is not None and only_date is not None:
-        try:
-            planned, covered = _bot_plan_events(
-                registry, only_date, only_date, service_id=service_id
-            )
-        except Exception:
-            if require_approved_plan:
-                raise
-            debug_logger.exception("Не удалось прочитать график бота")
+        planned, covered = _bot_plan_events(
+            registry, only_date, only_date, service_id=service_id
+        )
     bot_plan = _covered(
         SimpleNamespace(service_id=service_id, event_date=only_date),
         covered,
@@ -666,6 +744,25 @@ async def _load_service_task_assignments(
         if return_event_found:
             return {}, False
         return {}
+    if bot_plan:
+        events = [
+            event for event in planned
+            if event.service_id == service_id and event.event_date == only_date
+        ]
+        event_found = bool(events)
+        notes = _saved_note_events(
+            registry, credentials.yandex_public_url, only_date, only_date
+        )
+        events += [event for event in notes if event.service_id == service_id]
+        result = _service_event_assignments(events)
+        registry.ensure_member_contacts(service_id, result)
+        if raw_out is not None:
+            raw_out.clear()
+            raw_out.update(result)
+        result = apply_replacements(
+            result, registry.list_replacements(service_id, only_date.isoformat())
+        )
+        return (result, event_found) if return_event_found else result
     debug_dir = shm_dir / "debug"
     directory_fd = open_private_directory(debug_dir, create=True)
     os.close(directory_fd)
@@ -678,94 +775,41 @@ async def _load_service_task_assignments(
     os.close(file_fd)
     xlsx_path = Path(file_name)
     try:
-        excel_read = True
-        try:
-            await _download_schedule(
-                credentials.yandex_public_url,
-                xlsx_path,
-                debug_logger,
-                attempts=1,
-                interval=0,
-                backup_manager=backup_manager,
-            )
-            events_by_service = parse_service_events(
-                xlsx_path, sunday_date, debug_logger, services
-            )
-        except Exception:
-            # Утверждённый график бота не зависит от Excel: без файла или
-            # листа месяца — назначения из бота, без пометок и «Списков».
-            if not bot_plan:
-                raise
-            debug_logger.exception("Excel не прочитан — график из бота")
-            events_by_service, excel_read = {}, False
+        await _download_schedule(
+            credentials.yandex_public_url,
+            xlsx_path,
+            debug_logger,
+            attempts=1,
+            interval=0,
+            backup_manager=backup_manager,
+            cache_dir=shm_dir / "schedule-source",
+            force=own_roster_only,
+        )
+        events_by_service = parse_service_events(
+            xlsx_path, sunday_date, debug_logger, services
+        )
         service_events = events_by_service.get(service_id, [])
         event_found = any(
             event.event_date == sunday_date for event in service_events
         )
-        assignments: dict[str, dict[str, object]] = {}
+        selected = []
         for event in service_events:
             if only_date is not None and event.event_date != only_date:
                 continue
             if issues is not None:
                 issues.extend(event.issues)
-            for assignment in event.assignments:
-                task_info = assignments.setdefault(
-                    assignment.task,
-                    {"names": set(), "is_informational": True},
-                )
-                names = task_info["names"]
-                if assignment.name:
-                    names.add(assignment.name)
-                task_info["is_informational"] = (
-                    task_info["is_informational"]
-                    and getattr(assignment, "is_informational", False)
-                )
-        result = {
-            task: {
-                "names": sorted(task_info["names"]),
-                "is_informational": task_info["is_informational"],
-            }
-            for task, task_info in sorted(assignments.items())
-        }
-        if bot_plan:
-            # Утверждённый график бота на эту дату главнее Excel
-            # (решение 15); Excel по-прежнему читается ради «Списков».
-            plan_tasks: dict[str, set[str]] = {}
-            event_found = False
-            for event in planned:
-                if (
-                    event.service_id != service_id
-                    or event.event_date != only_date
-                ):
-                    continue
-                event_found = True
-                for assignment in event.assignments:
-                    plan_tasks.setdefault(assignment.task, set()).add(
-                        assignment.name
-                    )
-            notes = {
-                task: info for task, info in result.items()
-                if info["is_informational"]
-            }
-            result = {
-                task: {"names": sorted(names), "is_informational": False}
-                for task, names in sorted(plan_tasks.items())
-            }
-            # Пометки Excel остаются: график бота заменяет только людей.
-            for task, info in notes.items():
-                result.setdefault(task, info)
+            selected.append(event)
+        result = _service_event_assignments(selected)
         if raw_out is not None:
             # Назначения из графика без замен: отчёт админам применяет
             # действующие замены сам при каждом обновлении.
             raw_out.clear()
             raw_out.update(result)
         if registry is not None:
-            if excel_read:
-                # Привязки и состав — по графику, без замен.
-                _sync_rosters_and_contacts(
-                    registry, xlsx_path, service_id, result, services,
-                    debug_logger, issues, own_roster_only,
-                )
+            _sync_rosters_and_contacts(
+                registry, xlsx_path, service_id, result, services,
+                debug_logger, issues, own_roster_only,
+            )
             if only_date is not None:
                 # Замена на одну дату (этап 3.3) главнее графика. Без
                 # only_date здесь имена за весь месяц — замены не применяются.
@@ -778,6 +822,22 @@ async def _load_service_task_assignments(
         return result
     finally:
         xlsx_path.unlink(missing_ok=True)
+
+
+def _service_event_assignments(events: list) -> dict:
+    assignments = {}
+    for event in events:
+        for assignment in event.assignments:
+            info = assignments.setdefault(
+                assignment.task, {"names": set(), "is_informational": True}
+            )
+            if assignment.name:
+                info["names"].add(assignment.name)
+            info["is_informational"] &= assignment.is_informational
+    return {
+        task: {"names": sorted(info["names"]), "is_informational": info["is_informational"]}
+        for task, info in sorted(assignments.items())
+    }
 
 
 # Проблемы листа «Списки» в целом (неизвестное служение) — не одного
@@ -837,6 +897,9 @@ async def _load_upcoming_service_events(
     until: date | None = None,
     since: date | None = None,
     backup_manager: BackupManager | None = None,
+    force: bool = False,
+    registry: ServiceRegistry | None = None,
+    source_out: dict[str, str] | None = None,
 ) -> list:
     """Read schedule events from today (or since, if it is earlier) through
     the given number of weeks (or through until, if it is later)."""
@@ -867,7 +930,14 @@ async def _load_upcoming_service_events(
             attempts=1,
             interval=0,
             backup_manager=backup_manager,
+            cache_dir=shm_dir / "schedule-source",
+            force=force,
         )
+        if registry is not None:
+            await _refresh_schedule_reference_data(
+                registry, credentials.yandex_public_url, xlsx_path, debug_logger,
+                shm_dir / "schedule-source",
+            )
         events = []
         for month in months:
             try:
@@ -893,6 +963,8 @@ async def _load_upcoming_service_events(
                 for event in service_events
                 if first_day <= event.event_date <= last_day
             )
+        if source_out is not None:
+            source_out["digest"] = hashlib.sha256(xlsx_path.read_bytes()).hexdigest()
         return sorted(events, key=lambda event: (event.event_date, event.service_id))
     finally:
         xlsx_path.unlink(missing_ok=True)
@@ -1034,6 +1106,13 @@ async def _load_month_summary_events(
     loader, registry, cache: dict, now: datetime, *,
     fresh: bool = False, **kwargs,
 ) -> list:
+    public_url = kwargs.pop("public_url", None)
+    if public_url is not None:
+        today = now.date()
+        return _approved_service_events(
+            registry, public_url, min(kwargs.get("since") or today, today),
+            kwargs.get("until") or today + timedelta(weeks=UPCOMING_WEEKS_DEFAULT),
+        )
     forced_at = cache.get("forced_at")
     fresh = fresh and (
         forced_at is None or now - forced_at >= timedelta(minutes=10)
@@ -1146,6 +1225,7 @@ async def get_group_reminder_preview(
             services=registry.service_catalog(),
             registry=registry,
             backup_manager=backup_manager,
+            require_approved_plan=True,
         )
     except Exception:
         debug_logger.exception(
@@ -1182,6 +1262,12 @@ async def get_group_reminder_preview(
     contacts_by_name = {
         (contact["task"], contact["name"]): contact for contact in contacts
     }
+    result["event_date"] = event_date.isoformat()
+    result["schedule_state"] = [
+        event for event in _approved_service_events(
+            registry, credentials.yandex_public_url, event_date, event_date
+        ) if event.service_id == service["id"]
+    ]
     template = (
         body if body is not None
         else registry.resolve_group_text(reminder, service)
@@ -2165,6 +2251,7 @@ async def _process_upcoming_sunday(
             xlsx_path,
             debug_logger,
             backup_manager=backup_manager,
+            cache_dir=shm_dir / "schedule-source",
         )
         schedule = parse_schedule(xlsx_path, sunday_date, debug_logger)
         people = parse_people(xlsx_path, debug_logger)
@@ -2358,7 +2445,20 @@ async def _run_locked(args: CliArgs) -> None:
 
         async def load_service_task_assignments(
             service_id: str,
+            *,
+            force: bool = False,
         ) -> dict[str, dict[str, object]]:
+            if not force:
+                today = datetime.now(tz).date()
+                next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+                end = (next_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+                events = _approved_service_events(
+                    service_registry, credentials.yandex_public_url,
+                    today.replace(day=1), end,
+                )
+                return _service_event_assignments([
+                    event for event in events if event.service_id == service_id
+                ])
             return await _load_service_task_assignments(
                 credentials, shm_dir, tz, service_id, debug_logger,
                 services=(
@@ -2410,6 +2510,15 @@ async def _run_locked(args: CliArgs) -> None:
 
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
+        context.group_preview_state = lambda service_id, event_day: [
+            event for event in _approved_service_events(
+                service_registry, credentials.yandex_public_url,
+                date.fromisoformat(event_day), date.fromisoformat(event_day),
+            ) if event.service_id == service_id
+        ]
+        context.schedule_candidate_version = lambda: source_version(
+            credentials.yandex_public_url, shm_dir / "schedule-source"
+        )
 
         upcoming_cache: dict[str, Any] = {
             "loaded_at": None, "events": [], "until": None, "since": None,
@@ -2419,20 +2528,31 @@ async def _run_locked(args: CliArgs) -> None:
         async def load_upcoming_service_events(
             force: bool = False, until: date | None = None,
             since: date | None = None, with_replacements: bool = True,
-            excel_only: bool = False, approved_only: bool = False,
+            excel_only: bool = False, approved_only: bool | None = None,
+            source_out: dict[str, str] | None = None,
         ) -> list:
-            # Один общий скачанный график на несколько минут для всех
-            # пользователей: повторные нажатия не обращаются к Яндекс.Диску.
-            # force — «🔄 Сверить график»: скачать заново. В кэше — график до
-            # конца следующего месяца (для «🔁 Замена»); по умолчанию
-            # возвращаются ближайшие 6 недель, until — до этой даты, since —
-            # с этой даты (по умолчанию с сегодня; кэш — с начала месяца).
+            # Утверждённый график читается только из БД. Кэш ниже нужен
+            # для Excel-кандидатов; force обновляет проверку источника.
             today = datetime.now(tz).date()
             limit = until or today + timedelta(days=UPCOMING_WEEKS_DEFAULT * 7)
             start = min(since or today, today)
             month_start = today.replace(day=1)
+            if approved_only is None:
+                approved_only = not excel_only
+            if approved_only:
+                if excel_only:
+                    raise ValueError(
+                        "Нельзя одновременно запросить Excel-кандидат "
+                        "и только утверждённые графики"
+                    )
+                return _approved_service_events(
+                    service_registry, credentials.yandex_public_url, start, limit,
+                    with_replacements=with_replacements,
+                )
 
             def window(events: list) -> list:
+                if source_out is not None and upcoming_cache.get("digest") is not None:
+                    source_out["digest"] = upcoming_cache["digest"]
                 selected = [
                     event for event in events
                     if start <= event.event_date <= limit
@@ -2478,6 +2598,7 @@ async def _run_locked(args: CliArgs) -> None:
                     (next_month + timedelta(days=32)).replace(day=1)
                     - timedelta(days=1)
                 )
+                loaded_source: dict[str, str] = {}
                 events = await _load_upcoming_service_events(
                     credentials, shm_dir, tz, debug_logger,
                     weeks=UPCOMING_WEEKS_DEFAULT,
@@ -2488,11 +2609,15 @@ async def _run_locked(args: CliArgs) -> None:
                     until=max(end_of_next_month, limit),
                     since=min(month_start, start),
                     backup_manager=backup_manager,
+                    force=force,
+                    registry=service_registry,
+                    source_out=loaded_source,
                 )
                 upcoming_cache.update(
                     loaded_at=time.monotonic(), events=events,
                     until=max(end_of_next_month, limit),
                     since=min(month_start, start),
+                    digest=loaded_source.get("digest"),
                 )
                 return window(events)
 
@@ -2537,6 +2662,8 @@ async def _run_locked(args: CliArgs) -> None:
                     credentials.yandex_public_url,
                     path,
                     debug_logger,
+                    shm_dir=shm_dir,
+                    registry=service_registry,
                 )
 
         legacy_registry_notice = {"sent": False}
@@ -2839,8 +2966,8 @@ async def _run_locked(args: CliArgs) -> None:
             )
 
             month_summary_pause: dict[str, datetime] = {}
-            # Пока сводка ждёт публикации графика, график перечитывается
-            # не чаще раза в 30 минут; проверка сроков — каждую минуту.
+            # Утверждение, назначения и пометки перечитываются из БД
+            # для каждого получателя, без сетевого обновления.
             waiting_events: dict[str, Any] = {}
 
             async def month_summary_events(
@@ -2850,6 +2977,7 @@ async def _run_locked(args: CliArgs) -> None:
                     context.load_upcoming_service_events,
                     service_registry, waiting_events, datetime.now(tz),
                     fresh=fresh, **kwargs,
+                    public_url=credentials.yandex_public_url,
                 )
 
             async def month_summary_tick() -> None:

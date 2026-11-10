@@ -1128,6 +1128,11 @@ class BotPlanSourceTest(Base):
             sorted((a.task, a.name) for a in shown[0].assignments),
             [("2я часть членское", ""), ("звук", "Борис")],
         )
+        import hashlib
+        self.registry.save_schedule_notes(
+            hashlib.sha256(b"https://example.invalid").hexdigest(),
+            "test-version", [["sound", EVENT.isoformat(), "2я часть членское", ""]],
+        )
         result, _ = self.load([noted])
         self.assertTrue(result["2я часть членское"]["is_informational"])
 

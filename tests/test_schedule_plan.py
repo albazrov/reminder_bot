@@ -98,6 +98,34 @@ class SchedulePlanTest(unittest.TestCase):
             schedule_plan.build_draft(self.registry, self.run, loader, LOG)
         )
 
+    def test_import_checks_content_revision_inside_transaction(self):
+        plan = self.draft()
+        version = self.registry.schedule_plan_version(plan)
+        slots = {day: dict(tasks) for day, tasks in plan["slots"].items()}
+        changed = {day: {} for day in plan["dates"]}
+        with unittest.mock.patch(
+            "bot.service_registry._utc_now", return_value=plan["updated_at"]
+        ):
+            self.registry.set_schedule_slots(1001, "sound", "2026-11", changed)
+        current = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertEqual(current["updated_at"], plan["updated_at"])
+        self.assertNotEqual(self.registry.schedule_plan_version(current), version)
+        with self.assertRaisesRegex(ValueError, "изменился после предпросмотра"):
+            self.registry.import_excel_plan(
+                1001, "sound", "2026-11", dates=plan["dates"],
+                tasks=plan["tasks"], slots=slots, days={},
+                expected_version=version,
+            )
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["slots"], changed
+        )
+        saved = self.registry.import_excel_plan(
+            1001, "sound", "2026-11", dates=plan["dates"],
+            tasks=plan["tasks"], slots=slots, days={},
+            expected_version=self.registry.schedule_plan_version(current),
+        )
+        self.assertEqual(saved["approved"], slots)
+
     def test_last_served_from_excel_and_approved_plan(self):
         loader = AsyncMock(return_value=[
             event(date(2026, 10, 18), ("звук", "Алексей")),

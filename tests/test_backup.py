@@ -339,7 +339,7 @@ class BackupManagerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             asyncio.run(self.manager.create_snapshot("broken link"))
 
-    def test_refresh_retries_then_saves_and_switches_to_daily_interval(self):
+    def test_refresh_retries_then_saves_and_switches_to_half_hour_interval(self):
         async def scenario():
             good = self.xlsx.read_bytes()
             notices = AsyncMock()
@@ -364,7 +364,7 @@ class BackupManagerTest(unittest.TestCase):
             with patch("bot.backup.asyncio.sleep", side_effect=sleep):
                 with self.assertRaises(asyncio.CancelledError):
                     await self.manager.run_schedule_refresh(download)
-            self.assertEqual(delays, [300, 300, 86400])
+            self.assertEqual(delays, [300, 300, 1800])
             self.assertEqual(self.xlsx.read_bytes(), good)
             self.assertEqual(self.manager.saved_schedule.read_bytes(), good)
             schedule_notices = [
@@ -374,6 +374,30 @@ class BackupManagerTest(unittest.TestCase):
             self.assertEqual(len(schedule_notices), 1)
             self.assertFalse(list(self.shm_dir.glob(".schedule-refresh-*")))
             await self.manager.close()
+
+        asyncio.run(scenario())
+
+    def test_unchanged_half_hour_refresh_does_not_create_extra_snapshots(self):
+        async def scenario():
+            good = self.xlsx.read_bytes()
+            download = AsyncMock(side_effect=lambda path: path.write_bytes(good))
+            sleeps = 0
+
+            async def sleep(delay):
+                nonlocal sleeps
+                self.assertEqual(delay, 1800)
+                sleeps += 1
+                if sleeps == 2:
+                    raise asyncio.CancelledError
+
+            with patch.object(
+                self.manager, "create_snapshot", new=AsyncMock()
+            ) as snapshot, patch("bot.backup.asyncio.sleep", side_effect=sleep):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.manager.run_schedule_refresh(download)
+                snapshot.assert_awaited_once()
+                self.assertEqual(download.await_count, 2)
+                await self.manager.close()
 
         asyncio.run(scenario())
 
