@@ -12,6 +12,7 @@ from collections.abc import Callable
 from datetime import date
 
 from .presentation import (
+    display_name,
     apply_replacements,
     format_task_assignments,
     ordered_task_assignments,
@@ -61,6 +62,8 @@ def build_report_text(
     notifications_enabled: Callable[[int], bool],
     confirmations: dict[tuple[str, int], str],
     limit: int | None = None,
+    *,
+    display_names: dict[str, str] | None = None,
 ) -> str:
     """confirmations — {(задача, Telegram ID): status}: ответ принадлежит
     аккаунту, а не имени, поэтому перепривязка имени не переносит чужой
@@ -72,21 +75,22 @@ def build_report_text(
     answers = []
     for task, name in people:
         contact = contacts_by_name.get((task, name))
+        shown_name = (display_names or {}).get(name) or display_name(contact, name)
         telegram_id = contact.get("telegram_id") if contact else None
         if not telegram_id:
-            delivery.append(f"⚪ {name} ({task}) — не привязан")
+            delivery.append(f"⚪ {shown_name} ({task}) — не привязан")
         elif not notifications_enabled(telegram_id):
-            delivery.append(f"🔕 {name} ({task}) — уведомления выключены")
+            delivery.append(f"🔕 {shown_name} ({task}) — уведомления выключены")
         else:
-            delivery.append(f"✅ {name} ({task}) — уведомления включены")
+            delivery.append(f"✅ {shown_name} ({task}) — уведомления включены")
         status = confirmations.get((task, telegram_id)) if telegram_id else None
         label = _CONFIRMATION_LABELS.get(status, "⏳ нет ответа")
-        answers.append(f"{label} — {name} ({task})")
+        answers.append(f"{label} — {shown_name} ({task})")
     values = {
         "service_name": service_name,
         "sunday_date": f"{event_date:%d.%m.%Y}",
         "task_assignments": format_task_assignments(
-            assignments, contacts_by_name, mark_unlinked=True
+            assignments, contacts_by_name, mark_unlinked=True, display_names=display_names,
         ),
         "delivery_status": "\n".join(delivery) or "⚪ нет назначений",
         "confirmation_status": "\n".join(answers) or "⚪ нет назначений",
@@ -155,7 +159,7 @@ def report_text(registry, service: dict, event_date: date, assignments: dict,
             telegram_id, service["id"]
         ),
         registry.list_confirmations(service["id"], event_date.isoformat()),
-        limit=limit,
+        limit=limit, display_names=registry.service_display_names(service["id"]),
     )
 
 

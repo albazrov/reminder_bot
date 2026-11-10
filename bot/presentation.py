@@ -44,6 +44,11 @@ def task_emoji(task: str) -> str:
     )
 
 
+def display_name(person: Mapping | None, fallback: str = "") -> str:
+    """Only a label: matching and stored assignment keys keep the full name."""
+    return (person or {}).get("short_name") or (person or {}).get("name") or fallback
+
+
 def task_assignment_names(task_info: Mapping | list[str]) -> list[str]:
     if isinstance(task_info, Mapping):
         names = task_info.get("names", [])
@@ -75,11 +80,13 @@ def person_label(
     contacts: dict[tuple[str, str], dict] | None = None,
     *,
     mark_unlinked: bool = False,
+    display_names: Mapping[str, str] | None = None,
 ) -> str:
     """Имя ответственного: ссылка на Telegram, если человек привязан."""
     contact = (contacts or {}).get((task, name))
     username = contact.get("username") if contact else None
-    label = f"{name} (@{username})" if username else name
+    shown_name = (display_names or {}).get(name) or display_name(contact, name)
+    label = f"{shown_name} (@{username})" if username else shown_name
     telegram_id = contact.get("telegram_id") if contact else None
     if telegram_id:
         return user_link(telegram_id, label)
@@ -92,10 +99,14 @@ def format_task_responsibles(
     task: str,
     names: list[str],
     contacts: dict[tuple[str, str], dict] | None = None,
+    *,
+    display_names: Mapping[str, str] | None = None,
 ) -> str:
     """Поле {task_responsibles}: ответственные одной задачи через запятую."""
     return ", ".join(
-        person_label(task, name, contacts, mark_unlinked=True) for name in names
+        person_label(
+            task, name, contacts, mark_unlinked=True, display_names=display_names,
+        ) for name in names
     )
 
 
@@ -104,6 +115,7 @@ def format_task_assignments(
     contacts: dict[tuple[str, str], dict] | None = None,
     *,
     mark_unlinked: bool = False,
+    display_names: Mapping[str, str] | None = None,
 ) -> str:
     if not assignments:
         return "⚪ Ответственные не указаны"
@@ -118,7 +130,10 @@ def format_task_assignments(
             lines.append("• Ответственные не указаны")
         for name in names:
             lines.append(
-                f"• {person_label(task, name, contacts, mark_unlinked=mark_unlinked)}"
+                "• " + person_label(
+                    task, name, contacts, mark_unlinked=mark_unlinked,
+                    display_names=display_names,
+                )
             )
         groups.append("\n".join(lines))
     return "\n\n".join(groups) or "⚪ Ответственные не указаны"

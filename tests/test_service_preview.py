@@ -22,6 +22,32 @@ from bot.ui import plain_text, render_screen_chunks
 
 
 class ServicePreviewTest(unittest.TestCase):
+    def test_group_preview_uses_short_names_but_exact_full_name_bindings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ServiceRegistry(Path(temp_dir) / "registry.sqlite3")
+            registry.initialize(67890, -10001)
+            registry.set_group_chat(67890, "sound", -10002, enabled=True)
+            registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Алексей Полный", 3001,
+            )
+            registry.set_service_member_short_name(
+                67890, "sound", "Алексей Полный", "Лёша",
+            )
+            preview, _ = self._group_reminder_preview(
+                registry, temp_dir, {"Микшер": ["Алексей Полный"]},
+                body="{task_assignments}",
+            )
+            self.assertTrue(preview["has_data"])
+            self.assertIn("Лёша", plain_text(preview["text"]))
+            self.assertNotIn("Алексей Полный", plain_text(preview["text"]))
+            self.assertIn("LINK:3001:", preview["text"])
+            unbound, _ = self._group_reminder_preview(
+                registry, temp_dir, {"Другая задача": ["Алексей Полный"]},
+                body="{task_assignments}",
+            )
+            self.assertNotIn("LINK:3001:", unbound["text"])
+            self.assertIn("не привязан", plain_text(unbound["text"]))
+
     @staticmethod
     def _fixed_occurrence(_now, reminder):
         event_date = date(2026, 10, 25)

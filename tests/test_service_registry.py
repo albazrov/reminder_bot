@@ -2053,7 +2053,11 @@ class ServiceRegistryTest(unittest.TestCase):
             self.registry.set_group_chat(3003, "sound", 777, enabled=True)
         self.registry.set_group_chat(1001, "sound", -10024, enabled=True)
         # Свой общий чат админ служения может привязать заново.
-        self.registry.set_group_chat(3003, "sound", -10024, enabled=False)
+        with self.assertRaises(PermissionError):
+            self.registry.set_group_chat(3003, "sound", -10024, enabled=False)
+        with self.assertRaises(PermissionError):
+            self.registry.set_service_enabled(3003, "sound", False)
+        self.registry.set_service_enabled(3003, "sound", True)
         self.registry.set_group_chat(3003, "sound", -10024, enabled=True)
 
     def test_invalid_ids_and_unknown_services_are_rejected(self):

@@ -21,11 +21,27 @@ from bot.ui import (
     render_screen_chunks,
     send_telegram_screen,
     user_link,
+    telegram_link,
     validate_inline_keyboard,
 )
 
 
 class DialogRenderingTest(unittest.TestCase):
+    def test_chat_links_are_safe_plain_decodable_and_chunked_as_one_marker(self):
+        marker = telegram_link("https://t.me/service_chat", "Чат <&>")
+        self.assertEqual(plain_text(marker), "Чат <&>")
+        chunks = render_screen_chunks("Настройки\n" + marker, limit=40)
+        self.assertIn(
+            '<a href="https://t.me/service_chat">Чат &lt;&amp;&gt;</a>',
+            "".join(chunks),
+        )
+        self.assertNotIn("\x00", "".join(chunks))
+        for invalid in (
+            "javascript:alert(1)", "http://t.me/chat", "https://t.me.evil/chat",
+            'https://t.me/chat" onclick="bad', "https://example.com",
+        ):
+            self.assertEqual(telegram_link(invalid, "Чат"), "Чат")
+
     def test_render_escapes_untrusted_text_and_bolds_title(self):
         self.assertEqual(
             render_screen_chunks("Заголовок\n<a & b>"),
