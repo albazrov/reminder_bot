@@ -17,6 +17,7 @@ from bot.excel_parser import (
     parse_schedule,
     parse_service_events as parse_with_catalog,
     parse_service_rosters,
+    parse_workbook_service_events,
     resolve_assignments,
 )
 from bot.services import SERVICES, parse_catalog
@@ -71,6 +72,26 @@ class ExcelParserTest(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.path = Path(self.temp_dir.name) / "schedule.xlsx"
         self.debug_logger = logging.getLogger("test.excel_parser")
+
+    def test_candidate_validation_reads_all_months_and_rejects_bad_workbook(self):
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        for title, day in (("ноябрь26", date(2026, 11, 1)), ("ДЕКАБРЬ26", date(2026, 12, 6))):
+            sheet = workbook.create_sheet(title)
+            sheet.append(["ЗВУК"])
+            sheet.append([day])
+            sheet.append(["Микшер", "Участник"])
+        workbook.create_sheet("ЯНВАРЬ27")
+        workbook.save(self.path)
+        workbook.close()
+        events = parse_workbook_service_events(self.path, self.debug_logger, TEST_SERVICES)
+        self.assertEqual(
+            [item.event_date for item in events if item.service_id == "sound"],
+            [date(2026, 11, 1), date(2026, 12, 6)],
+        )
+        self.path.write_bytes(b"not an xlsx")
+        with self.assertRaises(zipfile.BadZipFile):
+            parse_workbook_service_events(self.path, self.debug_logger, TEST_SERVICES)
 
     def _make_workbook(self):
         workbook = Workbook()

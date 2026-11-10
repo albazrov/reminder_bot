@@ -34,7 +34,7 @@ MAX_SNAPSHOTS_PER_ENVIRONMENT = 14
 MIN_RETAINED_SNAPSHOTS = 7
 STALE_SNAPSHOT_STAGE_AGE = timedelta(hours=24)
 SCHEDULE_RETRY_SECONDS = 300
-SCHEDULE_REFRESH_SECONDS = 86400
+SCHEDULE_REFRESH_SECONDS = 1800
 STORAGE_WARNING_PERCENT = 90
 STORAGE_CRITICAL_PERCENT = 95
 STORAGE_MIN_FREE_BYTES = 256 * 1024 * 1024
@@ -332,15 +332,15 @@ class BackupManager:
         finally:
             stage.unlink(missing_ok=True)
 
-    async def record_schedule_download(self, path: Path) -> None:
+    async def record_schedule_download(self, path: Path) -> bool:
         """Publish verified bytes for backups only, never for delivery fallback."""
         self._schedule_generation += 1
-        await self._publish_schedule_download(path, self._schedule_generation)
+        return await self._publish_schedule_download(path, self._schedule_generation)
 
-    async def _publish_schedule_download(self, path: Path, generation: int) -> None:
+    async def _publish_schedule_download(self, path: Path, generation: int) -> bool:
         async with self._backup_lock:
             if generation < self._published_schedule_generation:
-                return
+                return False
 
             def publish() -> bool:
                 changed = self._record_schedule_download(path)
@@ -351,6 +351,7 @@ class BackupManager:
         self.clear_failure("schedule-copy")
         if changed and self._debounce_handle is None:
             self.mark_dirty()
+        return changed
 
     async def queue_schedule_download(self, source: Path) -> None:
         """Retain a RAM copy; external disk work never blocks reminder rendering."""
@@ -447,8 +448,9 @@ class BackupManager:
         self,
         download: Callable[[Path], Awaitable[Any]],
     ) -> None:
-        """Refresh after startup and daily; retry failures without blocking polling."""
+        """Check every half hour; retry failures without blocking polling."""
         first_attempt = True
+        needs_snapshot = True
         while True:
             path: Path | None = None
             try:
@@ -460,8 +462,10 @@ class BackupManager:
                 os.close(fd)
                 path = Path(name)
                 await download(path)
-                await self.record_schedule_download(path)
-                await self.create_snapshot("обновление Excel")
+                needs_snapshot |= await self.record_schedule_download(path)
+                if needs_snapshot:
+                    await self.create_snapshot("обновление Excel")
+                    needs_snapshot = False
             except Exception as exc:
                 await self.report_failure(
                     "schedule",

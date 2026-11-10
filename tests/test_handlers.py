@@ -2333,7 +2333,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.registry.set_group_chat(67890, "sound", -100555, enabled=True)
             self.context.get_group_reminder_preview = AsyncMock(return_value={
                 "has_data": True, "text": "Напоминание сейчас", "date": "25.10.2026",
+                "event_date": "2026-10-25", "schedule_state": ["plan-a"],
             })
+            self.context.group_preview_state = MagicMock(return_value=["plan-a"])
             menu = await self._open_sound_reminders()
             card = await self._click(
                 menu.message, lambda button: button.text == "1"
@@ -2350,6 +2352,17 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.context.bot.send_message.await_args.args[0], -100555
             )
             self.assertIn("Отправлено", sent.answer.await_args.args[0])
+            changed_plan = await self._click(
+                card.message, lambda button: button.text == "📤 Отправить сейчас"
+            )
+            self.context.group_preview_state.return_value = ["plan-b"]
+            self.context.bot.send_message.reset_mock()
+            rejected = await self._click(
+                changed_plan.message, lambda button: button.text == "✅ Отправить"
+            )
+            self.context.bot.send_message.assert_not_awaited()
+            self.assertIn("График изменился", rejected.answer.await_args.args[0])
+            self.context.group_preview_state.return_value = ["plan-a"]
             # Смена чата после предпросмотра — нужен новый предпросмотр.
             again = await self._click(
                 card.message, lambda button: button.text == "📤 Отправить сейчас"
@@ -3607,7 +3620,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for call in service_callback.message.answer.await_args_list
             ]
             self.assertTrue(any("загружаю" in text for text in replies))
-            self.assertTrue(any("Не удалось прочитать файл графика" in text for text in replies))
+            self.assertTrue(any("Не удалось прочитать график служений" in text for text in replies))
             self.assertFalse(any("График загружен" in text for text in replies))
 
         asyncio.run(run())
@@ -5803,6 +5816,27 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_enable_sees_bindings_created_by_schedule_loader(self):
+        async def run():
+            actor_id = 4612
+            self.registry.bind_service_member(
+                67890, "sound", "Имя из расписания", actor_id, tasks=("Микшер",),
+            )
+            assignments = {
+                "Микшер": ["Имя из расписания"],
+                "Пульт": ["Имя из расписания"],
+            }
+
+            async def load(service_id):
+                self.registry.ensure_member_contacts(service_id, assignments)
+                return assignments
+
+            self.context.load_service_task_assignments = load
+            await self.personal_toggle(actor_id)
+            self.assertEqual(self.rules(actor_id, "Пульт"), [(1, "18:00", True)])
+
+        asyncio.run(run())
+
     def test_enable_with_disabled_rule_still_covers_other_task(self):
         async def run():
             actor_id = 4613
@@ -7753,6 +7787,33 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_schedule_plan("sound", "2026-11")["source"],
                 "poll",
             )
+            self.context.schedule_candidate_version = MagicMock(return_value="one")
+
+            def loaded_source(**kwargs):
+                kwargs["source_out"]["digest"] = self.context.schedule_candidate_version()
+                return self.context.load_upcoming_service_events.return_value
+
+            self.context.load_upcoming_service_events.side_effect = loaded_source
+            load = callback("xls:load:sound:202611")
+            await self.callback_handler("on_excel_schedule")(load)
+            ok = next(
+                button.callback_data
+                for row in load.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row if button.text == "✅ Подтвердить"
+            )
+            self.context.schedule_candidate_version.return_value = "two"
+            changed_candidate = callback(ok)
+            await self.callback_handler("on_excel_schedule")(changed_candidate)
+            self.assertIn("Excel изменился после предпросмотра", "".join(
+                call.args[0]
+                for call in changed_candidate.message.answer.await_args_list
+            ))
+            self.assertEqual(
+                self.registry.get_schedule_plan("sound", "2026-11")["source"],
+                "poll",
+            )
             load = callback("xls:load:sound:202611")
             await self.callback_handler("on_excel_schedule")(load)
             ok = next(
@@ -7776,6 +7837,80 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(plan["approved"], plan["slots"])
             self.assertEqual(plan["slots"]["2026-11-01"]["звук"], ["Алексей"])
             self.assertFalse(plan["dirty"])
+
+        asyncio.run(run())
+
+    def test_excel_preview_tracks_loaded_bytes_not_latest_manifest(self):
+        async def run():
+            def loaded_source(**kwargs):
+                kwargs["source_out"]["digest"] = "loaded"
+                return [ServiceEvent("sound", date(2026, 11, 1), (
+                    ServiceAssignment("звук", "Алексей"),
+                ))]
+
+            self.context.load_upcoming_service_events = AsyncMock(side_effect=loaded_source)
+            self.context.schedule_candidate_version = MagicMock(return_value="newer")
+
+            def callback(data):
+                return SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=67890),
+                    message=self.message(67890, ""), answer=AsyncMock(),
+                )
+
+            load = callback("xls:load:sound:202611")
+            await self.callback_handler("on_excel_schedule")(load)
+            ok = next(
+                button.callback_data
+                for row in load.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row if button.text == "✅ Подтвердить"
+            )
+            confirm = callback(ok)
+            await self.callback_handler("on_excel_schedule")(confirm)
+            self.assertIn("Excel изменился после предпросмотра", "".join(
+                call.args[0] for call in confirm.message.answer.await_args_list
+            ))
+            self.assertIsNone(self.registry.get_schedule_plan("sound", "2026-11"))
+
+        asyncio.run(run())
+
+    def test_excel_import_cancelled_while_confirmation_waits_for_lock(self):
+        from bot import readiness
+
+        async def run():
+            self.context.load_upcoming_service_events = AsyncMock(return_value=[
+                ServiceEvent("sound", date(2026, 11, 1), (
+                    ServiceAssignment("звук", "Алексей"),
+                )),
+            ])
+
+            def callback(data):
+                return SimpleNamespace(
+                    data=data, from_user=SimpleNamespace(id=67890),
+                    message=self.message(67890, ""), answer=AsyncMock(),
+                )
+
+            load = callback("xls:load:sound:202611")
+            await self.callback_handler("on_excel_schedule")(load)
+            buttons = {
+                button.text: button.callback_data
+                for row in load.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            }
+            async with readiness.service_lock("sound"):
+                confirm = asyncio.create_task(self.callback_handler("on_excel_schedule")(
+                    callback(buttons["✅ Подтвердить"])
+                ))
+                await asyncio.sleep(0)
+                self.assertFalse(confirm.done())
+                await self.callback_handler("on_excel_schedule")(
+                    callback(buttons["❌ Отмена"])
+                )
+            await confirm
+            self.assertIsNone(self.registry.get_schedule_plan("sound", "2026-11"))
 
         asyncio.run(run())
 
