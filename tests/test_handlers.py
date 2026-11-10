@@ -6227,6 +6227,19 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "⚙️ Настройки — групповой чат",
                 helped.message.answer.await_args.args[0],
             )
+            text = helped.message.answer.await_args.args[0]
+            paragraphs = text.split("\n\n")
+            self.assertEqual(len(paragraphs), 9)
+            for paragraph, prefix in zip(paragraphs, (
+                "<b>❓ Кнопки карточки служения</b>",
+                "👥 Ответственные — список братьев и сестер служения:\nTelegram",
+                "«🗓 По датам графика»", "📅 График",
+                "За кнопкой «🗳 Опрос»", "🔔 Напомнить",
+                "📋 Задачи служения", "⚙️ Настройки", "⬅️ К списку служений",
+            )):
+                self.assertTrue(paragraph.startswith(prefix), paragraph)
+            self.assertIn("сколько ответственных требуется", text)
+            self.assertIn("тексты для сообщений в чат.", text)
 
         asyncio.run(run())
 
