@@ -72,6 +72,9 @@ Raspberry Pi specifics:
 - Before a requested commit/push, review the complete diff independently for
   correctness issues, verify any findings, and report confirmed fixes.
 - Do not begin another PLAN/backlog task unless the user asks.
+- Record user suggestions for functional improvements in GitHub Issues when
+  they are not implemented in the current work. Check for duplicates first;
+  update an existing issue when appropriate and share the issue link.
 
 ## Status snapshot (09.11.2026)
 

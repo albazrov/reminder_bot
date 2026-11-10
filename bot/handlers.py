@@ -763,7 +763,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "➖", "🗑", "✏️", "1️⃣", "2️⃣", "3️⃣", "4️⃣",
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
-                        "🔢", "🔤", "⛔", "↔️", "📥", "🌐", "🧮",
+                        "🔢", "🔤", "⛔", "↔️", "📥", "🌐", "🧮", "❓",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -5719,7 +5719,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     PLAN_ACTIONS = {
         "plan", "precalc", "precalcok", "pedit", "pdate", "ptask", "padd",
         "prem", "pclear", "pok", "pokok", "pfree", "pnew", "pday", "pdset",
-        "pprev",
+        "pprev", "phelp",
     }
 
     def plan_month(arg: str | None, now: datetime) -> str | None:
@@ -5821,6 +5821,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )]
                 for answer in summary.outside[:20]
             ]
+        if plan.get("run_id") is None:
+            current = datetime.now(context.timezone).date().replace(day=1)
+            following = month_end(current.year, current.month) + timedelta(days=1)
+            other = following if month_arg == current.strftime("%Y%m") else current
+            rows.append([readiness_button(
+                f"🧮 Авто {month_title(other.year, other.month).split()[0][:3]}",
+                "pfree", service_id, other.strftime("%Y%m"),
+            )])
+        rows.append([readiness_button("❓ Справка", "phelp", service_id, month_arg)])
         rows.append([readiness_button(
             "⬅️ К графику" if plan.get("run_id") is None else "⬅️ К опросу",
             "month" if plan.get("run_id") is None else "open",
@@ -6351,7 +6360,34 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             del parts[1]
-        if action == "plan":
+        if action == "phelp":
+            await _send_dialog(
+                callback.message,
+                f"❓ {service_label(service)} › График › Справка\n\n"
+                "«Авто» открывает существующий график выбранного месяца. "
+                "Если его нет, создаёт черновик без Excel и опроса: "
+                "все участники считаются доступными по воскресеньям.\n\n"
+                "✏️ Изменить — вручную выбрать ответственных и дни; "
+                "автоподбор не запускается.\n\n"
+                "🔄 Пересчитать — заново распределить задачи по текущему "
+                "составу, допускам и ограничениям. Для графика по опросу "
+                "учитываются ответы; без опроса — доступность всех участников. "
+                "Если есть ручные правки, бот попросит подтвердить их сброс.\n\n"
+                "✅ Утвердить / Утвердить изменения — сохранить проверенный "
+                "график как действующий и опубликовать его в чате служения. "
+                "До утверждения правки не заменяют прежний утверждённый график.\n\n"
+                "🧮 Авто с названием месяца — открыть или составить график "
+                "другого месяца отдельно, не меняя этот. Если для месяца "
+                "уже есть опрос, бот направит к нему.\n\n"
+                "⬅️ К графику — вернуться на основной экран с «Сводкой».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [readiness_button("⬅️ К графику месяца", "plan", service_id,
+                                      key.replace("-", ""))],
+                ]),
+                _dialog_keep_rows=True, _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                parse_mode=None,
+            )
+        elif action == "plan":
             await show_plan(callback.message, service, run, plan)
         elif action == "precalc" and plan["edited"]:
             month_arg = key.replace("-", "")

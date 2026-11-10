@@ -250,6 +250,69 @@ class ServiceScreensTest(unittest.TestCase):
             self.registry, 1001, "sound", self.now.date(), include_load=True,
         ))
 
+    def test_auto_help_and_next_month_preserve_approved_current_graph(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "A", 3001)
+        self.plan({"2026-11-15": {"Микшер": ["A"]}})
+        before = self.registry.get_schedule_plan("sound", "2026-11")
+
+        async def run():
+            shown = await self.press("rdy:pfree:sound:202611", 2001)
+            self.assertIn("График уже составлен", self.text(shown))
+            buttons = self.buttons(shown)
+            self.assertLessEqual(len(buttons), 6)
+            help_button = next(b for b in buttons if b.text == "❓ Справка")
+            help_screen = await self.press(help_button.callback_data, 2001)
+            for text in ("Изменить", "Пересчитать", "ручные правки", "Утвердить",
+                         "До утверждения", "другого месяца"):
+                self.assertIn(text, self.text(help_screen))
+            returned = await self.press(self.buttons(help_screen)[0].callback_data, 2001)
+            self.assertIn("График", self.text(returned))
+            next_button = next(b for b in self.buttons(returned) if b.text == "🧮 Авто дек")
+            self.assertEqual(next_button.callback_data, "rdy:pfree:sound:202612")
+            following = await self.press(next_button.callback_data, 2001)
+            self.assertIn("декабрь 2026", self.text(following))
+            self.assertIn("🧮 Авто ноя", [b.text for b in self.buttons(following)])
+            draft = self.registry.get_schedule_plan("sound", "2026-12")
+            self.assertIsNone(draft["run_id"])
+            self.assertIsNone(draft["approved"])
+            self.assertTrue(any(names for tasks in draft["slots"].values()
+                                for names in tasks.values()))
+            await self.press(next_button.callback_data, 2001)
+            self.assertEqual(self.registry.get_schedule_plan("sound", "2026-12"), draft)
+            denied = await self.press(help_button.callback_data, 9999)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+            self.assertEqual(self.registry.get_schedule_plan("sound", "2026-11"), before)
+            self.context.load_upcoming_service_events.assert_not_awaited()
+            self.context.bot.send_message.assert_not_awaited()
+        asyncio.run(run())
+
+    def test_auto_month_link_crosses_year_and_blocks_unrelated_months(self):
+        self.now = self.now.replace(month=12)
+        self.plan({"2026-12-06": {"Микшер": ["A"]}}, month="2026-12")
+
+        async def run():
+            shown = await self.press("rdy:pfree:sound:202612")
+            button = next(b for b in self.buttons(shown) if b.text == "🧮 Авто янв")
+            self.assertEqual(button.callback_data, "rdy:pfree:sound:202701")
+            self.assertTrue(all(len(b.callback_data.encode()) <= 64 for b in self.buttons(shown)))
+            await self.press("rdy:pfree:sound:202702")
+            self.assertIsNone(self.registry.get_schedule_plan("sound", "2027-02"))
+        asyncio.run(run())
+
+    def test_auto_next_month_does_not_bypass_existing_readiness_poll(self):
+        run = self.registry.create_readiness_run(
+            "sound", "2026-12", status="open", dates=["2026-12-06"],
+            deadline="2026-11-25T18:00:00+00:00",
+        )
+
+        async def check():
+            shown = await self.press("rdy:pfree:sound:202612", 2001)
+            self.assertIn("Опрос этого месяца уже есть", self.text(shown))
+            self.assertIsNone(self.registry.get_schedule_plan("sound", "2026-12"))
+            self.assertEqual(self.registry.get_readiness_run("sound", "2026-12"), run)
+        asyncio.run(check())
+
     def test_summary_load_uses_effective_graph_previous_replacements_and_ignores_draft(self):
         self.registry.add_service_task(1001, "sound", "Микшер")
         for name, telegram_id in (("Алексей", 3001), ("Мария", 3002), ("Борис", 3003)):
@@ -273,6 +336,63 @@ class ServiceScreensTest(unittest.TestCase):
         self.assertNotIn("Черновик", text)
         self.assertIn("неутверждённые правки", text)
         self.assertNotIn("0 — Алексей · интервалы", text)
+
+    def test_summary_keeps_namesakes_load_history_and_replacements_separate(self):
+        for task in ("Микшер", "Монтаж", "Запас"):
+            self.registry.add_service_task(1001, "sound", task)
+        for task, telegram_id, username in (
+            ("Микшер", 3101, "gleb_one"), ("Монтаж", 3102, "gleb_two"),
+            ("Запас", 3103, "gleb_three"),
+        ):
+            self.registry.set_responsible_contact(
+                1001, "sound", task, "Глеб", telegram_id, username,
+            )
+        # Legacy per-task bindings can contain separate accounts with one name.
+        with self.registry._connection() as connection:
+            for task, telegram_id, username in (
+                ("Микшер", 3101, "gleb_one"), ("Монтаж", 3102, "gleb_two"),
+            ):
+                connection.execute(
+                    "UPDATE responsible_contacts SET telegram_id = ?, username = ? "
+                    "WHERE service_id = 'sound' AND task = ?",
+                    (telegram_id, username, task),
+                )
+        people = self.registry.readiness_people("sound")
+        keys = {person["telegram_id"]: person["key"] for person in people}
+        self.assertEqual(len(set(keys.values())), 3)
+        tasks = [{"name": task, "needed": 1} for task in ("Микшер", "Монтаж", "Запас")]
+        self.plan({
+            "2026-10-04": {"Микшер": [keys[3101]]},
+            "2026-10-25": {"Монтаж": [keys[3102]]},
+        }, month="2026-10", tasks=tasks)
+        self.plan({
+            "2026-11-01": {"Микшер": [keys[3101]]},
+            "2026-11-08": {"Монтаж": [keys[3102]]},
+            "2026-11-15": {"Микшер": [keys[3101]]},
+        }, tasks=tasks)
+        text = self.summary()
+        self.assertIn("2 — Глеб (@gleb_one) · интервалы, нед.: 4, 2", text)
+        self.assertIn("1 — Глеб (@gleb_two) · интервалы, нед.: 2", text)
+        self.assertIn("0 — Глеб (@gleb_three)", text)
+        saved = self.registry.get_schedule_plan("sound", "2026-11")
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=saved["dates"],
+            tasks=tasks, slots=saved["slots"],
+            last_served={keys[3101]: "2026-10-04", keys[3102]: "2026-10-25"},
+        )
+        with patch.object(self.registry, "list_approved_schedule_plans", return_value=[]):
+            text = self.summary()
+        self.assertIn("2 — Глеб (@gleb_one) · интервалы, нед.: 4, 2", text)
+        self.assertIn("1 — Глеб (@gleb_two) · интервалы, нед.: 2", text)
+        # A same-name substitute is identified by Telegram, not by the task permit.
+        with patch.object(self.registry, "list_replacements", side_effect=lambda service, day: [
+            {"task": "Микшер", "old_name": "Глеб", "new_name": "Глеб",
+             "telegram_id": 3102},
+        ] if day in {"2026-10-04", "2026-11-01"} else []):
+            text = self.summary()
+        self.assertIn("1 — Глеб (@gleb_one) · интервалы, нед.: нет данных", text)
+        self.assertIn("2 — Глеб (@gleb_two) · интервалы, нед.: 1, 1", text)
+        self.assertIn("0 — Глеб (@gleb_three)", text)
 
     def test_summary_draft_missing_history_own_days_and_same_day_duty(self):
         self.plan({

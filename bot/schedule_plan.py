@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import date, timedelta
 from io import BytesIO
 
@@ -450,8 +450,12 @@ def workload_lines(
         key=lambda person: (-len(load.get(person["key"], ())), person["name"]),
     )
     lines = ["", "👥 Нагрузка (дней служения в месяце):"]
+    names = [display_name(person) for person in ordered]
     for person in ordered:
         key = person["key"]
+        label = display_name(person)
+        if names.count(label) > 1 and person.get("username"):
+            label += f" (@{person['username'].lstrip('@')})"
         days = sorted(load.get(key, ()))
         last = date.fromisoformat(previous[key]) if previous.get(key) else None
         intervals = []
@@ -463,7 +467,7 @@ def workload_lines(
             )
             last = day
         lines.append(
-            f"   {len(days)} — {display_name(person)}"
+            f"   {len(days)} — {label}"
             + ("" if person["telegram_id"] else " (без Telegram)")
             + (" · интервалы, нед.: " + ", ".join(intervals) if days else "")
         )
@@ -1152,7 +1156,7 @@ def excel_plan(registry, service_id: str, year: int, month: int,
     }
 
 
-def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
+def plan_events(plan: dict, people: list[dict], *, keyed: bool = False) -> list[ServiceEvent]:
     """Утверждённый график бота как события графика (решение 15): по ним
     — напоминания и замены. Задача со своим днём — событием своей даты
     (как в Excel), разовый день человека учитывается."""
@@ -1187,7 +1191,7 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
                 published, by_key, day, task["name"], approved=True
             ):
                 events.setdefault(moment, []).append(
-                    ServiceAssignment(task["name"], names.get(key, key))
+                    ServiceAssignment(task["name"], key if keyed else names.get(key, key))
                 )
     return [
         ServiceEvent(plan["service_id"], moment, tuple(items))
@@ -1196,7 +1200,8 @@ def plan_events(plan: dict, people: list[dict]) -> list[ServiceEvent]:
 
 
 def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
-                                draft: bool = False) -> dict[date, dict[str, list[str]]]:
+                                draft: bool = False, keyed: bool = False,
+                                ) -> dict[date, dict[str, list[str]]]:
     if draft:
         plan = {
             **plan, "approved": plan["slots"],
@@ -1217,16 +1222,56 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                 days=slot_offset(saved_tasks, None, day_key, task) or 0,
             )
             assignments.setdefault(moment, {}).setdefault(task, [])
-    for event in plan_events(plan, people):
+    by_key = {person["key"]: person for person in people}
+
+    def person_key(
+        name: str, task: str, telegram_id: int | None = None,
+        assigned: Sequence[str] = (),
+    ) -> str:
+        if telegram_id:
+            matches = [person["key"] for person in people
+                       if person["telegram_id"] == telegram_id]
+        else:
+            matches = [key for key in assigned
+                       if by_key.get(key, {}).get("name", key) == name]
+            if not matches:
+                matches = [person["key"] for person in people
+                           if person["name"] == name and task in person["tasks"]]
+        return matches[0] if len(matches) == 1 else name
+
+    for event in plan_events(plan, people, keyed=keyed):
         if not event.assignments:
             continue
         day = assignments.setdefault(event.event_date, {})
         event_tasks: dict[str, list[str]] = {}
         for assignment in event.assignments:
             event_tasks.setdefault(assignment.task, []).append(assignment.name)
+        replacements = [] if draft else registry.list_replacements(
+            plan["service_id"], event.event_date.isoformat(),
+        )
+        if keyed:
+            for task, keys in event_tasks.items():
+                event_tasks[task] = [
+                    key if key in by_key else person_key(key, task) for key in keys
+                ]
+            translated = []
+            effective = event_tasks
+            for replacement in replacements:
+                task = replacement["task"]
+                item = {
+                    **replacement,
+                    "old_name": person_key(
+                        replacement["old_name"], task, assigned=effective.get(task, ()),
+                    ),
+                    "new_name": person_key(
+                        replacement["new_name"], task, replacement.get("telegram_id"),
+                    ),
+                }
+                translated.append(item)
+                effective = apply_replacements(effective, [item])
+            replacements = translated
         current = event_tasks if draft else apply_replacements(
-            event_tasks,
-            registry.list_replacements(plan["service_id"], event.event_date.isoformat()),
+            event_tasks, replacements,
         )
         for task, info in current.items():
             names = day.setdefault(task, [])
@@ -1266,6 +1311,7 @@ def month_overview(
                 selected["approval_warnings"]
             )
     assignments: dict[date, dict[str, list[str]]] = {}
+    load: dict[str, set[date]] = {}
     cursor = (first - timedelta(days=7)).replace(day=1)
     while cursor <= last + timedelta(days=7):
         plan = registry.get_schedule_plan(service_id, cursor.strftime("%Y-%m"))
@@ -1273,6 +1319,14 @@ def month_overview(
         if draft and cursor != first:
             plan = None
         if plan is not None:
+            if include_load:
+                for moment, current in _effective_plan_assignments(
+                    registry, plan, people, draft=draft, keyed=True,
+                ).items():
+                    if first <= moment <= last:
+                        for keys in current.values():
+                            for key in keys:
+                                load.setdefault(key, set()).add(moment)
             for moment, current in _effective_plan_assignments(
                 registry, plan, people, draft=draft,
             ).items():
@@ -1298,30 +1352,25 @@ def month_overview(
     if not assignments and selected is not None:
         lines += ["", "На этот месяц назначений нет."]
     if include_load:
-        load: dict[str, set[date]] = {}
-        for moment, current in assignments.items():
-            for names in current.values():
-                for name in names:
-                    load.setdefault(name, set()).add(moment)
         previous: dict[str, str] = {}
         history = registry.list_approved_schedule_plans(
             service_id, (last + timedelta(days=7)).strftime("%Y-%m"),
         )
         for plan in history:
-            for moment, current in _effective_plan_assignments(registry, plan, people).items():
+            for moment, current in _effective_plan_assignments(
+                registry, plan, people, keyed=True,
+            ).items():
                 if moment >= first:
                     continue
-                for names in current.values():
-                    for name in names:
-                        previous[name] = max(previous.get(name, ""), moment.isoformat())
+                for keys in current.values():
+                    for key in keys:
+                        previous[key] = max(previous.get(key, ""), moment.isoformat())
         if selected and not any(plan["month"] < selected["month"] for plan in history):
-            by_key = {person["key"]: person["name"] for person in people}
             for key, day in selected["last_served"].items():
                 if day < first.isoformat():
-                    name = by_key.get(key, key)
-                    previous[name] = max(previous.get(name, ""), day)
+                    previous[key] = max(previous.get(key, ""), day)
         lines += workload_lines(
-            load, [{**person, "key": person["name"]} for person in people if person["tasks"]],
+            load, [person for person in people if person["tasks"]],
             previous,
         )
     return "\n".join(lines)
