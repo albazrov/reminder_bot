@@ -1199,6 +1199,48 @@ def plan_events(plan: dict, people: list[dict], *, keyed: bool = False) -> list[
     ]
 
 
+def _apply_assignment_replacements(
+    assignments: dict[str, list[str]], replacements: list[dict], people: list[dict],
+    *, keyed: bool = False,
+) -> dict[str, list[str]]:
+    if not keyed:
+        return apply_replacements(assignments, replacements)
+    by_key = {person["key"]: person for person in people}
+
+    def person_key(
+        name: str, task: str, telegram_id: int | None = None,
+        assigned: Sequence[str] = (),
+    ) -> str:
+        if telegram_id:
+            matches = [person["key"] for person in people
+                       if person["telegram_id"] == telegram_id]
+        else:
+            matches = [key for key in assigned
+                       if by_key.get(key, {}).get("name", key) == name]
+            if not matches:
+                matches = [person["key"] for person in people
+                           if person["name"] == name and task in person["tasks"]]
+        return matches[0] if len(matches) == 1 else name
+
+    current = {
+        task: [key if key in by_key else person_key(key, task) for key in keys]
+        for task, keys in assignments.items()
+    }
+    for replacement in replacements:
+        task = replacement["task"]
+        item = {
+            **replacement,
+            "old_name": person_key(
+                replacement["old_name"], task, assigned=current.get(task, ()),
+            ),
+            "new_name": person_key(
+                replacement["new_name"], task, replacement.get("telegram_id"),
+            ),
+        }
+        current = apply_replacements(current, [item])
+    return current
+
+
 def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                                 draft: bool = False, keyed: bool = False,
                                 ) -> dict[date, dict[str, list[str]]]:
@@ -1222,23 +1264,6 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                 days=slot_offset(saved_tasks, None, day_key, task) or 0,
             )
             assignments.setdefault(moment, {}).setdefault(task, [])
-    by_key = {person["key"]: person for person in people}
-
-    def person_key(
-        name: str, task: str, telegram_id: int | None = None,
-        assigned: Sequence[str] = (),
-    ) -> str:
-        if telegram_id:
-            matches = [person["key"] for person in people
-                       if person["telegram_id"] == telegram_id]
-        else:
-            matches = [key for key in assigned
-                       if by_key.get(key, {}).get("name", key) == name]
-            if not matches:
-                matches = [person["key"] for person in people
-                           if person["name"] == name and task in person["tasks"]]
-        return matches[0] if len(matches) == 1 else name
-
     for event in plan_events(plan, people, keyed=keyed):
         if not event.assignments:
             continue
@@ -1249,29 +1274,8 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
         replacements = [] if draft else registry.list_replacements(
             plan["service_id"], event.event_date.isoformat(),
         )
-        if keyed:
-            for task, keys in event_tasks.items():
-                event_tasks[task] = [
-                    key if key in by_key else person_key(key, task) for key in keys
-                ]
-            translated = []
-            effective = event_tasks
-            for replacement in replacements:
-                task = replacement["task"]
-                item = {
-                    **replacement,
-                    "old_name": person_key(
-                        replacement["old_name"], task, assigned=effective.get(task, ()),
-                    ),
-                    "new_name": person_key(
-                        replacement["new_name"], task, replacement.get("telegram_id"),
-                    ),
-                }
-                translated.append(item)
-                effective = apply_replacements(effective, [item])
-            replacements = translated
-        current = event_tasks if draft else apply_replacements(
-            event_tasks, replacements,
+        current = _apply_assignment_replacements(
+            event_tasks, replacements, people, keyed=keyed,
         )
         for task, info in current.items():
             names = day.setdefault(task, [])

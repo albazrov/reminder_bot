@@ -2102,8 +2102,8 @@ class ServiceRegistry:
         return warnings
 
     def effective_assignments(self, service_id: str, event_date: str, *,
-                              connection=None) -> dict[str, list[str]]:
-        from .schedule_plan import plan_events
+                              connection=None, keyed: bool = False) -> dict[str, list[str]]:
+        from .schedule_plan import _apply_assignment_replacements, plan_events
 
         target = date.fromisoformat(event_date)
         people = self.readiness_people(service_id, connection=connection)
@@ -2120,41 +2120,58 @@ class ServiceRegistry:
             )
         for row in rows:
             plan = self._schedule_plan(row)
-            for event in plan_events(plan, people):
+            for event in plan_events(plan, people, keyed=keyed):
                 if event.event_date == target:
                     for assignment in event.assignments:
                         names = result.setdefault(assignment.task, [])
                         if assignment.name not in names:
                             names.append(assignment.name)
-        return {
-            task: list(task_assignment_names(info))
-            for task, info in apply_replacements(
-                result, replacements,
-            ).items()
-        }
+        return _apply_assignment_replacements(result, replacements, people, keyed=keyed)
 
     def replacement_assignment_errors(
         self, service_id: str, event_date: str, task: str, old_name: str, new_name: str,
-        *, connection=None,
+        *, connection=None, telegram_id: int | None = None,
     ) -> list[str]:
         tasks = self.assignment_tasks(service_id, event_date, connection=connection)
         if not dependent_tasks(tasks):
             return []
-        assigned = self.effective_assignments(service_id, event_date, connection=connection)
-        current = assigned.get(task, [])
-        if old_name not in current:
-            return ["Назначение изменилось — откройте график заново."]
+        assigned = self.effective_assignments(
+            service_id, event_date, connection=connection, keyed=True,
+        )
         people = self.readiness_people(service_id, connection=connection)
+        current = assigned.get(task, [])
+        old_keys = [
+            key for key in current
+            if key == old_name or any(
+                person["key"] == key and person["name"] == old_name for person in people
+            )
+        ]
+        if len(old_keys) != 1:
+            return ["Назначение изменилось — откройте график заново."]
+        candidates = [
+            person["key"] for person in people
+            if (person["telegram_id"] == telegram_id if telegram_id is not None
+                else person["name"] == new_name and task in person["tasks"])
+        ]
+        if len(candidates) > 1:
+            return ["Уточните Telegram-аккаунт заменяющего участника."]
+        if telegram_id is not None and not candidates and any(
+            person["name"] == new_name or person["key"] == new_name for person in people
+        ):
+            return [
+                "Telegram-аккаунт заменяющего не совпадает с участником с таким именем. "
+                "Подключите его аккаунт в составе служения и выберите замену заново."
+            ]
+        new_key = candidates[0] if candidates else new_name
         skills = {
-            person["name"]: set(person["tasks"]) for person in people
-            if sum(other["name"] == person["name"] for other in people) == 1
+            person["key"]: set(person["tasks"]) for person in people
         }
         _, previous_warnings = assignment_issues(
             tasks, {event_date: assigned}, skills, complete=False,
         )
         changed = {
             **assigned,
-            task: [new_name if name == old_name else name for name in current],
+            task: [new_key if key == old_keys[0] else key for key in current],
         }
         errors, warnings = assignment_issues(
             tasks, {event_date: changed}, skills, complete=False,
@@ -2186,9 +2203,16 @@ class ServiceRegistry:
         person = self.service_person(service_id, telegram_id, task)
         if person is None:
             return [task]
-        assigned = self.effective_assignments(service_id, event_date, connection=connection)
-        scheduled_name = name or person["name"]
-        own = [task_name for task_name, people in assigned.items() if scheduled_name in people]
+        assigned = self.effective_assignments(
+            service_id, event_date, connection=connection, keyed=True,
+        )
+        keys = [
+            item["key"] for item in self.readiness_people(service_id, connection=connection)
+            if item["telegram_id"] == telegram_id
+        ]
+        if len(keys) != 1:
+            return [task]
+        own = [task_name for task_name, people in assigned.items() if keys[0] in people]
         if task not in own:
             return [task]
         return [task] + [
@@ -3419,7 +3443,7 @@ class ServiceRegistry:
                     return False
             errors = self.replacement_assignment_errors(
                 service_id, event_date, task, old_name, new_name,
-                connection=connection,
+                connection=connection, telegram_id=telegram_id,
             )
             if errors:
                 raise ValueError(

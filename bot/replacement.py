@@ -244,6 +244,7 @@ def choose_volunteer(registry, poll: dict) -> dict | None:
         if not registry.replacement_assignment_errors(
             poll["service_id"], poll["event_date"], poll["task"], poll["old_name"],
             substitute_from_answer(registry, poll, answer)["name"],
+            telegram_id=answer["telegram_id"],
         )
     ]
     if not volunteers:

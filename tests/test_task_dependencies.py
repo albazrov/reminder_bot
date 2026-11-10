@@ -321,6 +321,100 @@ class DependentRegistryTest(unittest.TestCase):
         self.assertEqual([item[0] for item in primary], [HEAD, DUTY])
         self.assertEqual(self.registry.get_confirmation("kitchen", "2026-11-08", DUTY, 501), "declined")
 
+    def test_namesakes_keep_declines_and_replacement_checks_separate(self):
+        # Preserve a legacy per-task binding of two accounts with the same name.
+        with self.registry._connection() as connection:
+            connection.execute(
+                "DELETE FROM service_members WHERE service_id='kitchen' AND name IN ('A','B')"
+            )
+            connection.execute(
+                "DELETE FROM responsible_contacts WHERE service_id='kitchen' "
+                "AND task=? AND telegram_id=501", (DUTY,),
+            )
+            connection.execute(
+                "UPDATE responsible_contacts SET name='Глеб' "
+                "WHERE service_id='kitchen' AND telegram_id IN (501,502)"
+            )
+        keys = {person["telegram_id"]: person["key"]
+                for person in self.registry.readiness_people("kitchen")}
+        self.slots = {day: {HEAD: [keys[501]], TEAM: [keys[502]], DUTY: [keys[502]]}
+                      for day in self.slots}
+        self.registry.set_schedule_slots(1001, "kitchen", "2026-11", self.slots)
+        self.approve()
+        answer = self.registry.set_assignment_answer(
+            "kitchen", "2026-11-01", HEAD, 501, "declined",
+        )
+        self.assertEqual([item[0] for item in answer], [HEAD])
+        self.assertIsNone(self.registry.get_confirmation("kitchen", "2026-11-01", DUTY, 501))
+        answer = self.registry.set_assignment_answer(
+            "kitchen", "2026-11-01", TEAM, 502, "declined",
+        )
+        self.assertEqual([item[0] for item in answer], [TEAM, DUTY])
+        for task in (HEAD, DUTY):
+            self.registry.set_responsible_contact(1001, "kitchen", task, "D", 504)
+        self.assertTrue(self.registry.replacement_assignment_errors(
+            "kitchen", "2026-11-08", TEAM, "Глеб", "C", telegram_id=503,
+        ))
+        for task in (HEAD, DUTY):
+            self.assertTrue(self.registry.set_replacement(
+                "kitchen", "2026-11-08", task, "Глеб", "D", 504, "", "admin", 1001,
+            ))
+        assigned = self.registry.effective_assignments(
+            "kitchen", "2026-11-08", keyed=True,
+        )
+        self.assertEqual(assigned[TEAM], [keys[502]])
+        self.assertEqual(assigned[DUTY], ["D"])
+        self.assertEqual(self.registry.decline_scope_tasks(
+            "kitchen", "2026-11-08", TEAM, 502,
+        ), [TEAM])
+
+    def test_unknown_account_cannot_inherit_namesakes_duty_permissions(self):
+        self.slots = {day: {HEAD: ["A"], TEAM: ["B"], DUTY: ["B"]}
+                      for day in self.slots}
+        self.registry.set_schedule_slots(1001, "kitchen", "2026-11", self.slots)
+        self.approve()
+        day = "2026-11-01"
+        poll = {
+            "poll_id": "test", "service_id": "kitchen", "event_date": day,
+            "task": DUTY, "old_name": "B", "old_telegram_id": 502,
+        }
+        stranger = {"telegram_id": 999, "can": True, "full_name": "A", "username": ""}
+        member = {**stranger, "telegram_id": 501}
+        with patch.object(self.registry, "list_poll_answers", return_value=[stranger]):
+            self.assertIsNone(replacement.choose_volunteer(self.registry, poll))
+        with patch.object(self.registry, "list_poll_answers", return_value=[stranger, member]):
+            self.assertEqual(replacement.choose_volunteer(self.registry, poll), member)
+        for task in (DUTY, TEAM):
+            with self.subTest(task=task), self.assertRaisesRegex(ValueError, "аккаунт"):
+                self.registry.set_replacement(
+                    "kitchen", day, task, "B", "A", 999, "", "admin", 1001,
+                )
+        self.assertEqual(self.registry.list_replacements("kitchen", day), [])
+        self.assertEqual(self.registry.replacement_assignment_errors(
+            "kitchen", day, DUTY, "B", "A", telegram_id=501,
+        ), [])
+        self.assertEqual(self.registry.replacement_assignment_errors(
+            "kitchen", day, HEAD, "A", "Гость", telegram_id=999,
+        ), [])
+
+    def test_duty_rotation_uses_previous_month_replacements(self):
+        days = readiness.month_sundays(2026, 10)
+        slots = {day.isoformat(): {HEAD: ["A"], TEAM: ["B"], DUTY: ["A"]}
+                 for day in days}
+        self.registry.import_excel_plan(
+            1001, "kitchen", "2026-10", dates=list(slots),
+            tasks=schedule_plan.plan_tasks(self.registry, "kitchen"),
+            slots=slots, days={},
+        )
+        self.registry.set_replacement(
+            "kitchen", days[-1].isoformat(), DUTY, "A", "B", 502, "", "admin", 1001,
+        )
+        run = schedule_plan.free_run("kitchen", 2026, 11)
+        with patch("bot.readiness.build_plan", wraps=readiness.build_plan) as build:
+            summary = readiness.summarize(self.registry, run, assume_free=True)
+        self.assertEqual(build.call_args.args[0].last_duty, {"A": days[-2], "B": days[-1]})
+        self.assertEqual(summary.plan.slots[(SUNDAYS[0], DUTY)], ["A"])
+
     def test_replacements_preserve_accepted_outsider_warning_but_cannot_change_outsider(self):
         self.registry.set_service_task_enabled(1001, "kitchen", "пироги", True)
         self.registry.set_responsible_contact(1001, "kitchen", "пироги", "P", 505)
