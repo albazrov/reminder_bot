@@ -165,6 +165,32 @@ class SourceTest(unittest.IsolatedAsyncioTestCase):
             "https://example.invalid/source", self.cache,
         ))
 
+    async def test_retry_returning_to_cached_fingerprint_never_publishes_rejected_bytes(self):
+        self.session.get.side_effect = self.responses(b"cached-A")
+        await self.get()
+        version = yandex_disk.source_version("https://example.invalid/source", self.cache)
+        self.validate.reset_mock()
+        self.session.get.side_effect = [
+            Response(self.meta(b"metadata-B")),
+            Response({"href": "https://example.invalid/file"}),
+            Response(b"unchecked-C"),
+            Response(self.meta(b"cached-A")),
+        ]
+        with patch.object(yandex_disk.asyncio, "sleep", new=AsyncMock()):
+            path = await yandex_disk.download_public(
+                "https://example.invalid/source", self.root / "out.xlsx",
+                self.logger, attempts=3, cache_dir=self.cache,
+                validate=self.validate, force=True,
+            )
+        self.assertEqual(path.read_bytes(), b"cached-A")
+        self.assertEqual(yandex_disk.source_version(
+            "https://example.invalid/source", self.cache,
+        ), version)
+        candidate = self.validate.call_args.args[0]
+        self.assertTrue(candidate.exists())
+        self.assertEqual(candidate.read_bytes(), b"cached-A")
+        self.validate.assert_called_once()
+
     async def test_force_joining_cached_request_still_checks_metadata(self):
         self.session.get.side_effect = self.responses(b"cached")
         await self.get()
