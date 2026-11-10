@@ -1935,10 +1935,9 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     )
                 )
                 logger.debug.assert_any_call(
-                    "Личное расписание %s пропущено: задача «%s» стала "
-                    "информационной в графике",
+                    "Личное расписание %s пропущено: %s",
                     schedule["id"],
-                    "Праздник",
+                    "информационная задача — без личных уведомлений",
                 )
 
         asyncio.run(process())

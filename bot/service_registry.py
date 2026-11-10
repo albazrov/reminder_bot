@@ -5372,6 +5372,24 @@ class ServiceRegistry:
                 })
         return result
 
+    def list_service_user_reminder_schedules(
+        self, actor_id: int, service_id: str,
+    ) -> list[dict]:
+        """All rules, including disabled ones and rules without a contact."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            rows = connection.execute(
+                "SELECT s.id FROM user_reminder_schedules s "
+                "JOIN user_reminder_texts t ON t.id = s.text_id "
+                "WHERE t.service_id = ? ORDER BY s.id",
+                (service_id,),
+            ).fetchall()
+        return [
+            schedule for row in rows
+            if (schedule := self.get_user_reminder_schedule(row["id"])) is not None
+        ]
+
     def get_user_reminder_schedule(self, schedule_id: int) -> dict | None:
         _validate_positive_id(schedule_id, "schedule_id")
         with self._connection() as connection:
