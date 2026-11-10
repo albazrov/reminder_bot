@@ -91,7 +91,7 @@ def person_label(
     if telegram_id:
         return user_link(telegram_id, label)
     if contact is None and mark_unlinked:
-        return f"{name} · не привязан"
+        return f"{shown_name} · не привязан"
     return label
 
 

@@ -1187,6 +1187,20 @@ def month_overview(registry, actor_id: int, service_id: str, month: date) -> str
         elif draft:
             plan = None
         if plan is not None:
+            tasks = {task["name"]: task for task in plan.get("approved_tasks") or []}
+            for slots in plan["approved"].values():
+                for task in slots:
+                    tasks.setdefault(task, {"name": task})
+            saved_tasks = {"tasks": list(tasks.values())}
+            for day_key, slots in plan["approved"].items():
+                for task in tasks:
+                    if slots.get(task):
+                        continue
+                    moment = date.fromisoformat(day_key) + timedelta(
+                        days=slot_offset(saved_tasks, None, day_key, task) or 0,
+                    )
+                    if first <= moment <= last:
+                        assignments.setdefault(moment, {}).setdefault(task, [])
             for event in plan_events(plan, people):
                 if not first <= event.event_date <= last:
                     continue

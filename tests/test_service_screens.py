@@ -163,15 +163,43 @@ class ServiceScreensTest(unittest.TestCase):
     def test_actual_days_from_adjacent_month_and_year(self):
         self.now = self.now.replace(year=2027, month=1)
         self.plan(
-            {"2026-12-27": {"Микшер": ["На границе"]}},
+            {"2026-12-27": {"Микшер": ["На границе"], "Пульт": []}},
             month="2026-12",
-            tasks=[{"name": "Микшер", "needed": 1, "day": 5}],
+            tasks=[
+                {"name": "Микшер", "needed": 1, "day": 5},
+                {"name": "Пульт", "needed": 1, "day": 5},
+            ],
         )
         text = self.overview()
         self.assertIn("01.01.2027", text)
         self.assertIn("На границе", text)
+        self.assertIn("Пульт", text)
+        self.assertIn("Ответственные не указаны", text)
         self.assertNotIn("27.12.2026", text)
         self.assertIn("соседних утверждённых", text)
+
+    def test_empty_tasks_remain_visible_in_draft_and_approved_snapshots(self):
+        tasks = [
+            {"name": "Микшер", "needed": 1},
+            {"name": "Пульт", "needed": 1, "day": -3},
+        ]
+        slots = {"2026-11-15": {"Микшер": ["Человек"], "Пульт": []}}
+        self.plan(slots, approved=False, tasks=tasks)
+        draft = self.overview()
+        self.assertIn("Пульт", draft)
+        self.assertIn("12.11.2026", draft)
+        self.assertIn("Ответственные не указаны", draft)
+        self.plan(slots, tasks=tasks)
+        self.plan(
+            {"2026-11-15": {"Черновая задача": ["Черновик"]}},
+            approved=False, tasks=[{"name": "Черновая задача", "needed": 1}],
+        )
+        approved = self.overview()
+        self.assertIn("Пульт", approved)
+        self.assertIn("12.11.2026", approved)
+        self.assertIn("Человек", approved)
+        self.assertNotIn("Черновая задача", approved)
+        self.assertNotIn("Черновик", approved)
 
     def test_big_graph_pages_keep_actions_and_all_people(self):
         async def run():

@@ -47,6 +47,8 @@ class ServicePreviewTest(unittest.TestCase):
             )
             self.assertNotIn("LINK:3001:", unbound["text"])
             self.assertIn("не привязан", plain_text(unbound["text"]))
+            self.assertIn("Лёша", plain_text(unbound["text"]))
+            self.assertNotIn("Алексей Полный", plain_text(unbound["text"]))
 
     @staticmethod
     def _fixed_occurrence(_now, reminder):

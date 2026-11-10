@@ -7553,6 +7553,46 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_manual_chat_off_requires_confirmation_before_any_change(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -100444, enabled=True)
+            self.context.bot.get_chat = AsyncMock(return_value=SimpleNamespace(
+                type="supergroup", title="Чат", username=None, invite_link=None,
+            ))
+            self.context.bot.get_chat_member = AsyncMock(
+                return_value=SimpleNamespace(status="member"),
+            )
+            before = self.registry.get_service("sound")
+            for actor in (67890, 24680):
+                if actor == 24680:
+                    self.registry.add_service_admin(67890, "sound", actor)
+                picker = SimpleNamespace(
+                    data="service:service_chat_set:sound",
+                    from_user=SimpleNamespace(id=actor),
+                    message=self.message(actor, ""), answer=AsyncMock(),
+                )
+                await self.callback_handler("on_service_selected")(picker)
+                typed = self.message(actor, "-100555 off")
+                await self.message_handler("on_service_parameter")(typed)
+                self.assertEqual(self.registry.get_service("sound"), before)
+                if actor == 24680:
+                    self.assertIn("суперадминистратор", typed.answer.await_args.args[0])
+                    continue
+                confirm = self.callback_data_list(typed)[0]
+                self.assertTrue(confirm.startswith("disable:sound:"))
+                await self.callback_handler("on_service_disable")(SimpleNamespace(
+                    data=confirm, from_user=SimpleNamespace(id=actor),
+                    message=typed, answer=AsyncMock(),
+                ))
+                service = self.registry.get_service("sound")
+                self.assertFalse(service["enabled"])
+                self.assertEqual(service["group_chat_id"], -100555)
+                self.registry.set_group_chat(
+                    67890, "sound", before["group_chat_id"], enabled=before["enabled"],
+                )
+
+        asyncio.run(run())
+
     def test_service_card_hub_buttons_open_sections(self):
         async def run():
             for operation, expected in (

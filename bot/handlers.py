@@ -13791,11 +13791,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                 chat_id = int(parts[0])
                 await require_chat_member(message.from_user.id, chat_id)
+                if parts[1] == "off":
+                    await ask_service_disable(
+                        message, message.from_user.id, service_id, group_chat_id=chat_id,
+                    )
+                    return
                 registry.set_group_chat(
                     message.from_user.id,
                     service_id,
                     chat_id,
-                    enabled=parts[1] == "on",
+                    enabled=True,
                 )
                 if service_id == "assembly":
                     context.group_chat_id = chat_id
