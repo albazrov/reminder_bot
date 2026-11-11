@@ -108,7 +108,7 @@ def resolve_assignment_fields(
             **plan, "approved": {sunday: plan["approved"].get(sunday, {})},
         }
         assignments = _effective_plan_assignments(
-            registry, block, people, keyed=True,
+            registry, block, people, keyed=True, assigned_replacements_only=True,
         )
         lines = []
         rows = []

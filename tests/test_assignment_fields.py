@@ -173,6 +173,31 @@ class AssignmentFieldsTest(unittest.TestCase):
             template, cutoff=date(2027, 1, 1),
         ).state)
 
+    def test_overlapping_week_dates_keep_replacements_in_their_source_block(self):
+        first, second = "2027-01-03", "2027-01-10"
+        slots = {first: {"старший": ["D"]}, second: {"старший": ["E"]}}
+        self.registry.save_schedule_draft(
+            "order", "2027-01", run_id=None, dates=[first, second],
+            tasks=[{"name": "старший", "needed": 1, "day": 2}],
+            slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            1001, "order", "2027-01", slots, chat_id=None, message_id=None,
+            approved_slot_days={
+                first: {"старший": {"D": 2}}, second: {"старший": {"E": -5}},
+            },
+        )
+        for old, new in (("E", "Other"), ("D", "Substitute"), ("Substitute", "Final")):
+            self.registry.set_replacement(
+                "order", "2027-01-05", "старший", old, new, telegram_id=None,
+                username="", source="admin", created_by=1001,
+            )
+        value = next(iter(self.resolve(assignment_field("order")).services.values()))
+        self.assertIn("старший — Final — 05.01.2027", plain_text(value))
+        self.assertNotIn("Other", value)
+        self.assertNotIn("Substitute", value)
+        self.assertNotIn("E —", plain_text(value))
+
     def test_strict_group_only_grammar_and_stable_task_token(self):
         field = assignment_field("order", "старший")
         for allowed in (GENERAL_GROUP_TEMPLATE_FIELDS,):

@@ -1212,9 +1212,15 @@ def plan_events(plan: dict, people: list[dict], *, keyed: bool = False) -> list[
 
 def _apply_assignment_replacements(
     assignments: dict[str, list[str]], replacements: list[dict], people: list[dict],
-    *, keyed: bool = False,
+    *, keyed: bool = False, assigned_only: bool = False,
 ) -> dict[str, list[str]]:
     if not keyed:
+        if assigned_only:
+            current = assignments
+            for replacement in replacements:
+                if replacement["old_name"] in current.get(replacement["task"], ()):
+                    current = apply_replacements(current, [replacement])
+            return current
         return apply_replacements(assignments, replacements)
     by_key = {person["key"]: person for person in people}
 
@@ -1248,12 +1254,15 @@ def _apply_assignment_replacements(
                 replacement["new_name"], task, replacement.get("telegram_id"),
             ),
         }
+        if assigned_only and item["old_name"] not in current.get(task, ()):
+            continue
         current = apply_replacements(current, [item])
     return current
 
 
 def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                                 draft: bool = False, keyed: bool = False,
+                                assigned_replacements_only: bool = False,
                                 ) -> dict[date, dict[str, list[str]]]:
     if draft:
         plan = {
@@ -1287,6 +1296,7 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
         )
         current = _apply_assignment_replacements(
             event_tasks, replacements, people, keyed=keyed,
+            assigned_only=assigned_replacements_only,
         )
         for task, info in current.items():
             names = day.setdefault(task, [])
