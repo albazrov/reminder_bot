@@ -49,6 +49,61 @@ class PersonalReminderForecastTest(unittest.TestCase):
             self.registry, 1001, "sound", self.month, self.now,
         ))
 
+    def test_forecast_task_order_preserves_dates_rules_and_database(self):
+        self.rule(task="сборка")
+        self.rule(task="звук")
+        text_id = self.registry.ensure_user_text(2001, "sound", "звук")
+        self.registry.add_schedule(text_id, 0, "09:00", origin="user")
+        tasks = [{"name": task, "needed": 1} for task in ("сборка", "звук")]
+        for assigned in (True, False):
+            with self.subTest(assigned=assigned):
+                self.approve({
+                    day: {task["name"]: ["Алексей"] if assigned else []
+                          for task in tasks}
+                    for day in ("2026-11-15", "2026-11-22")
+                }, tasks=tasks)
+                schedules = self.registry.list_service_user_reminder_schedules(
+                    1001, "sound",
+                )
+                original_ids = [rule["schedule_id"] for rule in schedules]
+                with self.registry._connection() as connection:
+                    before = "\n".join(connection.iterdump())
+                with patch.object(
+                    self.registry, "list_service_user_reminder_schedules",
+                    return_value=schedules,
+                ):
+                    entries = personal_reminder_forecast(
+                        self.registry, 1001, "sound", self.month, self.now,
+                    )
+                if assigned:
+                    self.assertEqual(
+                        [entry.splitlines()[0] for entry in entries],
+                        [
+                            f"📅 {day} · {task} · Алексей"
+                            for day in ("15.11.2026", "22.11.2026")
+                            for task in ("звук", "звук", "сборка")
+                        ],
+                    )
+                else:
+                    self.assertEqual(
+                        [entry.splitlines()[0] for entry in entries[1:]],
+                        ["• Алексей · звук", "• Алексей · звук",
+                         "• Алексей · сборка"],
+                    )
+                rule_lines = [entry.splitlines()[1] for entry in entries
+                              if entry.startswith(("📅", "•"))]
+                expected_rules = [
+                    "за 1 день в 18:00", "в день служения в 09:00",
+                    "за 1 день в 18:00",
+                ] * (2 if assigned else 1)
+                for line, expected in zip(rule_lines, expected_rules, strict=True):
+                    self.assertIn(expected, line)
+                self.assertEqual(
+                    [rule["schedule_id"] for rule in schedules], original_ids,
+                )
+                with self.registry._connection() as connection:
+                    self.assertEqual("\n".join(connection.iterdump()), before)
+
     def test_exact_dates_timezone_and_past_time(self):
         self.rule()
         self.approve({

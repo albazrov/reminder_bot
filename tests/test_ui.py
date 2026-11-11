@@ -17,6 +17,7 @@ from bot.ui import (
     code,
     layout_buttons,
     nav_row,
+    pair_back_help,
     plain_text,
     render_screen_chunks,
     send_telegram_screen,
@@ -27,6 +28,39 @@ from bot.ui import (
 
 
 class DialogRenderingTest(unittest.TestCase):
+    def test_every_sent_chunk_disables_link_preview_without_removing_url(self):
+        async def run():
+            send = AsyncMock()
+            url = "https://example.com/reminder"
+            await send_telegram_screen(
+                send, 123, ("Напоминание " + url + "\n") * 20, limit=100,
+            )
+            self.assertGreater(send.await_count, 1)
+            for call in send.await_args_list:
+                self.assertTrue(call.kwargs["link_preview_options"].is_disabled)
+                self.assertNotIn("disable_web_page_preview", call.kwargs)
+            self.assertIn(url, "".join(call.args[1] for call in send.await_args_list))
+
+        asyncio.run(run())
+
+    def test_back_and_help_share_last_row_without_moving_paging_or_dangerous_actions(self):
+        def button(text, data):
+            return InlineKeyboardButton(text=text, callback_data=data)
+
+        edit = button("✏️ Изменить", "edit")
+        help_button = button("❓ Справка", "help")
+        previous = button("⬅️ Назад", "ui_page:previous")
+        delete = button("🗑 Удалить", "delete")
+        back = button("⬅️ К графику", "back")
+        rows = pair_back_help([[edit, help_button], [previous], [delete], [back]])
+        self.assertEqual(rows, [[edit], [previous], [delete], [back, help_button]])
+        self.assertEqual(pair_back_help(rows), rows)
+        validate_inline_keyboard(rows)
+        self.assertEqual(
+            pair_back_help([[edit, help_button], [previous]]),
+            [[edit, help_button], [previous]],
+        )
+
     def test_chat_links_are_safe_plain_decodable_and_chunked_as_one_marker(self):
         marker = telegram_link("https://t.me/service_chat", "Чат <&>")
         self.assertEqual(plain_text(marker), "Чат <&>")

@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aiogram.types import LinkPreviewOptions
+
 from bot.notifier import (
     _notify_admin,
     build_general_message,
@@ -28,6 +30,7 @@ class PartialNotificationTest(unittest.TestCase):
                 "<b>⚠️ Ошибка: &lt;untrusted diagnostic&gt;</b>",
                 parse_mode="HTML",
                 reply_markup=None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
 
         asyncio.run(notify())
