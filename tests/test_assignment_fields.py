@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from bot import app
-from bot.assignment_fields import assignment_field, resolve_assignment_fields
+from bot.assignment_fields import (
+    AssignmentFieldResolutionError, assignment_field, resolve_assignment_fields,
+)
 from bot.event_notes import EventNoteResolutionError
 from bot.service_registry import (
     ADMIN_REPORT_FIELDS, GENERAL_GROUP_TEMPLATE_FIELDS, PERSONAL_TEMPLATE_FIELDS,
@@ -222,6 +224,44 @@ class AssignmentFieldsTest(unittest.TestCase):
         value = next(iter(self.resolve(assignment_field("order")).services.values()))
         self.assertIn("старший — D — 31.12.2026", plain_text(value))
         self.assertNotIn("Other", value)
+
+    def test_namesakes_in_overlapping_blocks_fail_explicitly_for_ambiguous_replacement(self):
+        people = [
+            {"key": f"Twin · {user}", "name": "Twin", "telegram_id": user,
+             "tasks": ["старший"], "username": ""}
+            for user in (601, 602)
+        ]
+        first, second = "2027-01-03", "2027-01-10"
+        slots = {
+            first: {"старший": [people[0]["key"]]},
+            second: {"старший": [people[1]["key"]]},
+        }
+        self.registry.save_schedule_draft(
+            "order", "2027-01", run_id=None, dates=[first, second],
+            tasks=[{"name": "старший", "needed": 1, "day": 2}],
+            slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            1001, "order", "2027-01", slots, chat_id=None, message_id=None,
+            approved_slot_days={
+                first: {"старший": {people[0]["key"]: 2}},
+                second: {"старший": {people[1]["key"]: -5}},
+            },
+        )
+        self.registry.set_replacement(
+            "order", "2027-01-05", "старший", "Twin", "Guest", telegram_id=None,
+            username="", source="admin", created_by=1001,
+        )
+        reader = self.registry.readiness_people
+        with patch.object(
+            self.registry, "readiness_people",
+            side_effect=lambda source: people if source == "order" else reader(source),
+        ):
+            with self.assertRaisesRegex(AssignmentFieldResolutionError, "тёзки"):
+                self.resolve(assignment_field("order"))
+            preview = self.preview(assignment_field("order"))
+        self.assertFalse(preview["has_data"])
+        self.assertIn("тёзки", preview["error"])
 
     def test_strict_group_only_grammar_and_stable_task_token(self):
         field = assignment_field("order", "старший")

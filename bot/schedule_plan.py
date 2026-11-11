@@ -1232,6 +1232,13 @@ def _apply_assignment_replacements(
             if not matches:
                 matches = [person["key"] for person in people
                            if person["name"] == name and task in person["tasks"]]
+            if other_assignments is not None and len(matches) > 1:
+                from .assignment_fields import AssignmentFieldResolutionError
+
+                raise AssignmentFieldResolutionError(
+                    "Нельзя однозначно определить участника сохранённой замены: "
+                    "на одну дату назначены тёзки. Уточните назначения или дату задачи."
+                )
         return matches[0] if len(matches) == 1 else name
 
     def keyed_assignments(values):
