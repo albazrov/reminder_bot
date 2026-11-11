@@ -2043,6 +2043,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             handler_name = "on_readiness"
         elif button.callback_data.startswith("psum:"):
             handler_name = "on_personal_summary_page"
+        elif button.callback_data.startswith("afield:"):
+            handler_name = "on_assignment_field"
+        elif button.callback_data.startswith("ui_page:"):
+            handler_name = "on_dialog_page"
         else:
             handler_name = "on_group_reminder_action"
         await self.callback_handler(handler_name)(callback)
@@ -2394,6 +2398,168 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 confirm.message, lambda button: button.text == "✅ Отправить"
             )
             self.context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_assignment_field_picker_preserves_text_and_rejects_stale_choices(self):
+        from bot.assignment_fields import assignment_field
+
+        async def run():
+            self.registry.set_group_chat(67890, "order", -100556, enabled=True)
+            self.registry.set_group_chat(67890, "kitchen", -100557, enabled=True)
+            self.registry.add_service_task(67890, "kitchen", "Скатерти")
+            reminder = self.registry.list_group_reminders("sound")[0]
+            before = reminder["body"]
+            menu = await self._open_sound_reminders()
+            card = await self._click(menu.message, lambda button: button.text == "1")
+            edit = await self._click(card.message, lambda button: button.text == "✏️ Текст")
+            sources = await self._click(
+                edit.message,
+                lambda button: button.text == "🔗 Назначения другого служения",
+            )
+            order_name = self.registry.get_service("order")["name"]
+            choices = await self._click(
+                sources.message, lambda button: button.text.endswith(order_name),
+            )
+            field = await self._click(
+                choices.message, lambda button: button.text.endswith("старший"),
+            )
+            self.assertIn(
+                assignment_field("order", "старший"),
+                field.message.answer.await_args.args[0],
+            )
+            self.assertEqual(self.registry.get_group_reminder(reminder["id"])["body"], before)
+            for value in self.callback_data_list(choices.message):
+                self.assertLessEqual(len(value.encode()), 64)
+            stale = await self._click(
+                choices.message, lambda button: button.text.endswith("Все задачи"),
+            )
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            saved = await self._type(
+                "Назначения:\n" + assignment_field("order", "старший"),
+            )
+            self.assertIn("Напоминание", saved.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.get_group_reminder(reminder["id"])["body"],
+                "Назначения:\n" + assignment_field("order", "старший"),
+            )
+            edit = await self._click(saved, lambda button: button.text == "✏️ Текст")
+            sources = await self._click(
+                edit.message,
+                lambda button: button.text == "🔗 Назначения другого служения",
+            )
+            kitchen_name = self.registry.get_service("kitchen")["name"]
+            tasks = await self._click(
+                sources.message, lambda button: button.text.endswith(kitchen_name),
+            )
+            labels = [
+                button.text for row in tasks.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+                if ":task:" in button.callback_data
+            ]
+            tasks = await self._click(
+                tasks.message,
+                lambda button: button.callback_data.startswith("ui_page:")
+                and "➡️" in button.text,
+            )
+            labels.extend(
+                button.text for row in tasks.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+                if ":task:" in button.callback_data
+            )
+            self.assertEqual(
+                [next(name for name in ("Все задачи", "старший", "в смене", "Скатерти", "пироги")
+                      if label.endswith(name)) for label in labels],
+                ["Все задачи", "старший", "в смене", "Скатерти", "пироги"],
+            )
+            self.registry.remove_service_admin(67890, "sound", 12345)
+            denied = await self._click(
+                tasks.message, lambda button: button.text.endswith("пироги"),
+            )
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+            denied.message.answer.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_send_now_rechecks_related_assignments_and_passes_manual_context(self):
+        async def run():
+            self.registry.set_group_chat(67890, "sound", -100555, enabled=True)
+            self.context.get_group_reminder_preview = AsyncMock(return_value={
+                "has_data": True, "text": "Назначения", "date": "25.10.2026",
+                "event_date": "2026-10-25", "schedule_state": ["local"],
+                "assignment_state": ("2026-10-25", "related-a"),
+            })
+            self.context.group_preview_state = MagicMock(return_value=["local"])
+            self.context.assignment_fields_state = MagicMock(
+                return_value=("2026-10-25", "related-b"),
+            )
+            menu = await self._open_sound_reminders()
+            card = await self._click(menu.message, lambda button: button.text == "1")
+            confirm = await self._click(
+                card.message, lambda button: button.text == "📤 Отправить сейчас",
+            )
+            self.assertTrue(
+                self.context.get_group_reminder_preview.await_args.kwargs["manual"],
+            )
+            self.context.bot.send_message.reset_mock()
+            rejected = await self._click(
+                confirm.message, lambda button: button.text == "✅ Отправить",
+            )
+            self.context.bot.send_message.assert_not_awaited()
+            self.assertIn("Связанные назначения", rejected.answer.await_args.args[0])
+            again = await self._click(
+                card.message, lambda button: button.text == "📤 Отправить сейчас",
+            )
+            self.registry.set_service_default_template(
+                67890, "sound", "Новый шаблон {week_task_assignments}",
+            )
+            stale = await self._click(
+                again.message, lambda button: button.text == "✅ Отправить",
+            )
+            self.context.bot.send_message.assert_not_awaited()
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_assignment_picker_pages_and_preserves_new_reminder_draft(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message, lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("3")
+            text_step = await self._type("10:30")
+            services = [
+                {"id": f"source{index}", "name": f"Служение {index}", "enabled": True}
+                for index in range(15)
+            ]
+            with patch.object(self.registry, "list_services", return_value=services):
+                picker = await self._click(
+                    text_step,
+                    lambda button: button.text == "🔗 Назначения другого служения",
+                )
+            buttons = [
+                button for row in picker.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+            ]
+            page_button = next(
+                button for button in buttons
+                if button.callback_data.startswith("ui_page:") and "➡️" in button.text
+            )
+            page = await self._click(
+                picker.message, lambda button: button is page_button,
+            )
+            for value in self.callback_data_list(page.message):
+                self.assertLessEqual(len(value.encode()), 64)
+            await self._type("Неделя:\n{week_task_assignments}")
+            self.assertIn((3, "10:30", "Неделя:\n{week_task_assignments}"), self._sound_slots())
+            stale = await self._click(
+                picker.message, lambda button: button.callback_data.startswith("afield:"),
+            )
+            self.assertIn("устарел", stale.answer.await_args.args[0])
 
         asyncio.run(run())
 

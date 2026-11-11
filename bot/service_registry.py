@@ -34,6 +34,7 @@ GROUP_TEMPLATE_FIELDS = frozenset(
         "service_name",
         "sunday_date",
         "task_assignments",
+        "week_task_assignments",
         "informational_notes",
         "event_notes",
         "task",
@@ -177,6 +178,8 @@ def validate_notification_template(
     allowed_fields: frozenset[str],
     label: str,
 ) -> None:
+    from .assignment_fields import assignment_reference
+
     allowed = ", ".join(sorted(f"{{{field}}}" for field in allowed_fields))
     if "\x00" in template:
         raise ValueError(f"{label}: текст содержит недопустимые символы.")
@@ -184,7 +187,11 @@ def validate_notification_template(
         for _, field_name, format_spec, conversion in Formatter().parse(template):
             if field_name is None:
                 continue
-            if field_name not in allowed_fields:
+            reference = (
+                "week_task_assignments" in allowed_fields
+                and assignment_reference(field_name) is not None
+            )
+            if field_name not in allowed_fields and not reference:
                 raise ValueError(
                     f"{label}: поле {{{field_name}}} не поддерживается. "
                     f"Доступны: {allowed}."
