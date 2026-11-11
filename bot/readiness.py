@@ -34,6 +34,7 @@ from .group_send import send_to_service_group
 from .month_summary import month_end, month_key, month_title, next_month
 from .presentation import task_emoji
 from .schedule_planner import Plan, PlanInput, build_plan
+from .services import sort_tasks_for_display
 from .service_registry import (  # noqa: F401 — шаблоны для экранов
     DEFAULT_READINESS_CHAT_REMINDER,
     DEFAULT_READINESS_CLOSED,
@@ -552,7 +553,10 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
         for day in run["dates"]:
             event_date = date.fromisoformat(day)
             lines += ["", f"🗓 {event_date:%d.%m}"]
-            for task, needed in summary.plan.needed.items():
+            for task, needed in sort_tasks_for_display(
+                summary.plan.needed.items(), run["service_id"],
+                name=lambda item: item[0],
+            ):
                 people = summary.plan.slots.get((event_date, task), [])
                 used_silent |= any(person in silent for person in people)
                 lines += task_lines(

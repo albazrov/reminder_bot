@@ -29,6 +29,7 @@ from aiogram.types import (
     KeyboardButton,
     KeyboardButtonRequestChat,
     KeyboardButtonRequestUsers,
+    LinkPreviewOptions,
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -104,12 +105,13 @@ from .scheduler import (
     reminder_occurrence,
     reminder_period_status,
 )
-from .services import SERVICES, normalized_name
+from .services import SERVICES, normalized_name, sort_tasks_for_display
 from .ui import (
     callback_text,
-    clean_previous_menu,
-    clean_previous_menu_by_id,
+    clean_previous_menu as clean_previous_message,
+    clean_previous_menu_by_id as clean_previous_message_by_id,
     layout_buttons,
+    pair_back_help,
     nav_row,
     plain_text,
     render_screen_chunks,
@@ -685,7 +687,45 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         str, tuple[int, str, str, str, dict[str, Any]]
     ] = {}
 
-    async def _send_dialog(
+    dialog_locks: dict[int, asyncio.Lock] = {}
+    screen_parts: dict[tuple[int, int], tuple[int, ...]] = {}
+
+    def take_screen_parts(chat_id: int, message_id: int) -> tuple[int, ...]:
+        parts = screen_parts.get((chat_id, message_id), (message_id,))
+        for part in parts:
+            screen_parts.pop((chat_id, part), None)
+        return parts
+
+    async def clean_previous_menu_by_id(
+        bot, chat_id, message_id, logger, **kwargs,
+    ) -> None:
+        if chat_id is None or message_id is None:
+            return
+        for part in take_screen_parts(chat_id, message_id):
+            await clean_previous_message_by_id(
+                bot, chat_id, part, logger, **kwargs,
+            )
+
+    async def clean_previous_menu(message, logger, **kwargs) -> None:
+        if message is None:
+            return
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        message_id = getattr(message, "message_id", None)
+        if (chat_id, message_id) in screen_parts:
+            await clean_previous_menu_by_id(
+                context.bot, chat_id, message_id, logger, **kwargs,
+            )
+        else:
+            await clean_previous_message(message, logger, **kwargs)
+
+    async def _send_dialog(target: Message, text: str, **kwargs) -> Message | None:
+        actor_id = getattr(getattr(target, "chat", None), "id", None)
+        if actor_id is not None and target.chat.type == ChatType.PRIVATE:
+            async with dialog_locks.setdefault(actor_id, asyncio.Lock()):
+                return await _send_dialog_locked(target, text, **kwargs)
+        return await _send_dialog_locked(target, text, **kwargs)
+
+    async def _send_dialog_locked(
         target: Message,
         text: str,
         *,
@@ -694,6 +734,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         **kwargs,
     ) -> Message | None:
         kwargs.pop("parse_mode", None)
+        kwargs.setdefault("link_preview_options", LinkPreviewOptions(is_disabled=True))
         keyboard_limit = kwargs.pop("_dialog_keyboard_limit", 6)
         keep_rows = kwargs.pop("_dialog_keep_rows", False)
         text_limit = kwargs.pop("_dialog_text_limit", 500)
@@ -791,6 +832,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "🏠 В начало",
                     ))
                     or (
+                        back_callback(markup) is not None
+                        and button.text.startswith(("❓ Справка", "❓ Помощь"))
+                    )
+                    or (
                         button.text == "⬅️ Назад"
                         and text.lstrip().startswith(("❌", "⚠️"))
                     )
@@ -860,6 +905,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
+        if isinstance(markup, InlineKeyboardMarkup):
+            rows = pair_back_help(markup.inline_keyboard)
+            validate_inline_keyboard(rows, max_buttons=keyboard_limit)
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
+
         nav_actor = (
             actor_id
             if chat_type == ChatType.PRIVATE and actor_id is not None
@@ -909,17 +959,31 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
         chunks = render_screen_chunks(text, limit=text_limit)
         sent_message = None
-        for index, chunk in enumerate(chunks):
-            sent_message = await target.answer(
-                chunk,
-                parse_mode="HTML",
-                reply_markup=(
-                    markup if index == len(chunks) - 1 else None
-                ),
-                **kwargs,
-            )
-            if sent_ids is not None:
-                sent_ids.append(sent_message.message_id)
+        parts = []
+        completed = False
+        try:
+            for index, chunk in enumerate(chunks):
+                sent_message = await target.answer(
+                    chunk,
+                    parse_mode="HTML",
+                    reply_markup=(
+                        markup if index == len(chunks) - 1 else None
+                    ),
+                    **kwargs,
+                )
+                parts.append(sent_message.message_id)
+                if sent_ids is not None:
+                    sent_ids.append(sent_message.message_id)
+            completed = True
+        finally:
+            if not completed:
+                for part in parts:
+                    await clean_previous_message_by_id(
+                        context.bot, target.chat.id, part, debug
+                    )
+        if len(parts) > 1 and nav_actor is not None:
+            for part in parts:
+                screen_parts[(actor_id, part)] = tuple(parts)
         if sent_message is not None and late_command():
             # Пока отправлялся этот экран, более поздняя команда показала
             # свой — этот лишний.
@@ -934,14 +998,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             state = nav_state.setdefault(
                 nav_actor, {"shown": False, "helpers": []}
             )
-            previous_menu = state.get("screen") if state.get("menu") else None
+            previous_menu = state.get("screen") if (
+                state.get("menu")
+                or (target.chat.id, state.get("screen")) in screen_parts
+            ) else None
             state["menu"] = isinstance(markup, InlineKeyboardMarkup)
             # Сразу, до await: параллельный обработчик увидит этот экран.
             state["screen"] = sent_message.message_id
             if (
                 clean_previous
-                and command
                 and previous_menu is not None
+                and (command or (target.chat.id, previous_menu) in screen_parts)
                 and previous_menu != sent_message.message_id
             ):
                 # Экран команды заменяет прежнее меню. Удаление — после
@@ -1945,6 +2012,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     pending.get("schedule_assignments", {}).get(task, [])
                 )
             ]
+        tasks = sort_tasks_for_display(tasks, service_id)
         page_size = 3
         page_count = max(1, (len(tasks) + page_size - 1) // page_size)
         page = min(max(page, 0), page_count - 1)
@@ -2195,7 +2263,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if not person["telegram_id"] and contact:
                 person["telegram_id"] = contact["telegram_id"]
                 person["username"] = contact.get("username") or ""
-            person["schedule_tasks"] = schedule_tasks.get(person["name"], [])
+            person["schedule_tasks"] = sort_tasks_for_display(
+                schedule_tasks.get(person["name"], []), service_id,
+            )
         return list(people.values())
 
     async def send_member_choices(
@@ -2302,7 +2372,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ])
         linked = sum(1 for person in people if person["telegram_id"])
         lines = [
-            f"👥 Состав · {service_label(service)}",
+            f"{service_label(service)} › 👥 Состав",
             f"📊 Привязано {linked} из {len(people)}"
             + (f" · стр. {page + 1} из {page_count}" if page_count > 1 else ""),
             "ℹ️ Выберите человека: Telegram, задачи или удаление из "
@@ -2507,9 +2577,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             None,
         )
         # «Списки» (или заданные в боте) и привязки к задачам.
-        tasks = list(dict.fromkeys(
+        tasks = sort_tasks_for_display(dict.fromkeys(
             (member or {}).get("tasks", []) + (person or {}).get("tasks", [])
-        ))
+        ), service_id)
         token = secrets.token_urlsafe(6)
         pending["step"] = "member_card"
         pending["member_card"] = {"token": token, "name": name, "tasks": tasks}
@@ -3144,7 +3214,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 names.append(assignment.name)
         linked = total = 0
         days = getattr(event, "days", {})
-        for task, names in names_by_task.items():
+        for task, names in sort_tasks_for_display(
+            names_by_task.items(), service["id"], name=lambda item: item[0],
+        ):
             moment = days.get(task)
             lines.extend(["", f"{task_emoji(task)} {task}" + (
                 f" · {_WEEKDAYS[moment.weekday()]} {moment:%d.%m}"
@@ -3591,6 +3663,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         f"{pending['session_id']}"
                     ),
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="📤 Отправить сейчас",
                     callback_data=(
@@ -3648,6 +3722,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         f"{reminder_id}:{pending['session_id']}"
                     ),
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🗑 Удалить",
                     callback_data=(
@@ -5011,7 +5087,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(message, "Служение не найдено.", parse_mode=None)
             return
         # Служение без задач — одна строка с его названием.
-        tasks = registry.plan_tasks(service_id)
+        tasks = sort_tasks_for_display(
+            registry.plan_tasks(service_id), service_id, name=lambda task: task["name"],
+        )
         lines = [
             f"👥 {service_label(service)} · нужно людей",
             "",
@@ -5703,7 +5781,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"{'☑️' if task in selected else '⬜'} {task}"[:60],
                 "addmt", service_id, f"{token}.{index}",
             )
-            for index, task in enumerate(tasks)
+            for index, task in sort_tasks_for_display(
+                enumerate(tasks), service_id, name=lambda pair: pair[1],
+            )
         ]
         rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
         rows.append([readiness_button("✅ Сохранить", "addms", service_id, token)])
@@ -5825,10 +5905,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             current = datetime.now(context.timezone).date().replace(day=1)
             following = month_end(current.year, current.month) + timedelta(days=1)
             other = following if month_arg == current.strftime("%Y%m") else current
-            rows.append([readiness_button(
+            auto_button = readiness_button(
                 f"🧮 Авто {month_title(other.year, other.month).split()[0][:3]}",
                 "pfree", service_id, other.strftime("%Y%m"),
-            )])
+            )
+            if len(rows) > 1 and len(rows[1]) == 1 and rows[1][0].text.startswith("✅"):
+                rows[1].append(auto_button)
+            else:
+                rows.append([auto_button])
         rows.append([readiness_button("❓ Справка", "phelp", service_id, month_arg)])
         rows.append([readiness_button(
             "⬅️ К графику" if plan.get("run_id") is None else "⬅️ К опросу",
@@ -5874,7 +5958,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         month_arg = plan["month"].replace("-", "")
         day = plan["dates"][day_index]
         rows = []
-        for index, task in enumerate(plan["tasks"]):
+        for index, task in sort_tasks_for_display(
+            enumerate(plan["tasks"]), service_id, name=lambda pair: pair[1]["name"],
+        ):
             people = schedule_plan.slot_people(plan, day, task["name"])
             shown = ", ".join(names.get(key, key) for key in people) or "⚠️ никого"
             rows.append([readiness_button(
@@ -6361,9 +6447,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             del parts[1]
         if action == "phelp":
+            route = "Авто" if plan.get("run_id") is None else "Опрос"
+            year, month = map(int, plan["month"].split("-"))
             await _send_dialog(
                 callback.message,
-                f"❓ {service_label(service)} › График › Справка\n\n"
+                f"❓ {service_label(service)} › График › {route} › "
+                f"{month_title(year, month)} › Справка\n\n"
                 "«Авто» открывает существующий график выбранного месяца. "
                 "Если его нет, создаёт черновик без Excel и опроса: "
                 "все участники считаются доступными по воскресеньям.\n\n"
@@ -12294,10 +12383,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             enabled = registry.get_user_notifications_enabled(
                 actor_id, service_id
             )
-            tasks = await current_personal_tasks(
-                registry, actor_id, service_id, state
+            tasks = sort_tasks_for_display(
+                await current_personal_tasks(registry, actor_id, service_id, state),
+                service_id,
             )
-            rules = registry.list_user_service_schedules(actor_id, service_id)
+            rules = sort_tasks_for_display(
+                registry.list_user_service_schedules(actor_id, service_id),
+                service_id, name=lambda rule: rule["task"],
+            )
             text = (
                 f"🔔 {service_label(service)}\n\n"
                 f"Личные уведомления: "
@@ -12438,8 +12531,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
         elif name == "add_task":
             service_id = level["service_id"]
-            tasks = await current_personal_tasks(
-                registry, actor_id, service_id, state
+            tasks = sort_tasks_for_display(
+                await current_personal_tasks(registry, actor_id, service_id, state),
+                service_id,
             )
             text = "➕ Своё напоминание\nℹ️ Выберите задачу, о которой напомнить."
             for task in tasks:
@@ -12885,7 +12979,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             week["moments"] += block["moments"]
         return [
             weeks[sunday] for sunday in sorted(weeks)
-            if week_items(weeks[sunday])
+            if week_items(weeks[sunday], service_id)
         ]
 
     def week_title(block: dict) -> str:
@@ -12897,7 +12991,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"{monday.isocalendar().week} нед. {monday:%d.%m}–{end:%d.%m}"
         )
 
-    def week_items(block: dict) -> list[tuple]:
+    def week_items(block: dict, service_id: str) -> list[tuple]:
         """Задачи недели по порядку дней: (день, задача, люди)."""
         items: dict[tuple, list[str]] = {}
         for item, moment in zip(block["assignments"], block["moments"]):
@@ -12906,10 +13000,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             names = items.setdefault((moment, item.task), [])
             if item.name not in names:
                 names.append(item.name)
+        ordered = sort_tasks_for_display(
+            items.items(), service_id, name=lambda entry: entry[0][1],
+        )
         return [
             (day, task, names)
             for (day, task), names in sorted(
-                items.items(), key=lambda entry: entry[0][0]
+                ordered, key=lambda entry: entry[0][0]
             )
         ]
 
@@ -12937,7 +13034,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             mark = "▶️" if block["date"] == sunday else "🗓"
             lines.append(f"{mark} {week_title(block)}")
             by_day: dict = {}
-            for day, task, names in week_items(block):
+            for day, task, names in week_items(block, pending["service_id"]):
                 by_day.setdefault(day, []).append(
                     f"{task_emoji(task)} {task}: {', '.join(names)}"
                 )
@@ -13049,7 +13146,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def show_replace_week(message: Message, pending: dict,
                                 notice: str = "") -> None:
         """Неделя: все её задачи с датами и людьми, выбор задачи."""
-        items = week_items(pending["week"])
+        items = week_items(pending["week"], pending["service_id"])
         pending["items"] = items
         pending["step"] = "replace_week"
         for key in ("event", "task", "old_name", "task_people", "substitute"):

@@ -7,12 +7,14 @@ from .month_summary import month_end
 from .presentation import (
     apply_replacements,
     display_name,
+    ordered_task_assignments,
     task_assignment_names,
     task_is_informational,
 )
 from .schedule_plan import plan_events
 from .scheduler import reminder_send_datetime
 from .service_registry import ServiceRegistry
+from .services import sort_tasks_for_display
 
 
 def personal_rule_label(days: int, clock: str) -> str:
@@ -104,7 +106,7 @@ def personal_reminder_forecast(
         assignments = apply_replacements(
             raw_assignments, registry.list_replacements(service_id, event_iso)
         )
-        for task, info in assignments.items():
+        for task, info in ordered_task_assignments(assignments, service_id):
             if task_is_informational(info):
                 continue
             for name in sorted(task_assignment_names(info), key=str.casefold):
@@ -164,7 +166,9 @@ def personal_reminder_forecast(
                         f"Отправка: {send_at:%d.%m.%Y %H:%M} — {reason}."
                     )
 
-    for rule in schedules:
+    for rule in sort_tasks_for_display(
+        schedules, service_id, name=lambda rule: rule["task"],
+    ):
         if rule["schedule_id"] in scheduled_ids:
             continue
         reason = personal_reminder_block_reason(

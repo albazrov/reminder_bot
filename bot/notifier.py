@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 from .service_registry import task_token
 from .ui import render_edit_screen, send_telegram_screen
@@ -173,6 +173,7 @@ async def send_assignments(
                         chat_id=group_chat_id,
                         message_id=state["general_message_id"],
                         parse_mode="HTML",
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                     )
                 except TelegramAPIError as exc:
                     delivery_state_persisted = False

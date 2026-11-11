@@ -11,6 +11,8 @@ import logging
 from collections.abc import Callable
 from datetime import date
 
+from aiogram.types import LinkPreviewOptions
+
 from .presentation import (
     display_name,
     apply_replacements,
@@ -41,10 +43,10 @@ class _Values(dict):
         return "{" + key + "}"
 
 
-def _people(assignments: dict) -> list[tuple[str, str]]:
+def _people(assignments: dict, service_id: str | None = None) -> list[tuple[str, str]]:
     return [
         (task, name)
-        for task, task_info in ordered_task_assignments(assignments)
+        for task, task_info in ordered_task_assignments(assignments, service_id)
         if not task_is_informational(task_info)
         for name in task_assignment_names(task_info)
     ]
@@ -64,13 +66,14 @@ def build_report_text(
     limit: int | None = None,
     *,
     display_names: dict[str, str] | None = None,
+    service_id: str | None = None,
 ) -> str:
     """confirmations — {(задача, Telegram ID): status}: ответ принадлежит
     аккаунту, а не имени, поэтому перепривязка имени не переносит чужой
     ответ. С limit длинный отчёт сокращается так, чтобы ответы
     участников оставались видны: сначала сворачиваются статусы доставки,
     затем список назначений."""
-    people = _people(assignments)
+    people = _people(assignments, service_id)
     delivery = []
     answers = []
     for task, name in people:
@@ -91,6 +94,7 @@ def build_report_text(
         "sunday_date": f"{event_date:%d.%m.%Y}",
         "task_assignments": format_task_assignments(
             assignments, contacts_by_name, mark_unlinked=True, display_names=display_names,
+            service_id=service_id,
         ),
         "delivery_status": "\n".join(delivery) or "⚪ нет назначений",
         "confirmation_status": "\n".join(answers) or "⚪ нет назначений",
@@ -160,6 +164,7 @@ def report_text(registry, service: dict, event_date: date, assignments: dict,
         ),
         registry.list_confirmations(service["id"], event_date.isoformat()),
         limit=limit, display_names=registry.service_display_names(service["id"]),
+        service_id=service["id"],
     )
 
 
@@ -197,6 +202,7 @@ async def send_admin_reports(
                     chat_id=admin_id,
                     message_id=report["message_id"],
                     parse_mode="HTML",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
             except Exception as exc:  # noqa: BLE001
                 error = str(exc).lower()

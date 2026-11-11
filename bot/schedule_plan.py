@@ -45,6 +45,7 @@ from .readiness import (
 from .service_registry import plan_target_thread
 from .services import (
     ScheduleColumn, normalized_name, split_day_key, task_day_key,
+    sort_tasks_for_display,
 )
 from .ui import (
     plain_text, render_screen_chunks, send_telegram_screen, user_link,
@@ -176,6 +177,13 @@ def implicit_plan(plan: dict) -> bool:
     return len(plan["tasks"]) == 1 and bool(plan["tasks"][0].get("implicit"))
 
 
+def display_tasks(plan: dict) -> list[dict]:
+    """Порядок строк; исходный список задач и индексы редактора неизменны."""
+    return sort_tasks_for_display(
+        plan["tasks"], plan["service_id"], name=lambda task: task["name"],
+    )
+
+
 def free_run(service_id: str, year: int, month: int) -> dict:
     """Опрос-заглушка графика без опроса: все воскресенья месяца."""
     return {
@@ -303,7 +311,7 @@ def covered(plan: dict) -> tuple[int, int]:
 def gaps(plan: dict) -> list[str]:
     lines = []
     for day in plan["dates"]:
-        for task in plan["tasks"]:
+        for task in display_tasks(plan):
             count = len(plan["slots"].get(day, {}).get(task["name"], []))
             if count < task["needed"]:
                 lines.append(
@@ -488,7 +496,7 @@ def week_groups(plan: dict, day: str, window: tuple[int, int]
     own = task_days(plan)
     groups: dict[int | None, list[dict]] = {}
     base = None if window != (0, 0) else 0
-    for task in plan["tasks"]:
+    for task in display_tasks(plan):
         groups.setdefault(
             own.get(task["name"], task.get("default_day", base)),
             [],
@@ -640,8 +648,9 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         )
     else:
         status = f"✅ Утверждён {local_text(plan['approved_at'], tz)}"
+    source_label = "Авто" if plan["run_id"] is None else "Опрос"
     lines = [
-        f"📋 {service_label} › График › Опрос › {month_title(year, month)}",
+        f"📋 {service_label} › График › {source_label} › {month_title(year, month)}",
         status,
         "",
         (
@@ -682,7 +691,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
             continue
         header, shared_day = date_header(plan, by_key, day, window)
         lines += ["", f"🗓 {header}"]
-        for task in plan["tasks"]:
+        for task in display_tasks(plan):
             people = plan["slots"].get(day, {}).get(task["name"], [])
             used_silent |= any(person in silent for person in people)
             lines += task_lines(
@@ -708,7 +717,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     # обычно её включили после составления черновика.
     able = {task for person in summary.people for task in person["tasks"]}
     idle = [
-        task["name"] for task in plan["tasks"]
+        task["name"] for task in display_tasks(plan)
         if task["name"] in able and not any(
             plan["slots"].get(day, {}).get(task["name"]) for day in plan["dates"]
         )
@@ -830,7 +839,8 @@ def choice_notes(plan: dict, summary: Summary, key: str, day: str,
 
 def plan_changes(old: dict, new: dict, names: dict[str, str],
                  nobody: str = "никого",
-                 show: Callable[[str], str] | None = None) -> list[str]:
+                 show: Callable[[str], str] | None = None,
+                 *, service_id: str | None = None) -> list[str]:
     """Отличия нового графика от опубликованного — для «обновлён»: кто
     кого заменил («• 08.11 Денис → Филипп»; при нескольких задачах — с
     задачей), кто добавлен («никого → Анна») и кто убран («Анна → никого»).
@@ -858,7 +868,7 @@ def plan_changes(old: dict, new: dict, names: dict[str, str],
         }
     for day in sorted(set(old) | set(new)):
         tasks = list(dict.fromkeys([*new.get(day, {}), *old.get(day, {})]))
-        for task in tasks:
+        for task in sort_tasks_for_display(tasks, service_id):
             before = old.get(day, {}).get(task, [])
             after = new.get(day, {}).get(task, [])
             gone = [key for key in before if key not in after]
@@ -915,6 +925,7 @@ def change_lines(plan: dict, people: list[dict], old_slots: dict,
     names = _names(people)
     changes = plan_changes(
         old_slots, plan["slots"], names, phrase(settings, "nobody"), show,
+        service_id=plan["service_id"],
     )
     for day in plan["dates"]:
         before = old_days.get(day, {})
@@ -1004,7 +1015,7 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                 else person_day(person, day, plan)
             )
 
-        for task in plan["tasks"]:
+        for task in display_tasks(plan):
             keys = plan["slots"].get(day, {}).get(task["name"], [])
             if implicit_plan(plan):
                 lines += (
@@ -1349,7 +1360,10 @@ def month_overview(
     for day, current in sorted(assignments.items()):
         lines += [
             "", f"🗓 {day:%d.%m.%Y}",
-            format_task_assignments(current, contacts, display_names=display_names),
+            format_task_assignments(
+                current, contacts, display_names=display_names,
+                service_id=service_id,
+            ),
         ]
         if not any(current.values()):
             lines.append("Назначений нет.")
@@ -1411,7 +1425,7 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     year, month = map(int, plan["month"].split("-"))
     blocks: dict[date, list[list[list]]] = {}
     for day in plan["dates"]:
-        for task in plan["tasks"]:
+        for task in display_tasks(plan):
             index = own.get(normalized_name(task["name"]), main)
             pairs = columns[index].layout == "pairs"
             # Задача на дату может разойтись по дням (разовый день
@@ -1469,7 +1483,7 @@ def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
         # днём (на листе — блоком своей даты); разовый день человека — в
         # скобках у имени.
         parts = []
-        for task in plan["tasks"]:
+        for task in display_tasks(plan):
             moments = task_moments(plan, by_key, day, task["name"])
             usual = date.fromisoformat(day) + timedelta(
                 days=own_days.get(task["name"], 0)
