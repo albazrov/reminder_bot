@@ -1212,16 +1212,11 @@ def plan_events(plan: dict, people: list[dict], *, keyed: bool = False) -> list[
 
 def _apply_assignment_replacements(
     assignments: dict[str, list[str]], replacements: list[dict], people: list[dict],
-    *, keyed: bool = False, assigned_only: bool = False,
+    *, keyed: bool = False, other_assignments: dict[str, list[str]] | None = None,
 ) -> dict[str, list[str]]:
     if not keyed:
-        if assigned_only:
-            current = assignments
-            for replacement in replacements:
-                if replacement["old_name"] in current.get(replacement["task"], ()):
-                    current = apply_replacements(current, [replacement])
-            return current
-        return apply_replacements(assignments, replacements)
+        if other_assignments is None:
+            return apply_replacements(assignments, replacements)
     by_key = {person["key"]: person for person in people}
 
     def person_key(
@@ -1239,36 +1234,75 @@ def _apply_assignment_replacements(
                            if person["name"] == name and task in person["tasks"]]
         return matches[0] if len(matches) == 1 else name
 
-    current = {
-        task: [key if key in by_key else person_key(key, task) for key in keys]
-        for task, keys in assignments.items()
-    }
+    def keyed_assignments(values):
+        return {
+            task: [key if key in by_key else person_key(key, task) for key in keys]
+            for task, keys in values.items()
+        } if keyed else values
+
+    current = keyed_assignments(assignments)
+    others = keyed_assignments(other_assignments or {})
     for replacement in replacements:
         task = replacement["task"]
         item = {
             **replacement,
             "old_name": person_key(
-                replacement["old_name"], task, assigned=current.get(task, ()),
-            ),
+                replacement["old_name"], task,
+                assigned=tuple(dict.fromkeys(
+                    [*current.get(task, ()), *others.get(task, ())],
+                )),
+            ) if keyed else replacement["old_name"],
             "new_name": person_key(
                 replacement["new_name"], task, replacement.get("telegram_id"),
-            ),
+            ) if keyed else replacement["new_name"],
         }
-        if assigned_only and item["old_name"] not in current.get(task, ()):
-            continue
-        current = apply_replacements(current, [item])
+        belongs_elsewhere = (
+            item["old_name"] not in current.get(task, ())
+            and item["old_name"] in others.get(task, ())
+        )
+        # Track the other block's chain without dropping unowned saved overrides.
+        if item["old_name"] in others.get(task, ()):
+            others = apply_replacements(others, [item])
+        if not belongs_elsewhere:
+            current = apply_replacements(current, [item])
     return current
 
 
 def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                                 draft: bool = False, keyed: bool = False,
-                                assigned_replacements_only: bool = False,
+                                source_sunday: str | None = None,
                                 ) -> dict[date, dict[str, list[str]]]:
     if draft:
         plan = {
             **plan, "approved": plan["slots"],
             "approved_tasks": plan["tasks"], "approved_days": plan["days"],
             "approved_slot_days": approved_slot_days(plan, people),
+        }
+    other_events = []
+    if source_sunday is not None:
+        sunday = date.fromisoformat(source_sunday)
+        # Offsets -6..+6 can make nearby Sunday blocks overlap across months.
+        months = {
+            (sunday + timedelta(days=offset)).strftime("%Y-%m")
+            for offset in (-14, 0, 14)
+        }
+        for month in sorted(months):
+            candidate = (
+                plan if month == source_sunday[:7]
+                else registry.get_schedule_plan(plan["service_id"], month)
+            )
+            if candidate is None or candidate.get("approved") is None:
+                continue
+            other_events.extend(plan_events({
+                **candidate, "approved": {
+                    day: slots for day, slots in candidate["approved"].items()
+                    if day != source_sunday
+                },
+            }, people, keyed=keyed))
+        plan = {
+            **plan, "approved": {
+                source_sunday: plan["approved"].get(source_sunday, {}),
+            },
         }
     tasks = {task["name"]: task for task in plan.get("approved_tasks") or []}
     for slots in plan["approved"].values():
@@ -1296,7 +1330,16 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
         )
         current = _apply_assignment_replacements(
             event_tasks, replacements, people, keyed=keyed,
-            assigned_only=assigned_replacements_only,
+            other_assignments=(
+                {
+                    task: [
+                        assignment.name for other in other_events
+                        if other.event_date == event.event_date
+                        for assignment in other.assignments if assignment.task == task
+                    ]
+                    for task in event_tasks
+                } if source_sunday is not None else None
+            ),
         )
         for task, info in current.items():
             names = day.setdefault(task, [])

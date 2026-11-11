@@ -187,7 +187,10 @@ class AssignmentFieldsTest(unittest.TestCase):
                 first: {"старший": {"D": 2}}, second: {"старший": {"E": -5}},
             },
         )
-        for old, new in (("E", "Other"), ("D", "Substitute"), ("Substitute", "Final")):
+        for old, new in (
+            ("E", "Other"), ("Other", "Other final"),
+            ("D", "Substitute"), ("Substitute", "Final"),
+        ):
             self.registry.set_replacement(
                 "order", "2027-01-05", "старший", old, new, telegram_id=None,
                 username="", source="admin", created_by=1001,
@@ -197,6 +200,28 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertNotIn("Other", value)
         self.assertNotIn("Substitute", value)
         self.assertNotIn("E —", plain_text(value))
+
+    def test_saved_replacement_survives_reapproval_without_old_person(self):
+        self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "D", "Substitute",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        self.plan("order", {"старший": ["E"]})
+        value = next(iter(self.resolve(assignment_field("order")).services.values()))
+        self.assertIn("Substitute", value)
+        self.assertIn("E —", plain_text(value))
+
+    def test_other_month_replacement_chain_does_not_leak_into_selected_week(self):
+        self.plan("order", {"старший": ["D"]}, {"старший": -3})
+        self.plan("order", {"старший": ["E"]}, {"старший": 4}, sunday=date(2026, 12, 27))
+        for old, new in (("E", "Other"), ("Other", "Other final")):
+            self.registry.set_replacement(
+                "order", "2026-12-31", "старший", old, new, telegram_id=None,
+                username="", source="admin", created_by=1001,
+            )
+        value = next(iter(self.resolve(assignment_field("order")).services.values()))
+        self.assertIn("старший — D — 31.12.2026", plain_text(value))
+        self.assertNotIn("Other", value)
 
     def test_strict_group_only_grammar_and_stable_task_token(self):
         field = assignment_field("order", "старший")

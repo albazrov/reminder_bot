@@ -104,11 +104,8 @@ def resolve_assignment_fields(
             selected = matches[0]
         people = registry.readiness_people(source_id)
         by_key = {person["key"]: person for person in people}
-        block = {
-            **plan, "approved": {sunday: plan["approved"].get(sunday, {})},
-        }
         assignments = _effective_plan_assignments(
-            registry, block, people, keyed=True, assigned_replacements_only=True,
+            registry, plan, people, keyed=True, source_sunday=sunday,
         )
         lines = []
         rows = []
