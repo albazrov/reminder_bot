@@ -263,6 +263,24 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertFalse(preview["has_data"])
         self.assertIn("тёзки", preview["error"])
 
+    def test_plain_namesake_assignment_without_replacement_remains_unlinked(self):
+        people = [
+            {"key": f"Twin · {user}", "name": "Twin", "telegram_id": user,
+             "tasks": ["старший"], "username": ""}
+            for user in (601, 602)
+        ]
+        self.plan("order", {"старший": ["Twin"]})
+        reader = self.registry.readiness_people
+        with patch.object(
+            self.registry, "readiness_people",
+            side_effect=lambda source: people if source == "order" else reader(source),
+        ):
+            result = self.resolve(assignment_field("order"))
+            preview = self.preview(assignment_field("order"))
+        self.assertIn("старший — Twin — 03.01.2027", result.services["order"])
+        self.assertNotIn("LINK:", result.services["order"])
+        self.assertTrue(preview["has_data"], preview)
+
     def test_strict_group_only_grammar_and_stable_task_token(self):
         field = assignment_field("order", "старший")
         for allowed in (GENERAL_GROUP_TEMPLATE_FIELDS,):

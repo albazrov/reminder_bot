@@ -1221,7 +1221,7 @@ def _apply_assignment_replacements(
 
     def person_key(
         name: str, task: str, telegram_id: int | None = None,
-        assigned: Sequence[str] = (),
+        assigned: Sequence[str] = (), *, require_unique: bool = False,
     ) -> str:
         if telegram_id:
             matches = [person["key"] for person in people
@@ -1232,7 +1232,7 @@ def _apply_assignment_replacements(
             if not matches:
                 matches = [person["key"] for person in people
                            if person["name"] == name and task in person["tasks"]]
-            if other_assignments is not None and len(matches) > 1:
+            if require_unique and len(matches) > 1:
                 from .assignment_fields import AssignmentFieldResolutionError
 
                 raise AssignmentFieldResolutionError(
@@ -1258,6 +1258,7 @@ def _apply_assignment_replacements(
                 assigned=tuple(dict.fromkeys(
                     [*current.get(task, ()), *others.get(task, ())],
                 )),
+                require_unique=other_assignments is not None,
             ) if keyed else replacement["old_name"],
             "new_name": person_key(
                 replacement["new_name"], task, replacement.get("telegram_id"),
