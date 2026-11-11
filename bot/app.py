@@ -1434,8 +1434,9 @@ def _render_group_reminder(
             task_assignments=format_task_assignments(
                 scoped, contacts_by_name, mark_unlinked=True,
                 display_names=display_names,
+                service_id=service["id"],
             ),
-            informational_notes=format_informational_notes(assignments),
+            informational_notes=format_informational_notes(assignments, service["id"]),
             event_notes=event_notes,
             task=task,
             task_responsibles=(
@@ -2204,6 +2205,7 @@ async def _prepare_service_test_previews(
         contacts_by_name,
         mark_unlinked=True,
         display_names=registry.service_display_names(service["id"]),
+        service_id=service["id"],
     )
     effective_group_template = (
         service["group_template"]
@@ -2218,7 +2220,7 @@ async def _prepare_service_test_previews(
                 service_name=service["name"],
                 sunday_date=sunday_str,
                 task_assignments=assignment_text,
-                informational_notes=format_informational_notes(assignments),
+                informational_notes=format_informational_notes(assignments, service["id"]),
                 event_notes=resolve_event_note(
                     registry, service_id, sunday_date, template=effective_group_template,
                     public_url=(
@@ -2241,7 +2243,7 @@ async def _prepare_service_test_previews(
             service_name=service["name"],
             sunday_date=sunday_str,
             task_assignments=assignment_text,
-            informational_notes=format_informational_notes(assignments),
+            informational_notes=format_informational_notes(assignments, service["id"]),
         )
     )
     return {

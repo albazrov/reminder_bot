@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .ui import user_link
+from .services import sort_tasks_for_display
 
 
 _TASK_EMOJIS = (
@@ -66,11 +67,10 @@ def task_is_informational(task_info: Mapping | list[str]) -> bool:
 
 def ordered_task_assignments(
     assignments: dict[str, dict[str, Any] | list[str]],
+    service_id: str | None = None,
 ) -> list[tuple[str, dict[str, Any] | list[str]]]:
-    priority = {"старший": 0, "в смене": 1}
-    return sorted(
-        assignments.items(),
-        key=lambda item: priority.get(item[0].strip().casefold(), 2),
+    return sort_tasks_for_display(
+        assignments.items(), service_id, name=lambda item: item[0],
     )
 
 
@@ -116,12 +116,13 @@ def format_task_assignments(
     *,
     mark_unlinked: bool = False,
     display_names: Mapping[str, str] | None = None,
+    service_id: str | None = None,
 ) -> str:
     if not assignments:
         return "⚪ Ответственные не указаны"
 
     groups = []
-    for task, task_info in ordered_task_assignments(assignments):
+    for task, task_info in ordered_task_assignments(assignments, service_id):
         if task_is_informational(task_info):
             continue
         names = task_assignment_names(task_info)
@@ -146,9 +147,10 @@ def informational_label(task: str, values) -> str:
 
 def format_informational_notes(
     assignments: dict[str, dict[str, Any] | list[str]],
+    service_id: str | None = None,
 ) -> str:
     notes = []
-    for task, task_info in assignments.items():
+    for task, task_info in ordered_task_assignments(assignments, service_id):
         if not task_is_informational(task_info):
             continue
         notes.append(f"📌 {informational_label(task, task_assignment_names(task_info))}")
@@ -214,13 +216,13 @@ def personal_schedule_lines(
     linked — {(service_id, task, имя в графике)} его привязок."""
     lines: list[str] = []
     for event in events:
-        tasks = sorted(
-            {
+        tasks = sort_tasks_for_display(
+            sorted({
                 assignment.task
                 for assignment in event.assignments
                 if not assignment.is_informational
                 and (event.service_id, assignment.task, assignment.name) in linked
-            }
+            }), event.service_id,
         )
         if not tasks:
             continue

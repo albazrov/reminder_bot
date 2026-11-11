@@ -23,6 +23,7 @@ from .services import (
     ServiceDefinition,
     ServiceTask,
     normalized_name,
+    sort_tasks_for_display,
     split_day_key,
 )
 from .task_rules import AssignmentWarnings, assignment_issues, dependent_tasks
@@ -1698,7 +1699,7 @@ class ServiceRegistry:
         )
 
     def list_service_tasks(self, service_id: str, *, connection=None) -> list[dict]:
-        """Задачи служения в порядке каталога, включая выключенные."""
+        """Задачи в порядке показа, включая выключенные для настройки."""
         with nullcontext(connection) if connection is not None else self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
@@ -1714,7 +1715,7 @@ class ServiceRegistry:
                     "WHERE service_id = ?", (service_id,),
                 )
             }
-        return [
+        return sort_tasks_for_display([
             {
                 "name": row["name"],
                 "position": row["position"],
@@ -1733,13 +1734,15 @@ class ServiceRegistry:
                 "requires_any": dependencies.get(row["name"], []),
             }
             for row in rows
-        ]
+        ], service_id, name=lambda task: task["name"])
 
     def plan_tasks(self, service_id: str, *, connection=None) -> list[dict]:
         """Задачи графика: включённые задачи служения; у служения без задач
         (Уборка, Книги) — одна задача с названием служения и «Нужно людей»
         из настроек раздела «📅 График»."""
         tasks = self.list_service_tasks(service_id, connection=connection)
+        # Распределение сохраняет прежний порядок каталога/добавления.
+        tasks = sorted(tasks, key=lambda task: task["position"])
         if tasks:
             return [
                 {
@@ -4368,13 +4371,18 @@ class ServiceRegistry:
                 "name": row["name"],
                 "telegram_id": row["telegram_id"],
                 "username": row["username"],
-                "tasks": json.loads(row["tasks_json"]),
+                "tasks": sort_tasks_for_display(
+                    json.loads(row["tasks_json"]), service_id,
+                ),
                 "in_list": bool(row["in_list"]),
                 "source": row["source"],
                 "tasks_manual": bool(row["tasks_manual"]),
                 "day_offset": row["day_offset"],
                 "month_limit": _member_limit(row),
-                "week_tasks": _week_tasks(row),
+                "week_tasks": (
+                    sort_tasks_for_display(_week_tasks(row), service_id)
+                    if _week_tasks(row) is not None else None
+                ),
             }
             for row in rows
         ]
@@ -5122,7 +5130,7 @@ class ServiceRegistry:
                 "WHERE telegram_id = ? AND service_id = ? ORDER BY task",
                 (actor_id, service_id),
             ).fetchall()
-        return [row["task"] for row in rows]
+        return sort_tasks_for_display([row["task"] for row in rows], service_id)
 
     MONTH_SUMMARY_DEFAULTS = {
         "enabled": False, "reminder_days": 1, "reminder_time": "18:00",

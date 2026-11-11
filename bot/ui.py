@@ -11,7 +11,9 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
+
+from .navigation import back_callback
 
 MAX_SCREEN_UNITS = 500
 MAX_CALLBACK_UNITS = 200
@@ -367,6 +369,31 @@ async def clean_previous_menu_by_id(
         )
 
 
+def pair_back_help(
+    rows: list[list[InlineKeyboardButton]],
+) -> list[list[InlineKeyboardButton]]:
+    """Keep the real return action and help together below all other actions."""
+    buttons = [button for row in rows for button in row]
+    back_data = back_callback(InlineKeyboardMarkup(inline_keyboard=rows))
+    back = next(
+        (button for button in reversed(buttons)
+         if back_data and button.callback_data == back_data),
+        None,
+    )
+    help_button = next(
+        (button for button in buttons
+         if button.text.startswith(("❓ Справка", "❓ Помощь"))),
+        None,
+    )
+    if back is None or help_button is None:
+        return rows
+    result = [
+        [button for button in row if button is not back and button is not help_button]
+        for row in rows
+    ]
+    return [row for row in result if row] + [[back, help_button]]
+
+
 def layout_buttons(
     buttons: list[InlineKeyboardButton],
     *,
@@ -463,7 +490,7 @@ def layout_buttons(
             rows.extend([[button] for button in navigation])
     else:
         rows.extend([[button] for button in navigation])
-    return rows
+    return pair_back_help(rows)
 
 
 async def send_telegram_screen(
@@ -475,6 +502,7 @@ async def send_telegram_screen(
 ) -> Any:
     """Send a safe HTML screen, splitting long text at Telegram UI boundaries."""
     kwargs.pop("parse_mode", None)
+    kwargs.setdefault("link_preview_options", LinkPreviewOptions(is_disabled=True))
     markup = kwargs.pop("reply_markup", None)
     if isinstance(markup, InlineKeyboardMarkup):
         validate_inline_keyboard(markup.inline_keyboard)

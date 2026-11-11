@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import sqlite3
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
 from bot.excel_parser import ServiceAssignment, ServiceEvent
 from bot.handlers import register, router
@@ -1646,6 +1647,12 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             card_markup = reminder_callback.message.answer.await_args.kwargs[
                 "reply_markup"
             ]
+            for label in ("👁 Предпросмотр", "📤 Отправить сейчас", "🗑 Удалить"):
+                row = next(
+                    row for row in card_markup.inline_keyboard
+                    if any(button.text == label for button in row)
+                )
+                self.assertEqual([button.text for button in row], [label])
             card_text = reminder_callback.message.answer.await_args.args[0]
             self.assertIn("📅 Срок: за 1 дн.", card_text)
             self.assertIn("✉️ Отправка: 24.10.2026 в 18:00", card_text)
@@ -6182,8 +6189,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "service:service_reminders:sound",
                     "svc_tasks:open:sound",
                     "service:service_setup:sound",
-                    "service:service_help:sound",
                     "service:back_to_services:list",
+                    "service:service_help:sound",
                 ],
             )
             self.assertIn(
@@ -7247,6 +7254,191 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def dialog_sender(self):
+        return inspect.getclosurevars(self.message_handler("on_services")).nonlocals[
+            "_send_dialog"
+        ]
+
+    def test_reminder_dialog_disables_link_preview(self):
+        async def run():
+            message = self.message(67890, "")
+            await self.dialog_sender()(
+                message, "Напоминание\nhttps://example.com/reminder",
+            )
+            sent = message.answer.await_args
+            self.assertTrue(sent.kwargs["link_preview_options"].is_disabled)
+            self.assertIn("https://example.com/reminder", sent.args[0])
+
+        asyncio.run(run())
+
+    def test_multipart_screen_is_cleaned_by_commands_inline_and_home(self):
+        async def run():
+            sender = self.dialog_sender()
+            next_id = 700
+
+            async def answer(*args, **kwargs):
+                nonlocal next_id
+                next_id += 1
+                return SimpleNamespace(message_id=next_id)
+
+            message = self.message(67890, "")
+            message.answer.side_effect = answer
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="⬅️ К служению",
+                    callback_data="service:service_settings:sound",
+                ),
+            ]])
+            # An unrelated notification is never registered as part of a dialog.
+            self.context.bot.send_message.return_value = SimpleNamespace(message_id=450)
+            await self.context.bot.send_message(67890, "Независимое уведомление")
+            self.context.bot.send_message.return_value = SimpleNamespace(message_id=451)
+            for transition in ("command", "inline", "home"):
+                ids = []
+                await sender(
+                    message, "Длинный экран\n" + "строка\n" * 180,
+                    reply_markup=markup, _dialog_sent_ids=ids,
+                )
+                self.assertGreater(len(ids), 1)
+                self.context.bot.delete_message.reset_mock()
+                if transition == "command":
+                    command = self.message(67890, "/services")
+                    command.message_id = 100
+                    command.answer.side_effect = answer
+                    await self.message_handler("on_services")(command)
+                elif transition == "inline":
+                    callback = SimpleNamespace(
+                        data="service:service_settings:sound",
+                        from_user=SimpleNamespace(id=67890),
+                        message=SimpleNamespace(
+                            **{**vars(message), "message_id": ids[-1]},
+                        ),
+                        answer=AsyncMock(),
+                    )
+                    await self.callback_handler("on_service_selected")(callback)
+                else:
+                    home = self.message(67890, NAV_HOME_TEXT)
+                    home.delete = AsyncMock()
+                    home.answer.side_effect = answer
+                    await self.message_handler("on_nav_button")(home)
+                deleted = {
+                    call.kwargs.get("message_id")
+                    for call in self.context.bot.delete_message.await_args_list
+                }
+                self.assertTrue(set(ids) <= deleted, (transition, ids, deleted))
+                self.assertNotIn(450, deleted)
+            self.assertEqual(
+                sum(call.args == (67890, "Независимое уведомление")
+                    for call in self.context.bot.send_message.await_args_list),
+                1,
+            )
+
+        asyncio.run(run())
+
+    def test_partial_screen_failure_removes_sent_parts_and_propagates_error(self):
+        async def run():
+            message = self.message(67890, "")
+            message.answer.side_effect = [
+                SimpleNamespace(message_id=811), RuntimeError("send failed"),
+            ]
+            with self.assertRaisesRegex(RuntimeError, "send failed"):
+                await self.dialog_sender()(message, "строка\n" * 180)
+            self.context.bot.delete_message.assert_any_await(
+                chat_id=67890, message_id=811,
+            )
+
+        asyncio.run(run())
+
+    def test_text_only_multipart_result_is_removed_by_next_dialog(self):
+        async def run():
+            sender = self.dialog_sender()
+            message = self.message(67890, "")
+            message.answer.side_effect = [
+                SimpleNamespace(message_id=index) for index in range(1100, 1110)
+            ]
+            ids = []
+            await sender(message, "строка\n" * 180, _dialog_sent_ids=ids)
+            await sender(message, "Следующий экран")
+            deleted = {
+                call.kwargs.get("message_id")
+                for call in self.context.bot.delete_message.await_args_list
+            }
+            self.assertTrue(set(ids) <= deleted)
+            self.assertGreater(len(ids), 1)
+
+        asyncio.run(run())
+
+    def test_paged_dialog_keeps_back_and_help_on_every_page(self):
+        async def run():
+            message = self.message(67890, "")
+            buttons = [
+                InlineKeyboardButton(text=f"Действие {index}", callback_data=f"action:{index}")
+                for index in range(8)
+            ] + [
+                InlineKeyboardButton(text="❓ Справка", callback_data="help"),
+                InlineKeyboardButton(text="⬅️ К служению", callback_data="back"),
+            ]
+            await self.dialog_sender()(
+                message, "Выберите действие",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[b] for b in buttons]),
+            )
+            for _ in range(4):
+                rows = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                self.assertEqual(
+                    [button.callback_data for button in rows[-1]], ["back", "help"],
+                )
+                self.assertLessEqual(sum(map(len, rows)), 6)
+                next_button = next(
+                    (button for row in rows for button in row if "Далее" in button.text),
+                    None,
+                )
+                if next_button is None:
+                    break
+                callback = SimpleNamespace(
+                    data=next_button.callback_data,
+                    from_user=SimpleNamespace(id=67890),
+                    message=message, answer=AsyncMock(),
+                )
+                await self.callback_handler("on_dialog_page")(callback)
+
+        asyncio.run(run())
+
+    def test_concurrent_dialogs_do_not_interleave_parts_or_leave_old_screen(self):
+        async def run():
+            sender = self.dialog_sender()
+            sequence = []
+            next_id = 900
+
+            async def answer(text, **kwargs):
+                nonlocal next_id
+                next_id += 1
+                message_id = next_id
+                sequence.append("A" if "AAAA" in text else "B")
+                await asyncio.sleep(0)
+                return SimpleNamespace(message_id=message_id)
+
+            message = self.message(67890, "")
+            message.answer.side_effect = answer
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🏠 В начало", callback_data="menu:start"),
+            ]])
+            first_ids, second_ids = [], []
+            await asyncio.gather(
+                sender(message, "AAAA\n" * 200, reply_markup=markup,
+                       _dialog_sent_ids=first_ids),
+                sender(message, "BBBB\n" * 200, reply_markup=markup,
+                       _dialog_sent_ids=second_ids),
+            )
+            self.assertEqual(sequence, ["A"] * len(first_ids) + ["B"] * len(second_ids))
+            deleted = {
+                call.kwargs.get("message_id")
+                for call in self.context.bot.delete_message.await_args_list
+            }
+            self.assertTrue(set(first_ids) <= deleted)
+            self.assertTrue(set(second_ids).isdisjoint(deleted))
+
+        asyncio.run(run())
+
     def test_readiness_plan_edit_and_approve(self):
         from bot.excel_parser import RosterMember
 
@@ -7447,8 +7639,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 ["service:service_contact:sound",
                  "rdy:month:sound", "service:service_reminders:sound",
                  "svc_tasks:open:sound",
-                 "service:service_setup:sound", "service:service_help:sound",
-                 "service:back_to_services:list"],
+                 "service:service_setup:sound", "service:back_to_services:list",
+                 "service:service_help:sound"],
             )
             # В «⚙️ Настройки» — только групповой чат, без админов.
             setup = SimpleNamespace(
@@ -7944,7 +8136,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         message = self.message(67890, "/service_contact sound")
         await self.message_handler("on_service_contact")(message)
         # «👥 Ответственные» открывается списком людей; даты — кнопкой.
-        self.assertIn("👥 Состав · ЗВУК", message.answer.await_args.args[0])
+        self.assertIn("ЗВУК › 👥 Состав", message.answer.await_args.args[0])
         dates = await self.press_contact(message, "🗓 По датам графика")
         return dates.message
 
@@ -8023,7 +8215,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             tasks = await self.press_contact(message, "👥 К списку ответственных")
 
             self.assertIn(
-                "👥 Состав · ЗВУК", tasks.message.answer.await_args.args[0]
+                "ЗВУК › 👥 Состав", tasks.message.answer.await_args.args[0]
             )
             overview = await self.press_contact(
                 tasks.message, "🗓 По датам графика"
@@ -8060,7 +8252,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             message = self.message(67890, "/service_contact sound")
             await self.message_handler("on_service_contact")(message)
-            self.assertIn("👥 Состав · ЗВУК", message.answer.await_args.args[0])
+            self.assertIn("ЗВУК › 👥 Состав", message.answer.await_args.args[0])
             dates = await self.press_contact(message, "🗓 По датам графика")
             self.assertIn(
                 "Не удалось загрузить график по датам",
@@ -8070,7 +8262,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 dates.message, "👥 К списку ответственных"
             )
             self.assertIn(
-                "👥 Состав · ЗВУК", tasks.message.answer.await_args.args[0]
+                "ЗВУК › 👥 Состав", tasks.message.answer.await_args.args[0]
             )
 
         asyncio.run(run())
@@ -8700,7 +8892,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text = result.message.answer.await_args.args[0]
             self.assertIn("«Мария» связан", text)
             self.assertIn("во всех задачах", text)
-            self.assertIn("👥 Состав · ЗВУК", text)
+            self.assertIn("ЗВУК › 👥 Состав", text)
             contacts = {
                 (contact["task"], contact["name"]): contact["telegram_id"]
                 for contact in self.registry.list_responsible_contacts(

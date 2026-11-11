@@ -300,6 +300,67 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertIsNone(self.registry.get_schedule_plan("sound", "2027-02"))
         asyncio.run(run())
 
+    def test_auto_layout_and_breadcrumb_preserve_draft_and_approved_data(self):
+        async def run():
+            for month, day in (("2026-11", "2026-11-22"), ("2026-12", "2026-12-06")):
+                for state in ("draft", "approved", "dirty"):
+                    slots = {day: {"Микшер": ["A"]}}
+                    self.plan(slots, approved=state != "draft", month=month)
+                    if state == "dirty":
+                        self.plan({day: {"Микшер": ["B"]}}, approved=False, month=month)
+                    before = self.registry.get_schedule_plan("sound", month)
+                    shown = await self.press(f"rdy:pfree:sound:{month.replace('-', '')}")
+                    self.assertIn("ЗВУК › График › Авто ›", self.text(shown))
+                    self.assertNotIn("График › Опрос", self.text(shown))
+                    rows = shown.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                    self.assertEqual(
+                        [b.text for b in rows[-1]], ["⬅️ К графику", "❓ Справка"],
+                    )
+                    self.assertEqual([b.text for b in rows[0]], ["✏️ Изменить", "🔄 Пересчитать"])
+                    if state != "approved":
+                        self.assertEqual(len(rows[1]), 2)
+                        self.assertTrue(rows[1][0].text.startswith("✅ Утвердить"))
+                        self.assertTrue(rows[1][1].text.startswith("🧮 Авто"))
+                    self.assertEqual(self.registry.get_schedule_plan("sound", month), before)
+            self.context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_plan_editor_orders_tasks_without_changing_original_callback_indices(self):
+        names = ["пироги", "Скатерти", "в смене", "старший"]
+        self.registry.add_service_task(1001, "kitchen", "Скатерти")
+        self.registry.save_schedule_draft(
+            "kitchen", "2026-11", run_id=None, dates=["2026-11-22"],
+            tasks=[{"name": name, "needed": 1, "max": 1} for name in names],
+            slots={"2026-11-22": {name: [f"A{index}"] for index, name in enumerate(names)}},
+            last_served={},
+        )
+        before = self.registry.get_schedule_plan("kitchen", "2026-11")
+
+        async def run():
+            dates = await self.press("rdy:pedit:kitchen:202611")
+            day_button = next(
+                b for b in self.buttons(dates) if b.callback_data.startswith("rdy:pdate:")
+            )
+            day = await self.press(day_button.callback_data)
+            choices = [
+                b for b in self.buttons(day) if b.callback_data.startswith("rdy:ptask:")
+            ]
+            self.assertEqual(
+                [int(b.callback_data.split(".")[-1]) for b in choices], [3, 2, 1, 0],
+            )
+            self.assertEqual(
+                [next(name for name in names if name in b.text) for b in choices],
+                ["старший", "в смене", "Скатерти", "пироги"],
+            )
+            for button in choices:
+                task = await self.press(button.callback_data)
+                index = int(button.callback_data.split(".")[-1])
+                self.assertIn(f"«{names[index]}»", self.text(task))
+            self.assertEqual(self.registry.get_schedule_plan("kitchen", "2026-11"), before)
+
+        asyncio.run(run())
+
     def test_auto_next_month_does_not_bypass_existing_readiness_poll(self):
         run = self.registry.create_readiness_run(
             "sound", "2026-12", status="open", dates=["2026-12-06"],

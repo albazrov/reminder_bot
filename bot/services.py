@@ -7,9 +7,10 @@ SQLite и накладываются на каталог (см. ServiceRegistry.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 CATALOG_PATH = Path(__file__).resolve().parent.parent / "reminder_bot_services.json"
 _SERVICE_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
@@ -35,6 +36,37 @@ def normalized_name(value: str) -> str:
     """Ключ сравнения названий: регистр, «ё», лишние пробелы и пробелы у скобок."""
     text = " ".join(str(value).casefold().replace("ё", "е").split())
     return text.replace("( ", "(").replace(" )", ")")
+
+
+_TASK_DISPLAY_ORDER = {
+    "order": ("старший", "в смене"),
+    "sound": ("звук", "сборка"),
+    "kitchen": ("старший", "в смене", "скатерти", "пироги"),
+}
+_T = TypeVar("_T")
+
+
+def sort_tasks_for_display(
+    tasks: Iterable[_T], service_id: str | None = None, *,
+    name: Callable[[_T], str] = str,
+) -> list[_T]:
+    """Новая коллекция только для показа; позиции и данные не меняются.
+
+    Незаданные задачи остаются в исходном стабильном порядке в конце.
+    Без service_id поддерживаются старые форматтеры одного служения.
+    Не использовать порядок показа как вход распределения.
+    """
+    order = (
+        _TASK_DISPLAY_ORDER.get(service_id, ())
+        if service_id is not None else
+        tuple(dict.fromkeys(
+            task for tasks in _TASK_DISPLAY_ORDER.values() for task in tasks
+        ))
+    )
+    ranks = {task: index for index, task in enumerate(order)}
+    return sorted(
+        tasks, key=lambda task: ranks.get(normalized_name(name(task)), len(ranks)),
+    )
 
 
 @dataclass(frozen=True)
