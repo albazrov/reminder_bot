@@ -280,6 +280,8 @@ TEMPLATE_FIELD_HELP = {
     "service_name": "название служения",
     "sunday_date": "дата собрания (воскресенье)",
     "task_assignments": "задачи и ответственные",
+    "week_task_assignments": "все задачи служения в том же воскресном блоке: "
+    "задача — ответственный — дата; только на день отправки и позже",
     "informational_notes": "информационные заметки графика",
     "event_notes": "опубликованные заметки к собранию",
     "task": "задача напоминания",
@@ -291,7 +293,7 @@ TEMPLATE_FIELD_HELP = {
     "deadline": "срок ответа (дд.мм чч:мм)",
     "people": "упоминания опрашиваемых",
 }
-GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments",
+GROUP_FIELDS = ("service_name", "sunday_date", "task_assignments", "week_task_assignments",
                 "informational_notes", "event_notes")
 REPORT_FIELDS = ("service_name", "sunday_date", "task_assignments",
                  "delivery_status", "confirmation_status")
@@ -1296,20 +1298,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         return "\n".join(lines)
 
-    def service_selection_keyboard(
-        services: list[dict],
-        operation: str,
-    ) -> InlineKeyboardMarkup:
-        # Порядок служений — как в каталоге reminder_bot_services.json.
+    def ordered_services(services: list[dict]) -> list[dict]:
         service_rank = {
             service.id: index for index, service in enumerate(SERVICES)
         }
-        ordered_services = sorted(
+        return sorted(
             services,
             key=lambda service: service_rank.get(
                 service["id"], len(service_rank)
             ),
         )
+
+    def service_selection_keyboard(
+        services: list[dict],
+        operation: str,
+    ) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1321,7 +1324,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         callback_data=f"service:{operation}:{service['id']}",
                     )
                 ]
-                for service in ordered_services
+                for service in ordered_services(services)
             ]
         )
 
@@ -3808,6 +3811,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reminder["reminder_days"], reminder["reminder_time"],
             reminder.get("active_from"), reminder.get("active_until"),
             service.get("group_chat_id"), service.get("group_thread_id"),
+            service_registry().resolve_group_text(reminder, service),
         )
 
     async def show_send_now_confirm(
@@ -3827,12 +3831,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         result = None
         current = registry.get_group_reminder(reminder_id) if registry else None
+        snapshot = send_now_snapshot(current)
         period_ended = current is not None and reminder_occurrence(
             datetime.now(context.timezone), current
         ) is None
         if callable(loader) and not period_ended:
             try:
-                result = await loader(reminder_id)
+                result = await loader(reminder_id, manual=True)
             except Exception:  # noqa: BLE001
                 debug.exception("Не удалось подготовить отправку сейчас")
         reminder = registry.get_group_reminder(reminder_id) if registry else None
@@ -3855,6 +3860,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "в «🗓 Период».",
                 [[back]],
             )
+        elif send_now_snapshot(reminder) != snapshot:
+            text, rows = (
+                "⚠️ Напоминание изменилось. Откройте предпросмотр заново.",
+                [[back]],
+            )
         elif not result or not result.get("has_data"):
             reason = (result or {}).get("error") or "Не удалось загрузить график."
             text, rows = f"⚠️ Сейчас отправить нельзя: {reason}", [[back]]
@@ -3866,16 +3876,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         else:
             pending["send_now"] = {
                 "reminder_id": reminder_id, "text": result["text"],
-                "snapshot": send_now_snapshot(reminder),
+                "snapshot": snapshot,
                 "event_date": result.get("event_date"),
                 "schedule_state": result.get("schedule_state"),
+                "assignment_state": result.get("assignment_state"),
+                "template": registry.resolve_group_text(reminder, service),
+                "task": reminder.get("task"),
             }
             text = (
                 f"📤 Отправить сейчас в чат служения? Так оно будет "
                 f"выглядеть на {result['date']}:\n\n"
                 "──────────────────\n\n"
                 f"{result['text']}\n\n"
-                "ℹ️ Запланированная отправка останется в силе."
+                + "".join(f"⚠️ {warning}\n" for warning in result.get("warnings", []))
+                + "ℹ️ Запланированная отправка останется в силе."
             )
             rows = [[
                 InlineKeyboardButton(
@@ -4241,6 +4255,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if len(chunks) > 1:
                 preview_text = chunks[0] + "\n... (текст обрезан)"
             text += preview_text
+            text += "".join(
+                f"\n\n⚠️ {warning}" for warning in result.get("warnings", [])
+            )
         await _send_dialog(
             callback.message,
             text,
@@ -4259,14 +4276,150 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     def notification_edit_controls(
         service_id: str, session_id: str
     ) -> InlineKeyboardMarkup:
+        rows = []
+        pending = next((
+            item for item in pending_inputs.values()
+            if item.get("session_id") == session_id
+            and item.get("service_id") == service_id
+        ), None)
+        if pending and pending.get("step") in {
+            "group_reminder_new_text", "group_reminder_text",
+            "group_default_text", "group_template",
+        }:
+            rows.append([InlineKeyboardButton(
+                text="🔗 Назначения другого служения",
+                callback_data=f"afield:{session_id}:open",
+            )])
         return InlineKeyboardMarkup(
-            inline_keyboard=[[
+            inline_keyboard=rows + [[
                 InlineKeyboardButton(
                     text="⬅️ Назад без изменения",
                     callback_data=f"notify_back:{service_id}:{session_id}",
                 )
             ]]
         )
+
+    @admin_router.callback_query(F.data.startswith("afield:"))
+    async def on_assignment_field(callback: CallbackQuery) -> None:
+        from .assignment_fields import assignment_field
+
+        if (
+            not callback.from_user or not callback.message
+            or callback.message.chat.type != ChatType.PRIVATE
+        ):
+            await _answer_callback(callback)
+            return
+        parts = callback.data.split(":")
+        pending = pending_inputs.get(callback.from_user.id)
+        registry = service_registry()
+        if (
+            len(parts) not in {3, 5} or not pending or registry is None
+            or pending.get("operation") != "service_notify"
+            or pending.get("session_id") != parts[1]
+            or pending.get("step") not in {
+                "group_reminder_new_text", "group_reminder_text",
+                "group_default_text", "group_template",
+            }
+        ):
+            await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+            return
+        try:
+            if not is_service_admin(callback.from_user.id, pending["service_id"]):
+                raise PermissionError("Недостаточно прав.")
+            picker = pending.get("assignment_picker")
+            if len(parts) == 3:
+                if parts[2] != "open":
+                    raise ValueError("Этот экран уже устарел.")
+                picker = {
+                    "step": pending["step"], "token": secrets.token_hex(4),
+                    "services": ordered_services([
+                        service for service in registry.list_services()
+                        if service["enabled"] and service["id"] != pending["service_id"]
+                    ]),
+                    "stage": "services",
+                }
+                pending["assignment_picker"] = picker
+            elif (
+                not picker or parts[2] != picker["token"]
+                or picker["step"] != pending["step"]
+            ):
+                raise ValueError("Этот экран уже устарел.")
+            else:
+                action, raw_index = parts[3:]
+                index = int(raw_index)
+                if action == "service" and picker["stage"] == "services":
+                    if not 0 <= index < len(picker["services"]):
+                        raise ValueError("Этот экран уже устарел.")
+                    source = picker["services"][index]
+                    tasks = sort_tasks_for_display([
+                        task["name"] for task in registry.list_service_tasks(source["id"])
+                        if task["enabled"]
+                    ], source["id"])
+                    picker.update(
+                        source=source, tasks=tasks, stage="tasks",
+                        token=secrets.token_hex(4),
+                    )
+                elif action == "task" and picker["stage"] == "tasks":
+                    if not 0 <= index <= len(picker["tasks"]):
+                        raise ValueError("Этот экран уже устарел.")
+                    task = picker["tasks"][index - 1] if index else None
+                    value = assignment_field(picker["source"]["id"], task)
+                    pending.pop("assignment_picker", None)
+                    await _send_dialog(
+                        callback.message,
+                        "Скопируйте поле в нужное место шаблона и отправьте "
+                        "полный текст сообщения:\n\n" + ui_code(value)
+                        + "\n\nЗадача — ответственный — дата; только на день "
+                        "отправки и позже. Если график другого служения "
+                        "не утверждён или никто не назначен, поле будет пустым."
+                        "\nТекущий текст и настройки пока не изменены.",
+                        reply_markup=notification_edit_controls(
+                            pending["service_id"], pending["session_id"],
+                        ),
+                        parse_mode=None,
+                    )
+                    await _answer_callback(callback)
+                    return
+                else:
+                    raise ValueError("Этот экран уже устарел.")
+            prefix = f"afield:{pending['session_id']}:{picker['token']}"
+            if picker["stage"] == "services":
+                rows = [[InlineKeyboardButton(
+                    text=service["name"], callback_data=f"{prefix}:service:{index}",
+                )] for index, service in enumerate(picker["services"])]
+                text = (
+                    "🔗 Выберите служение, чьи назначения добавить в шаблон."
+                    if rows else
+                    "⚪ Других включённых служений пока нет. Настройте нужное "
+                    "служение и вернитесь к редактированию текста."
+                )
+            else:
+                rows = [[InlineKeyboardButton(
+                    text="Все задачи", callback_data=f"{prefix}:task:0",
+                )]] + [[InlineKeyboardButton(
+                    text=task, callback_data=f"{prefix}:task:{index}",
+                )] for index, task in enumerate(picker["tasks"], 1)]
+                rows.append([InlineKeyboardButton(
+                    text="⬅️ К служениям",
+                    callback_data=f"afield:{pending['session_id']}:open",
+                )])
+                text = f"🔗 {picker['source']['name']} — выберите задачи."
+            rows.extend(notification_edit_controls(
+                pending["service_id"], pending["session_id"],
+            ).inline_keyboard[-1:])
+            await _send_dialog(
+                callback.message, text, reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=rows,
+                ), parse_mode=None,
+            )
+        except (ValueError, PermissionError) as exc:
+            await _answer_callback(callback, f"⚠️ {exc}")
+            return
+        except sqlite3.Error:
+            debug.exception("Не удалось выбрать поле назначений")
+            await _answer_callback(callback, "❌ Не удалось прочитать назначения.")
+            return
+        await _answer_callback(callback)
 
     async def show_service_tasks(
         message: Message, actor_id: int, service_id: str,
@@ -8369,7 +8522,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     ).inline_keyboard,
                 ]
             )
-        await _send_dialog(message, text, reply_markup=markup, parse_mode=None)
+        await _send_dialog(
+            message, text, reply_markup=markup,
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT, parse_mode=None,
+        )
 
     def enabled_group_reminder_at(
         registry: Any,
@@ -8846,6 +9002,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             callback, "⚠️ График изменился. Откройте предпросмотр заново."
                         )
                         return
+                    if prepared.get("assignment_state"):
+                        field_state = getattr(context, "assignment_fields_state", None)
+                        if field_state is None or field_state(
+                            service_id, prepared["event_date"],
+                            prepared["template"], prepared["task"],
+                        ) != prepared["assignment_state"]:
+                            await _answer_callback(
+                                callback,
+                                "⚠️ Связанные назначения или дата изменились. "
+                                "Откройте предпросмотр заново.",
+                            )
+                            return
                     await send_to_service_group(
                         lambda chat_id, text, **kwargs: send_telegram_screen(
                             context.bot.send_message, chat_id, text,
@@ -9019,6 +9187,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             preview_chunks[0] + "\n... (текст обрезан)"
                         )
                     text = header + preview_text
+                    text += "".join(
+                        f"\n\n⚠️ {warning}" for warning in result.get("warnings", [])
+                    )
                 else:
                     text = header + "⚠️ Предпросмотр временно недоступен."
                 back_button = InlineKeyboardMarkup(

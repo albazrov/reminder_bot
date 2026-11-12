@@ -31,6 +31,9 @@ from aiogram.types import MenuButtonWebApp, WebAppInfo
 from apscheduler.jobstores.base import JobLookupError
 
 if __package__:
+    from .assignment_fields import (
+        AssignmentFields, AssignmentFieldResolutionError, resolve_assignment_fields,
+    )
     from .cli import CliArgs
     from .commands import sync_admin_commands
     from .config import (
@@ -128,6 +131,9 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.admin_report import report_text, send_admin_reports
     from bot.event_notes import EventNoteResolutionError, resolve_event_note
+    from bot.assignment_fields import (
+        AssignmentFields, AssignmentFieldResolutionError, resolve_assignment_fields,
+    )
     from bot.handlers import register, send_to_service_group
     from bot.logger import setup_loggers
     from bot.notifier import (
@@ -1196,6 +1202,7 @@ async def get_group_reminder_preview(
     debug_logger,
     *,
     body: str | None = None,
+    manual: bool = False,
     backup_manager: BackupManager | None = None,
 ) -> dict:
     """Готовит предпросмотр; body подменяет текст напоминания (объединение)."""
@@ -1279,24 +1286,37 @@ async def get_group_reminder_preview(
         else registry.resolve_group_text(reminder, service)
     )
     try:
+        field_values = resolve_assignment_fields(
+            registry, service["id"], event_date, template,
+            datetime.now(tz).date() if manual else send_date,
+            reminder.get("task"),
+        )
+        result["assignment_state"] = field_values.state
+        result["warnings"] = field_values.warnings
         result["text"] = _render_group_reminder(
             template, reminder, service, assignments, contacts_by_name,
             date_text, registry.service_display_names(service["id"]),
+            assignment_fields=field_values,
             event_notes=resolve_event_note(
                 registry, service["id"], event_date, reminder.get("task"),
                 template=template,
                 public_url=credentials.yandex_public_url if "{event_notes" in template else None,
             ),
         )
+    except AssignmentFieldResolutionError as exc:
+        debug_logger.exception("Не удалось разрешить поля назначений")
+        result["error"] = str(exc)
+        return result
     except (sqlite3.Error, EventNoteResolutionError) as exc:
         debug_logger.exception("Не удалось прочитать заметки для предпросмотра")
         result["error"] = (
             f"Не удалось прочитать заметки события: {exc}"
             if isinstance(exc, EventNoteResolutionError)
-            else "Не удалось прочитать заметки события. Попробуйте позже."
+            else "Не удалось прочитать заметки события или назначения. Попробуйте позже."
         )
         return result
     except (AttributeError, IndexError, ValueError):
+        debug_logger.exception("Не удалось подготовить поля группового шаблона")
         result["error"] = "Ошибка в синтаксисе шаблона."
         return result
     result["has_data"] = True
@@ -1362,6 +1382,11 @@ async def get_template_preview(
             contacts = registry.list_responsible_contacts(
                 credentials.admin_tg_id, service_id
             )
+            field_values = resolve_assignment_fields(
+                registry, service_id, event_date,
+                template or DEFAULT_GROUP_TEMPLATE, datetime.now(tz).date(),
+            )
+            result["warnings"] = field_values.warnings
             result["text"] = _render_group_reminder(
                 template or DEFAULT_GROUP_TEMPLATE,
                 {"task": None},
@@ -1370,6 +1395,7 @@ async def get_template_preview(
                 {(item["task"], item["name"]): item for item in contacts},
                 date_text,
                 registry.service_display_names(service_id),
+                assignment_fields=field_values,
                 event_notes=resolve_event_note(
                     registry, service_id, event_date,
                     template=template or DEFAULT_GROUP_TEMPLATE,
@@ -1379,15 +1405,20 @@ async def get_template_preview(
                     ),
                 ),
             )
+    except AssignmentFieldResolutionError as exc:
+        debug_logger.exception("Не удалось разрешить поля назначений шаблона")
+        result["error"] = str(exc)
+        return result
     except (sqlite3.Error, EventNoteResolutionError) as exc:
         debug_logger.exception("Не удалось прочитать заметки для предпросмотра шаблона")
         result["error"] = (
             f"Не удалось прочитать заметки события: {exc}"
             if isinstance(exc, EventNoteResolutionError)
-            else "Не удалось прочитать заметки события. Попробуйте позже."
+            else "Не удалось прочитать заметки события или назначения. Попробуйте позже."
         )
         return result
     except (AttributeError, IndexError, ValueError):
+        debug_logger.exception("Не удалось подготовить поля шаблона служения")
         result["error"] = "Ошибка в синтаксисе шаблона."
         return result
     result["has_data"] = True
@@ -1420,6 +1451,7 @@ def _render_group_reminder(
     display_names: dict[str, str] | None = None,
     *,
     event_notes: str = "",
+    assignment_fields: AssignmentFields | None = None,
 ) -> str:
     """Текст группового напоминания; для задачи — только её ответственные."""
     task = reminder.get("task") or ""
@@ -1438,6 +1470,8 @@ def _render_group_reminder(
             ),
             informational_notes=format_informational_notes(assignments, service["id"]),
             event_notes=event_notes,
+            week_task_assignments=assignment_fields.week if assignment_fields else "",
+            service_assignments=assignment_fields.services if assignment_fields else {},
             task=task,
             task_responsibles=(
                 format_task_responsibles(
@@ -1683,9 +1717,16 @@ async def _process_service_reminder(
     date_text = event_date.strftime("%d.%m.%Y")
     group_template = registry.resolve_group_text(reminder, service)
     try:
+        field_values = resolve_assignment_fields(
+            registry, service_id, event_date, group_template,
+            datetime.now(tz).date(), reminder.get("task"),
+        )
+        for warning in field_values.warnings:
+            debug_logger.warning("Поле группового напоминания: %s", warning)
         group_text = _render_group_reminder(
             group_template, reminder, service, assignments, contacts_by_name,
             date_text, registry.service_display_names(service_id),
+            assignment_fields=field_values,
             event_notes=resolve_event_note(
                 registry, service_id, event_date, reminder.get("task"),
                 template=group_template,
@@ -1770,6 +1811,13 @@ async def _process_service_reminder(
                 same_assignments = approved_state == _approved_assignments_state(
                     registry, service_id, event_date
                 )
+                if field_values.state:
+                    same_assignments = same_assignments and (
+                        field_values.state == resolve_assignment_fields(
+                            registry, service_id, event_date, group_template,
+                            datetime.now(tz).date(), reminder.get("task"),
+                        ).state
+                    )
             except Exception:
                 debug_logger.exception(
                     "Не удалось повторно проверить утверждённый график "
@@ -2215,11 +2263,18 @@ async def _prepare_service_test_previews(
         "{service_name} — {sunday_date}\n{task_assignments}"
     )
     try:
+        field_values = resolve_assignment_fields(
+            registry, service_id, sunday_date, effective_group_template,
+            datetime.now(tz).date(),
+        )
+        issues.extend(field_values.warnings)
         group_text = effective_group_template.format_map(
             _TemplateValues(
                 service_name=service["name"],
                 sunday_date=sunday_str,
                 task_assignments=assignment_text,
+                week_task_assignments=field_values.week,
+                service_assignments=field_values.services,
                 informational_notes=format_informational_notes(assignments, service["id"]),
                 event_notes=resolve_event_note(
                     registry, service_id, sunday_date, template=effective_group_template,
@@ -2556,6 +2611,8 @@ async def _run_locked(args: CliArgs) -> None:
         async def prepare_group_reminder_preview(
             reminder_id: int,
             body: str | None = None,
+            *,
+            manual: bool = False,
         ) -> dict:
             if service_registry is None:
                 raise ValueError("Реестр настроек служений недоступен")
@@ -2567,6 +2624,7 @@ async def _run_locked(args: CliArgs) -> None:
                 service_registry,
                 debug_logger,
                 body=body,
+                manual=manual,
                 backup_manager=backup_manager,
             )
 
@@ -2578,6 +2636,12 @@ async def _run_locked(args: CliArgs) -> None:
                 date.fromisoformat(event_day), date.fromisoformat(event_day),
             ) if event.service_id == service_id
         ]
+        context.assignment_fields_state = lambda service_id, event_day, template, task: (
+            resolve_assignment_fields(
+                service_registry, service_id, date.fromisoformat(event_day),
+                template, datetime.now(tz).date(), task,
+            ).state
+        )
         context.schedule_candidate_version = lambda: source_version(
             credentials.yandex_public_url, shm_dir / "schedule-source"
         )
