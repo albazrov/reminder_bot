@@ -5,7 +5,7 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from bot.excel_parser import ServiceAssignment, ServiceEvent
@@ -16,7 +16,7 @@ from bot.month_summary import (
     month_summary_text,
     send_due_month_summaries,
 )
-from bot.service_registry import ServiceRegistry
+from bot.service_registry import ReplacementResolutionError, ServiceRegistry
 
 TZ = ZoneInfo("UTC")
 SUPER = 67890
@@ -137,6 +137,130 @@ class SendTest(unittest.TestCase):
         self.assertEqual(self.send(), 0)
         self.bot.send_message.assert_not_awaited()
         self.assertTrue(self.registry.is_month_summary_delivered(USER, "2026-11"))
+
+    def test_ambiguous_replacement_isolated_to_linked_recipients(self):
+        from bot import app
+
+        other = USER + 1
+        self.registry.set_responsible_contact(
+            SUPER, "kitchen", "старший", "Другой", other,
+        )
+        for user in (other, USER):
+            self.registry.set_month_summary(user, enabled=True)
+        day = "2026-11-01"
+        for service, task, name in (
+            ("sound", "звук", "Алексей"), ("kitchen", "старший", "Другой"),
+        ):
+            slots = {day: {task: [name]}}
+            self.registry.save_schedule_draft(
+                service, "2026-11", run_id=None, dates=[day],
+                tasks=[{"name": task, "needed": 1}], slots=slots, last_served={},
+            )
+            self.registry.approve_schedule_plan(
+                SUPER, service, "2026-11", slots, chat_id=None, message_id=None,
+            )
+        original = self.registry.list_replacements
+
+        def replacements(service, day, **kwargs):
+            if service == "kitchen":
+                raise ReplacementResolutionError("Неоднозначная замена")
+            return original(service, day, **kwargs)
+
+        async def load(**kwargs):
+            return await app._load_month_summary_events(
+                AsyncMock(), self.registry, {}, self.now,
+                public_url="unused", **kwargs,
+            )
+
+        with patch.object(self.registry, "list_replacements", side_effect=replacements):
+            run = asyncio.run(send_due_month_summaries(
+                self.bot, self.registry, load, self.now, MagicMock(),
+            ))
+            async def check_cached_loader():
+                cache = {}
+                source = AsyncMock(return_value=[])
+                kwargs = {"since": date(2026, 11, 1), "until": date(2026, 11, 30)}
+                events = await app._load_month_summary_events(
+                    source, self.registry, cache, self.now,
+                    service_ids={"sound"}, **kwargs,
+                )
+                self.assertEqual({event.service_id for event in events}, {"sound"})
+                with self.assertRaises(ReplacementResolutionError):
+                    await app._load_month_summary_events(
+                        source, self.registry, cache, self.now,
+                        service_ids={"kitchen"}, **kwargs,
+                    )
+                self.assertEqual(source.await_count, 1)
+            asyncio.run(check_cached_loader())
+        self.assertEqual((run.sent, run.waiting), (1, True))
+        self.assertTrue(self.registry.is_month_summary_delivered(USER, "2026-11"))
+        self.assertFalse(self.registry.is_month_summary_delivered(other, "2026-11"))
+        self.assertEqual(self.bot.send_message.await_args.args[0], USER)
+
+    def test_summary_refreshes_new_task_contact_before_sending(self):
+        from bot import app
+
+        self.registry.bind_service_member(SUPER, "sound", "Алексей", USER)
+        self.registry.set_month_summary(USER, enabled=True)
+        day = "2026-11-01"
+        slots = {day: {"сборка": ["Алексей"]}}
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=[day],
+            tasks=[{"name": "сборка", "needed": 1}], slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", "2026-11", slots, chat_id=None, message_id=None,
+        )
+        self.assertNotIn(
+            ("sound", "сборка", "Алексей"),
+            {(item["service_id"], item["task"], item["name"])
+             for item in self.registry.list_user_assignments(USER)},
+        )
+
+        async def load(**kwargs):
+            return await app._load_month_summary_events(
+                AsyncMock(), self.registry, {}, self.now,
+                public_url="unused", **kwargs,
+            )
+
+        run = asyncio.run(send_due_month_summaries(
+            self.bot, self.registry, load, self.now, MagicMock(),
+        ))
+        self.assertEqual(run.sent, 1)
+        self.assertIn("сборка", self.bot.send_message.await_args.args[1])
+
+    def test_summary_includes_member_service_without_existing_task_contact(self):
+        from bot import app
+
+        self.registry.bind_service_member(SUPER, "sound", "Алексей", USER)
+        with self.registry._connection() as connection:
+            connection.execute(
+                "DELETE FROM responsible_contacts WHERE service_id=? AND telegram_id=?",
+                ("sound", USER),
+            )
+        self.registry.set_month_summary(USER, enabled=True)
+        day = "2026-11-01"
+        slots = {day: {"сборка": ["Алексей"]}}
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=[day],
+            tasks=[{"name": "сборка", "needed": 1}], slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", "2026-11", slots, chat_id=None, message_id=None,
+        )
+        self.assertEqual(self.registry.list_user_assignments(USER), [])
+
+        async def load(**kwargs):
+            return await app._load_month_summary_events(
+                AsyncMock(), self.registry, {}, self.now,
+                public_url="unused", **kwargs,
+            )
+
+        run = asyncio.run(send_due_month_summaries(
+            self.bot, self.registry, load, self.now, MagicMock(),
+        ))
+        self.assertEqual(run.sent, 1)
+        self.assertIn("сборка", self.bot.send_message.await_args.args[1])
 
     def test_batch_rechecks_approved_plan_between_recipients_without_download(self):
         from bot import app

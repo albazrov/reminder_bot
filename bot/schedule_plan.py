@@ -1335,6 +1335,7 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
             event_tasks.setdefault(assignment.task, []).append(assignment.name)
         replacements = [] if draft else registry.list_replacements(
             plan["service_id"], event.event_date.isoformat(),
+            **({"source_sunday": source_sunday} if source_sunday is not None else {}),
         )
         current = _apply_assignment_replacements(
             event_tasks, replacements, people, keyed=keyed,
