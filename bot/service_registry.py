@@ -5362,6 +5362,20 @@ class ServiceRegistry:
             ).fetchall()
         return [row["service_id"] for row in rows]
 
+    def list_user_summary_services(self, actor_id: int) -> list[str]:
+        """Служения с привязками или участником, чьи задачи может добавить график."""
+        _validate_positive_id(actor_id, "actor_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT service_id FROM responsible_contacts WHERE telegram_id=? "
+                "AND service_id IN (SELECT id FROM services WHERE archived=0) "
+                "UNION SELECT service_id FROM service_members WHERE telegram_id=? "
+                "AND service_id IN (SELECT id FROM services WHERE archived=0) "
+                "ORDER BY service_id",
+                (actor_id, actor_id),
+            ).fetchall()
+        return [row["service_id"] for row in rows]
+
     def list_user_tasks(self, actor_id: int, service_id: str) -> list[str]:
         """Return only tasks to which this user is currently assigned."""
         _validate_positive_id(actor_id, "actor_id")

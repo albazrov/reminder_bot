@@ -150,8 +150,7 @@ async def send_due_month_summaries(
         key = month_key(year, month)
         for item in users:
             telegram_id = item["telegram_id"]
-            linked = linked_assignments(registry, telegram_id)
-            service_ids = {service_id for service_id, _, _ in linked}
+            service_ids = set(registry.list_user_summary_services(telegram_id))
             try:
                 events = await load_events(
                     since=since, until=until, fresh=fresh, service_ids=service_ids,
@@ -163,9 +162,11 @@ async def send_due_month_summaries(
                 )
                 run.waiting = True
                 continue
+            linked = linked_assignments(registry, telegram_id)
+            linked_services = {service_id for service_id, _, _ in linked}
             events_of_month = month_events(events, year, month)
             published = {event.service_id for event in events_of_month}
-            if service_ids - published and (
+            if linked_services - published and (
                 now < last_chance((year, month), item)
             ):
                 run.waiting = True
