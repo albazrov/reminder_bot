@@ -145,6 +145,9 @@ async def send_scheduled_event_notes(bot, registry, now: datetime, logger,
                 service["enabled"] and not registry.event_note_was_delivered(
                     note["event_sunday"], service["id"],
                 )
+                and not registry.event_note_expiry_alerted(
+                    note["event_sunday"], service["id"],
+                )
                 for service in registry.list_services()
             )
             if not registry.event_note_expiry_alerted(note["event_sunday"], "*"):

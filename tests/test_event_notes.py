@@ -246,6 +246,24 @@ class EventNotesTest(unittest.TestCase):
         asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
         notify.assert_awaited_once()
 
+    def test_all_services_expiry_alert_is_not_repeated_after_per_service_alerts(self):
+        self.note()
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+        bot = SimpleNamespace(send_message=AsyncMock())
+        notify = AsyncMock(return_value=True)
+        tz = ZoneInfo("Europe/Moscow")
+        asyncio.run(send_scheduled_event_notes(
+            bot, self.registry, datetime(2026, 11, 2, 1, tzinfo=tz), LOG, notify,
+        ))
+        initial = notify.await_count
+        self.assertGreater(initial, 0)
+        asyncio.run(send_scheduled_event_notes(
+            bot, self.registry, datetime(2026, 11, 3, 1, tzinfo=tz), LOG, notify,
+        ))
+        self.assertEqual(notify.await_count, initial)
+        self.assertTrue(self.registry.event_note_expiry_alerted("2026-11-01", "*"))
+
     def test_chat_change_during_previous_delivery_uses_new_chat(self):
         self.registry.set_group_chat(1001, "kitchen", -10003, enabled=True)
         self.note(targets=["sound", "kitchen"])
