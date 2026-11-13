@@ -69,10 +69,10 @@ def resolve_assignment_fields(
             "Не найдено воскресное событие утверждённого графика."
         )
     states = []
-    cache: dict[tuple[str, str | None], str] = {}
+    cache: dict[tuple[str, str | None, bool], str] = {}
 
-    def render(source_id: str, token: str | None) -> str:
-        cache_key = source_id, token
+    def render(source_id: str, token: str | None, *, own: bool) -> str:
+        cache_key = source_id, token, own
         if cache_key in cache:
             return cache[cache_key]
         service = registry.get_service(source_id)
@@ -122,11 +122,10 @@ def resolve_assignment_fields(
                         continue
                     person = by_key.get(key)
                     label = display_name(person, key)
-                    if person and person.get("username"):
-                        label += f" (@{person['username']})"
-                    if person and person.get("telegram_id"):
+                    if own and person and person.get("telegram_id"):
                         label = user_link(person["telegram_id"], label)
-                    lines.append(f"{task_emoji(name)} {name} — {label} — {day:%d.%m.%Y}")
+                    day_label = f" — {day:%d.%m}" if own and day.isoformat() != sunday else ""
+                    lines.append(f"{task_emoji(name)} {name}{day_label} — {label}")
                     rows.append((day.isoformat(), name, key, label))
         value = "\n".join(lines)
         states.append((cache_key, "approved", tuple(rows)))
@@ -134,9 +133,9 @@ def resolve_assignment_fields(
         return value
 
     if "week_task_assignments" in fields:
-        result.week = render(service_id, None)
+        result.week = render(service_id, None, own=True)
     for reference, (source_id, token) in references.items():
         key = reference[len("service_assignments["):-1]
-        result.services[key] = render(source_id, token)
+        result.services[key] = render(source_id, token, own=False)
     result.state = (sunday, cutoff.isoformat(), tuple(states))
     return result

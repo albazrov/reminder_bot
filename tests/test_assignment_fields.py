@@ -11,13 +11,16 @@ from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from bot import app
+from bot.admin_report import report_text
 from bot.assignment_fields import (
     AssignmentFieldResolutionError, assignment_field, resolve_assignment_fields,
 )
 from bot.event_notes import EventNoteResolutionError
+from bot.replacement import finish_replacement
+from bot.presentation import personal_schedule_lines
 from bot.service_registry import (
     ADMIN_REPORT_FIELDS, GENERAL_GROUP_TEMPLATE_FIELDS, PERSONAL_TEMPLATE_FIELDS,
-    ServiceRegistry, validate_notification_template,
+    ReplacementResolutionError, ServiceRegistry, validate_notification_template,
 )
 from bot.ui import plain_text, render_screen_chunks
 
@@ -77,8 +80,11 @@ class AssignmentFieldsTest(unittest.TestCase):
     def test_week_uses_actual_dates_today_and_order_without_mutation(self):
         before = copy.deepcopy(self.registry.get_schedule_plan("sound", "2027-01"))
         text = plain_text(self.resolve().week)
-        self.assertIn("спевка — C — 31.12.2026", text)
-        self.assertIn("звук — A — 03.01.2027", text)
+        self.assertIn("спевка — 31.12 — C", text)
+        self.assertIn("звук — A", text)
+        self.assertNotIn("03.01", text)
+        self.assertIn("LINK:501:", self.resolve().week)
+        self.assertNotIn("@", text)
         self.assertLess(text.index("звук"), text.index("сборка"))
         self.assertNotIn("спевка", plain_text(self.resolve(cutoff=date(2027, 1, 1)).week))
         self.assertEqual(self.resolve(cutoff=date(2027, 1, 4)).week, "")
@@ -99,7 +105,7 @@ class AssignmentFieldsTest(unittest.TestCase):
     def test_unassigned_hidden_and_unbound_person_still_shown(self):
         self.plan("sound", {"звук": ["Guest"], "сборка": [], "спевка": []})
         text = plain_text(self.resolve().week)
-        self.assertIn("звук — Guest — 03.01.2027", text)
+        self.assertIn("звук — Guest", text)
         self.assertNotIn("сборка", text)
         self.assertNotIn("спевка", text)
         self.assertNotIn("не назначен", text)
@@ -114,6 +120,27 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertNotIn("в смене", one)
         self.assertEqual(self.resolve(assignment_field("kitchen")).services, {"kitchen": ""})
         self.assertIn("нет утверждённого", self.resolve(assignment_field("kitchen")).warnings[0])
+
+    def test_hidden_cross_service_date_still_changes_state(self):
+        template = assignment_field("order", "старший")
+        before = self.resolve(template)
+        self.plan("order", {"старший": ["D"]}, {"старший": 2})
+        after = self.resolve(template)
+        self.assertEqual(before.services, after.services)
+        self.assertNotEqual(before.state, after.state)
+        self.assertEqual(next(iter(after.services.values())), "⭐ старший — D")
+
+    def test_week_link_and_non_sunday_date_format(self):
+        value = self.resolve().week
+        self.assertIn("LINK:501:", value)
+        self.assertIn("LINK:503:", value)
+        self.assertIn("спевка — 31.12 — C", plain_text(value))
+        self.assertNotIn("@", plain_text(value))
+        self.assertNotIn("2027", plain_text(value))
+        rendered = render_screen_chunks(value)[0]
+        self.assertIn('<a href="tg://user?id=501">A</a>', rendered)
+        self.assertIn('<a href="tg://user?id=503">C</a>', rendered)
+        self.assertNotIn("@", rendered)
 
     def test_namesakes_keep_exact_identity_and_safe_mentions(self):
         self.registry.set_responsible_contact(
@@ -137,18 +164,18 @@ class AssignmentFieldsTest(unittest.TestCase):
         value = next(iter(self.resolve(
             assignment_field("order", "старший"),
         ).services.values()))
-        self.assertIn("LINK:601:", value)
+        self.assertNotIn("LINK:601:", value)
         self.assertNotIn("LINK:602:", value)
         rendered = render_screen_chunks(value)[0]
         self.assertIn("&lt;name&gt;", rendered)
-        self.assertIn("(@first)", rendered)
+        self.assertNotIn("@first", rendered)
         self.assertNotIn("@second", rendered)
 
     def test_post_sunday_and_frozen_slot_dates_stay_in_same_block(self):
         self.plan("sound", {"звук": ["A"], "спевка": ["C"]}, {"спевка": 2})
         value = self.resolve(cutoff=date(2027, 1, 4))
         self.assertNotIn("звук", value.week)
-        self.assertIn("05.01.2027", value.week)
+        self.assertIn("05.01", value.week)
         self.assertEqual(value.week, self.resolve(
             event=date(2027, 1, 5), task="спевка", cutoff=date(2027, 1, 4),
         ).week)
@@ -169,7 +196,8 @@ class AssignmentFieldsTest(unittest.TestCase):
             telegram_id=505, username="", source="admin", created_by=1001,
         )
         after = self.resolve(template)
-        self.assertIn("LINK:505:", next(iter(after.services.values())))
+        self.assertIn("E", next(iter(after.services.values())))
+        self.assertNotIn("LINK:", next(iter(after.services.values())))
         self.assertNotEqual(after.state, before.state)
         self.assertNotEqual(after.state, self.resolve(
             template, cutoff=date(2027, 1, 1),
@@ -198,20 +226,210 @@ class AssignmentFieldsTest(unittest.TestCase):
                 username="", source="admin", created_by=1001,
             )
         value = next(iter(self.resolve(assignment_field("order")).services.values()))
-        self.assertIn("старший — Final — 05.01.2027", plain_text(value))
+        self.assertIn("старший — Final", plain_text(value))
         self.assertNotIn("Other", value)
         self.assertNotIn("Substitute", value)
         self.assertNotIn("E —", plain_text(value))
 
-    def test_saved_replacement_survives_reapproval_without_old_person(self):
+    def test_reapproval_supersedes_older_replacement_without_old_person(self):
         self.registry.set_replacement(
             "order", SUNDAY.isoformat(), "старший", "D", "Substitute",
             telegram_id=None, username="", source="admin", created_by=1001,
         )
         self.plan("order", {"старший": ["E"]})
         value = next(iter(self.resolve(assignment_field("order")).services.values()))
-        self.assertIn("Substitute", value)
-        self.assertIn("E —", plain_text(value))
+        self.assertNotIn("Substitute", value)
+        self.assertIn("старший — E", plain_text(value))
+
+    def test_reapproval_supersedes_older_replacement_when_old_person_remains(self):
+        self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "D", "Substitute",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        self.plan("order", {"старший": ["D"]})
+        value = next(iter(self.resolve(assignment_field("order")).services.values()))
+        self.assertIn("старший — D", plain_text(value))
+        self.assertNotIn("Substitute", value)
+
+    def test_excel_approval_supersedes_older_replacement(self):
+        self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "D", "Substitute",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        day = SUNDAY.isoformat()
+        self.registry.import_excel_plan(
+            1001, "order", day[:7], dates=[day],
+            tasks=[{"name": "старший", "needed": 1, "max": 1, "day": 0}],
+            slots={day: {"старший": ["D"]}}, days={},
+            approved_slot_days={day: {"старший": {"D": 0}}},
+        )
+        self.assertEqual(self.registry.list_replacements("order", day), [])
+
+    def test_reapproval_is_consistent_in_reminders_reports_and_personal_schedule(self):
+        day = SUNDAY.isoformat()
+        self.registry.set_replacement(
+            "order", day, "старший", "D", "Substitute",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        self.plan("order", {"старший": ["E"]})
+        raw = {}
+        with patch("bot.app._saved_note_events", return_value=[]):
+            assignments = asyncio.run(app._load_service_task_assignments(
+                self.credentials, self.path, TZ, "order", LOG, only_date=SUNDAY,
+                services=self.registry.service_catalog(), registry=self.registry,
+                raw_out=raw, require_approved_plan=True,
+            ))
+        self.assertEqual(set(assignments["старший"]["names"]), {"E"})
+        report = plain_text(report_text(
+            self.registry, self.registry.get_service("order"), SUNDAY, raw, 1001, 4096,
+        ))
+        self.assertIn("E", report)
+        self.assertNotIn("Substitute", report)
+        events, _ = app._bot_plan_events(
+            self.registry, SUNDAY, SUNDAY, service_id="order",
+        )
+        events = app._apply_event_replacements(
+            [event for event in events if event.event_date == SUNDAY], self.registry,
+        )
+        self.assertTrue(personal_schedule_lines(events, {("order", "старший", "E")}, {}))
+        self.assertFalse(personal_schedule_lines(
+            events, {("order", "старший", "Substitute")}, {},
+        ))
+
+    def test_stale_replacement_screen_cannot_add_removed_person_after_reapproval(self):
+        self.plan("order", {"старший": ["E"]})
+        saved = self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "D", "Substitute",
+            telegram_id=None, username="", source="admin", created_by=1001,
+            expect_current=True,
+        )
+        self.assertFalse(saved)
+        self.assertEqual(self.registry.list_replacements("order", SUNDAY.isoformat()), [])
+
+    def test_new_replacement_after_reapproval_applies_and_history_is_retained(self):
+        self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "D", "First",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        self.plan("order", {"старший": ["D"]})
+        self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "D", "Second",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        value = next(iter(self.resolve(assignment_field("order")).services.values()))
+        self.assertIn("старший — Second", plain_text(value))
+        self.assertNotIn("First", value)
+        with self.registry._connection(notify=False) as connection:
+            history = connection.execute(
+                "SELECT new_name, source_sunday FROM service_replacement_history "
+                "WHERE service_id=? AND event_date=? AND task=?",
+                ("order", SUNDAY.isoformat(), "старший"),
+            ).fetchall()
+        self.assertEqual([(row["new_name"], row["source_sunday"]) for row in history],
+                         [("First", SUNDAY.isoformat())])
+
+    def test_new_replacement_can_continue_an_unambiguous_legacy_chain(self):
+        self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "D", "First",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        with self.registry._connection() as connection:
+            connection.execute(
+                "UPDATE service_replacements SET source_sunday=NULL "
+                "WHERE service_id=? AND event_date=?", ("order", SUNDAY.isoformat()),
+            )
+        saved = self.registry.set_replacement(
+            "order", SUNDAY.isoformat(), "старший", "First", "Second",
+            telegram_id=None, username="", source="admin", created_by=1001,
+            expect_current=True,
+        )
+        self.assertTrue(saved)
+        value = next(iter(self.resolve(assignment_field("order")).services.values()))
+        self.assertIn("старший — Second", plain_text(value))
+        self.assertNotIn("First", value)
+
+    def test_legacy_replacement_schema_migrates_without_losing_rows(self):
+        path = self.path / "legacy.sqlite3"
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "CREATE TABLE service_replacements ("
+                "service_id TEXT NOT NULL, event_date TEXT NOT NULL, "
+                "task TEXT NOT NULL, old_name TEXT NOT NULL, new_name TEXT NOT NULL, "
+                "telegram_id INTEGER, username TEXT NOT NULL, source TEXT NOT NULL, "
+                "created_by INTEGER, created_at TEXT NOT NULL, "
+                "PRIMARY KEY (service_id, event_date, task, old_name))"
+            )
+            connection.execute(
+                "INSERT INTO service_replacements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("order", SUNDAY.isoformat(), "старший", "D", "E", None,
+                 "", "admin", 1001, "2026-01-01T00:00:00+00:00"),
+            )
+        path.chmod(0o600)
+        registry = ServiceRegistry(path)
+        registry.initialize(1001, -10001)
+        registry.initialize(1001, -10001)
+        with registry._connection(notify=False) as connection:
+            row = connection.execute(
+                "SELECT old_name, new_name, source_sunday FROM service_replacements"
+            ).fetchone()
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        self.assertEqual(tuple(row), ("D", "E", None))
+        self.assertEqual(integrity, "ok")
+
+    def test_poll_started_before_reapproval_cannot_apply_result(self):
+        self.registry.create_replacement_poll(
+            "old-poll", "order", SUNDAY.isoformat(), "старший", "D", 504,
+            -10002, 0, None, "2027-01-02T00:00:00+00:00",
+        )
+        poll = self.registry.get_replacement_poll("old-poll")
+        self.plan("order", {"старший": ["D"]})
+        bot = SimpleNamespace(send_message=AsyncMock(), stop_poll=AsyncMock())
+        result = asyncio.run(finish_replacement(
+            bot, self.registry, poll,
+            {"name": "Substitute", "telegram_id": None, "username": ""},
+            source="admin", actor_id=1001, admin_actor_id=1001,
+            tz=TZ, logger=LOG, report_limit=4096,
+        ))
+        self.assertFalse(result)
+        self.assertEqual(self.registry.list_replacements("order", SUNDAY.isoformat()), [])
+        self.assertEqual(self.registry.get_replacement_poll("old-poll")["filled"], 1)
+        self.assertTrue(any("устарел" in call.args[1] for call in bot.send_message.await_args_list))
+
+    def test_poll_started_after_approval_can_apply_result(self):
+        self.registry.create_replacement_poll(
+            "new-poll", "order", SUNDAY.isoformat(), "старший", "D", 504,
+            -10002, 0, None, "2027-01-02T00:00:00+00:00",
+        )
+        poll = self.registry.get_replacement_poll("new-poll")
+        bot = SimpleNamespace(send_message=AsyncMock(), stop_poll=AsyncMock())
+        with patch("bot.replacement._announce_replacement", new=AsyncMock(return_value=[])):
+            result = asyncio.run(finish_replacement(
+                bot, self.registry, poll,
+                {"name": "Substitute", "telegram_id": None, "username": ""},
+                source="admin", actor_id=1001, admin_actor_id=1001,
+                tz=TZ, logger=LOG, report_limit=4096,
+            ))
+        self.assertTrue(result)
+        self.assertEqual(
+            self.registry.list_replacements("order", SUNDAY.isoformat())[0]["new_name"],
+            "Substitute",
+        )
+
+    def test_stale_poll_without_votes_does_not_leave_unfilled_request(self):
+        self.registry.create_replacement_poll(
+            "stale-empty", "order", SUNDAY.isoformat(), "старший", "D", 504,
+            -10002, 0, None, "2027-01-02T00:00:00+00:00",
+        )
+        poll = self.registry.get_replacement_poll("stale-empty")
+        self.plan("order", {"старший": ["D"]})
+        bot = SimpleNamespace(send_message=AsyncMock(), stop_poll=AsyncMock())
+        result = asyncio.run(finish_replacement(
+            bot, self.registry, poll, None, source="poll", actor_id=None,
+            admin_actor_id=1001, tz=TZ, logger=LOG, report_limit=4096,
+        ))
+        self.assertFalse(result)
+        self.assertEqual(self.registry.get_replacement_poll("stale-empty")["filled"], 1)
+        self.assertTrue(any("устарел" in call.args[1] for call in bot.send_message.await_args_list))
 
     def test_other_month_replacement_chain_does_not_leak_into_selected_week(self):
         self.plan("order", {"старший": ["D"]}, {"старший": -3})
@@ -222,8 +440,99 @@ class AssignmentFieldsTest(unittest.TestCase):
                 username="", source="admin", created_by=1001,
             )
         value = next(iter(self.resolve(assignment_field("order")).services.values()))
-        self.assertIn("старший — D — 31.12.2026", plain_text(value))
+        self.assertIn("старший — D", plain_text(value))
         self.assertNotIn("Other", value)
+
+    def test_overlapping_month_events_apply_replacement_only_to_its_block(self):
+        day = date(2026, 12, 31)
+        self.plan("order", {"старший": ["D"]}, {"старший": -3})
+        self.plan("order", {"старший": ["E"]}, {"старший": 4},
+                  sunday=date(2026, 12, 27))
+        self.registry.set_replacement(
+            "order", day.isoformat(), "старший", "E", "Other",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        events, _ = app._bot_plan_events(self.registry, day, day, service_id="order")
+        events = [event for event in events if event.event_date == day]
+        result = app._apply_event_replacements(events, self.registry)
+        self.assertCountEqual(
+            [row.name for event in result for row in event.assignments
+             if row.task == "старший"],
+            ["D", "Other"],
+        )
+
+    def test_legacy_replacement_cannot_be_attributed_to_remaining_neighbor(self):
+        day = "2026-12-31"
+        self.plan("order", {"старший": ["D"]}, {"старший": -3})
+        self.plan("order", {"старший": ["E"]}, {"старший": 4},
+                  sunday=date(2026, 12, 27))
+        self.registry.set_replacement(
+            "order", day, "старший", "E", "Other",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        with self.registry._connection() as connection:
+            connection.execute(
+                "UPDATE service_replacements SET source_sunday=NULL "
+                "WHERE service_id=? AND event_date=?", ("order", day),
+            )
+        self.plan("order", {"старший": ["E"]}, {"старший": 0},
+                  sunday=date(2026, 12, 27))
+        with self.assertRaises(ReplacementResolutionError):
+            self.registry.list_replacements("order", day)
+
+    def test_new_namesake_in_neighboring_week_does_not_get_replaced(self):
+        day = "2026-12-31"
+        self.plan("order", {"старший": ["D"]}, {"старший": -3})
+        self.plan("order", {"старший": ["E"]}, {"старший": 4},
+                  sunday=date(2026, 12, 27))
+        self.registry.set_replacement(
+            "order", day, "старший", "D", "Other",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        self.plan("order", {"старший": ["D"]}, {"старший": 4},
+                  sunday=date(2026, 12, 27))
+        with self.assertRaises(ReplacementResolutionError):
+            self.registry.list_replacements("order", day)
+
+    def test_legacy_replacement_cannot_be_attributed_if_other_month_disappeared(self):
+        day = "2026-12-31"
+        self.plan("order", {"старший": ["D"]}, {"старший": -3})
+        self.plan("order", {"старший": ["E"]}, {"старший": 4},
+                  sunday=date(2026, 12, 27))
+        self.registry.set_replacement(
+            "order", day, "старший", "E", "Other",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        with self.registry._connection() as connection:
+            connection.execute(
+                "UPDATE service_replacements SET source_sunday=NULL "
+                "WHERE service_id=? AND event_date=?", ("order", day),
+            )
+            connection.execute(
+                "UPDATE schedule_plans SET approved_json=NULL "
+                "WHERE service_id=? AND month=?", ("order", "2026-12"),
+            )
+        with self.assertRaises(ReplacementResolutionError):
+            self.registry.list_replacements("order", day)
+
+    def test_legacy_replacement_is_inactive_when_all_possible_months_reapproved(self):
+        day = "2026-12-31"
+        self.plan("order", {"старший": ["D"]}, {"старший": -3})
+        self.plan("order", {"старший": ["E"]}, {"старший": 4},
+                  sunday=date(2026, 12, 27))
+        self.registry.set_replacement(
+            "order", day, "старший", "E", "Other",
+            telegram_id=None, username="", source="admin", created_by=1001,
+        )
+        with self.registry._connection() as connection:
+            connection.execute(
+                "UPDATE service_replacements SET source_sunday=NULL "
+                "WHERE service_id=? AND event_date=?", ("order", day),
+            )
+        self.plan("order", {"старший": ["D"]}, {"старший": -3})
+        self.plan("order", {"старший": ["E"]}, {"старший": 4},
+                  sunday=date(2026, 12, 27))
+        self.assertEqual(self.registry.list_replacements("order", day), [])
 
     def test_namesakes_in_overlapping_blocks_fail_explicitly_for_ambiguous_replacement(self):
         people = [
@@ -248,20 +557,11 @@ class AssignmentFieldsTest(unittest.TestCase):
                 second: {"старший": {people[1]["key"]: -5}},
             },
         )
-        self.registry.set_replacement(
-            "order", "2027-01-05", "старший", "Twin", "Guest", telegram_id=None,
-            username="", source="admin", created_by=1001,
-        )
-        reader = self.registry.readiness_people
-        with patch.object(
-            self.registry, "readiness_people",
-            side_effect=lambda source: people if source == "order" else reader(source),
-        ):
-            with self.assertRaisesRegex(AssignmentFieldResolutionError, "тёзки"):
-                self.resolve(assignment_field("order"))
-            preview = self.preview(assignment_field("order"))
-        self.assertFalse(preview["has_data"])
-        self.assertIn("тёзки", preview["error"])
+        with self.assertRaisesRegex(ValueError, "неделю замены"):
+            self.registry.set_replacement(
+                "order", "2027-01-05", "старший", "Twin", "Guest", telegram_id=None,
+                username="", source="admin", created_by=1001,
+            )
 
     def test_plain_namesake_assignment_without_replacement_remains_unlinked(self):
         people = [
@@ -277,7 +577,7 @@ class AssignmentFieldsTest(unittest.TestCase):
         ):
             result = self.resolve(assignment_field("order"))
             preview = self.preview(assignment_field("order"))
-        self.assertIn("старший — Twin — 03.01.2027", result.services["order"])
+        self.assertIn("старший — Twin", result.services["order"])
         self.assertNotIn("LINK:", result.services["order"])
         self.assertTrue(preview["has_data"], preview)
 
@@ -349,6 +649,22 @@ class AssignmentFieldsTest(unittest.TestCase):
             result = self.preview("{week_task_assignments}")
         self.assertFalse(result["has_data"])
         self.assertIsNotNone(result["error"])
+
+    def test_preview_reports_replacement_conflict_not_template_syntax(self):
+        message = "Не удалось определить неделю сохранённой замены."
+        with patch("bot.app.resolve_assignment_fields",
+                   side_effect=ReplacementResolutionError(message)):
+            result = self.preview("{week_task_assignments}")
+        self.assertFalse(result["has_data"])
+        self.assertEqual(result["error"], message)
+
+    def test_preview_reports_replacement_conflict_in_schedule_snapshot(self):
+        message = "Не удалось определить неделю сохранённой замены."
+        with patch("bot.app._approved_service_events",
+                   side_effect=ReplacementResolutionError(message)):
+            result = self.preview("{task_assignments}")
+        self.assertFalse(result["has_data"])
+        self.assertEqual(result["error"], message)
 
     def test_template_preview_uses_same_fields_and_exposes_warnings(self):
         template = "{week_task_assignments}\n" + assignment_field("kitchen")

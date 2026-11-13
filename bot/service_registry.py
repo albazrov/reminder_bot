@@ -213,6 +213,14 @@ def plan_target_thread(plan: dict) -> int | None:
     return target if target is not None else plan.get("thread_id")
 
 
+class ReplacementResolutionError(ValueError):
+    """Невозможно безопасно сопоставить замену с утверждённым графиком."""
+
+
+class StaleReplacementRequest(ValueError):
+    """Запрос замены создан до изменения потенциально связанного графика."""
+
+
 class ServiceRegistry:
     def __init__(
         self, path: Path, on_change: Callable[[], None] | None = None
@@ -721,6 +729,13 @@ class ServiceRegistry:
                     PRIMARY KEY (service_id, event_date, task, old_name)
                 );
 
+                CREATE TABLE IF NOT EXISTS service_replacement_history (
+                    service_id TEXT NOT NULL, event_date TEXT NOT NULL,
+                    task TEXT NOT NULL, old_name TEXT NOT NULL, new_name TEXT NOT NULL,
+                    telegram_id INTEGER, username TEXT NOT NULL, source TEXT NOT NULL,
+                    created_by INTEGER, created_at TEXT NOT NULL, source_sunday TEXT
+                );
+
                 -- Опросы «Кто сможет…» в чате служения (этап 3.3).
                 CREATE TABLE IF NOT EXISTS replacement_polls (
                     poll_id TEXT PRIMARY KEY,
@@ -1015,6 +1030,7 @@ class ServiceRegistry:
                 ("readiness_runs", "reverse_poll",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("event_notes", "revision", "INTEGER NOT NULL DEFAULT 1"),
+                ("service_replacements", "source_sunday", "TEXT"),
             ):
                 columns = {
                     row["name"]
@@ -3036,11 +3052,14 @@ class ServiceRegistry:
         notice_message_id: int | None,
         deadline: str,
         status: str = "open",
+        started_at: str | None = None,
     ) -> None:
         """status="closed" — запрос без опроса (нет чата служения или опрос
         не отправился): ждёт /change."""
         date.fromisoformat(event_date)
         datetime.fromisoformat(deadline)
+        if started_at is not None:
+            datetime.fromisoformat(started_at)
         if status not in {"open", "closed"}:
             raise ValueError("Некорректное состояние опроса")
         with self._connection() as connection:
@@ -3056,7 +3075,7 @@ class ServiceRegistry:
                 (
                     poll_id, service_id, event_date, task, old_name,
                     old_telegram_id, chat_id, message_id, notice_message_id,
-                    deadline, status, _utc_now(),
+                    deadline, status, started_at or _utc_now(),
                 ),
             )
 
@@ -3408,6 +3427,34 @@ class ServiceRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def validate_replacement_request(self, poll: dict, *, connection=None) -> None:
+        with nullcontext(connection) if connection is not None else self._connection() as connection:
+            request = connection.execute(
+                "SELECT service_id, event_date, task, old_name, created_at "
+                "FROM replacement_polls WHERE poll_id=?",
+                (poll["poll_id"],),
+            ).fetchone()
+            if request is None or any(
+                request[key] != poll[key]
+                for key in ("service_id", "event_date", "task", "old_name")
+            ):
+                raise StaleReplacementRequest("Запрос замены больше не актуален.")
+            day = date.fromisoformat(request["event_date"])
+            plans = connection.execute(
+                "SELECT approved_at FROM schedule_plans WHERE service_id=? "
+                "AND approved_json IS NOT NULL AND month BETWEEN ? AND ?",
+                (request["service_id"], (day - timedelta(days=6)).strftime("%Y-%m"),
+                 (day + timedelta(days=6)).strftime("%Y-%m")),
+            ).fetchall()
+            for plan in plans:
+                if plan["approved_at"] and not _timestamp_after(
+                    request["created_at"], plan["approved_at"]
+                ):
+                    raise StaleReplacementRequest(
+                        "График изменился после начала поиска замены. "
+                        "Проверьте назначения и начните поиск заново."
+                    )
+
     def set_replacement(
         self,
         service_id: str,
@@ -3420,6 +3467,7 @@ class ServiceRegistry:
         source: str,
         created_by: int | None,
         expect_current: bool = False,
+        request_id: str | None = None,
     ) -> bool:
         """Замена на одну дату.
 
@@ -3436,21 +3484,69 @@ class ServiceRegistry:
         if telegram_id is not None:
             _validate_positive_id(telegram_id, "telegram_id")
         username = (username or "").strip().lstrip("@")
-        now = _utc_now()
         with self._connection() as connection:
             # Проверка и запись — одной транзакцией: два подтверждения
             # подряд не назначат замену дважды.
             connection.execute("BEGIN IMMEDIATE")
             self._require_service(connection, service_id)
-            if expect_current:
-                rows = connection.execute(
-                    "SELECT task, old_name, new_name FROM service_replacements "
-                    "WHERE service_id = ? AND event_date = ? "
-                    "ORDER BY created_at, rowid",
-                    (service_id, event_date),
-                ).fetchall()
-                if is_replaced([dict(row) for row in rows], task, old_name):
+            now = _utc_now()
+            if request_id is not None:
+                self.validate_replacement_request(
+                    {"poll_id": request_id, "service_id": service_id,
+                     "event_date": event_date, "task": task, "old_name": old_name},
+                    connection=connection,
+                )
+            active = self.list_replacements(
+                service_id, event_date, connection=connection, include_source=True,
+            )
+            if expect_current and is_replaced(active, task, old_name):
+                return False
+            blocks = self._replacement_blocks(connection, service_id, event_date)
+            candidates = {
+                sunday: entry for (name, sunday), entry in blocks.items() if name == task
+            }
+            matching = {
+                sunday for sunday, entry in candidates.items() if old_name in entry["names"]
+            }
+            matching.update(
+                row["source_sunday"] for row in active
+                if row["task"] == task and row["new_name"] == old_name
+                and row["source_sunday"] in candidates
+            )
+            if expect_current and not matching:
+                day = date.fromisoformat(event_date)
+                approved = connection.execute(
+                    "SELECT 1 FROM schedule_plans WHERE service_id=? "
+                    "AND approved_json IS NOT NULL AND month BETWEEN ? AND ? LIMIT 1",
+                    (service_id, (day - timedelta(days=6)).strftime("%Y-%m"),
+                     (day + timedelta(days=6)).strftime("%Y-%m")),
+                ).fetchone()
+                if approved:
                     return False
+            if len(matching) > 1 or (not matching and len(candidates) > 1):
+                raise ValueError(
+                    "Не удалось определить неделю замены. Проверьте назначения "
+                    "и выберите задачу с однозначной датой."
+                )
+            source_sunday = (
+                next(iter(matching)) if matching else
+                next(iter(candidates)) if candidates else None
+            )
+            existing = connection.execute(
+                "SELECT source_sunday, created_at FROM service_replacements "
+                "WHERE service_id=? AND event_date=? AND task=? AND old_name=?",
+                (service_id, event_date, task, old_name),
+            ).fetchone()
+            if existing and existing["source_sunday"] and existing["source_sunday"] != source_sunday:
+                old_block = candidates.get(existing["source_sunday"])
+                if old_block and (
+                    not old_block["approved_at"]
+                    or _timestamp_after(existing["created_at"], old_block["approved_at"])
+                ):
+                    raise ValueError(
+                        "Для другой недели уже существует замена этого участника. "
+                        "Уточните даты задачи перед новой заменой."
+                    )
             errors = self.replacement_assignment_errors(
                 service_id, event_date, task, old_name, new_name,
                 connection=connection, telegram_id=telegram_id,
@@ -3461,22 +3557,30 @@ class ServiceRegistry:
                     + "\nСначала назначьте дополнительную обязанность другому участнику смены."
                 )
             connection.execute(
+                "INSERT INTO service_replacement_history "
+                "SELECT service_id,event_date,task,old_name,new_name,telegram_id,"
+                "username,source,created_by,created_at,source_sunday FROM service_replacements "
+                "WHERE service_id=? AND event_date=? AND task=? AND old_name=?",
+                (service_id, event_date, task, old_name),
+            )
+            connection.execute(
                 """
                 INSERT INTO service_replacements (
                     service_id, event_date, task, old_name, new_name,
-                    telegram_id, username, source, created_by, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    telegram_id, username, source, created_by, created_at, source_sunday
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(service_id, event_date, task, old_name)
                 DO UPDATE SET new_name = excluded.new_name,
                               telegram_id = excluded.telegram_id,
                               username = excluded.username,
                               source = excluded.source,
                               created_by = excluded.created_by,
-                              created_at = excluded.created_at
+                              created_at = excluded.created_at,
+                              source_sunday = excluded.source_sunday
                 """,
                 (
                     service_id, event_date, task, old_name, new_name,
-                    telegram_id, username, source, created_by, now,
+                    telegram_id, username, source, created_by, now, source_sunday,
                 ),
             )
             known = telegram_id is not None and connection.execute(
@@ -3504,19 +3608,150 @@ class ServiceRegistry:
                 )
         return True
 
+    def _replacement_blocks(self, connection, service_id: str, event_date: str):
+        from .schedule_plan import plan_events
+
+        day = date.fromisoformat(event_date)
+        people = self.readiness_people(service_id, connection=connection)
+        rows = connection.execute(
+            "SELECT * FROM schedule_plans WHERE service_id=? AND approved_json IS NOT NULL "
+            "AND month BETWEEN ? AND ?",
+            (service_id, (day - timedelta(days=6)).strftime("%Y-%m"),
+             (day + timedelta(days=6)).strftime("%Y-%m")),
+        ).fetchall()
+        blocks = {}
+        for row in rows:
+            plan = self._schedule_plan(row)
+            for sunday, slots in plan["approved"].items():
+                block = {**plan, "approved": {sunday: slots}}
+                for event in plan_events(block, people):
+                    if event.event_date != day:
+                        continue
+                    for assignment in event.assignments:
+                        key = assignment.task, sunday
+                        entry = blocks.setdefault(
+                            key, {"approved_at": plan["approved_at"], "names": set()},
+                        )
+                        entry["names"].add(assignment.name)
+        return blocks
+
     def list_replacements(self, service_id: str, event_date: str, *,
-                          connection=None) -> list[dict]:
+                          connection=None, source_sunday: str | None = None,
+                          include_source: bool = False) -> list[dict]:
         """Замены на дату в порядке назначения (цепочки применяются по
         очереди)."""
         with nullcontext(connection) if connection is not None else self._connection() as connection:
             rows = connection.execute(
                 "SELECT task, old_name, new_name, telegram_id, username, "
-                "source FROM service_replacements "
+                "source, created_at, source_sunday FROM service_replacements "
                 "WHERE service_id = ? AND event_date = ? "
                 "ORDER BY created_at, rowid",
                 (service_id, event_date),
             ).fetchall()
-        return [dict(row) for row in rows]
+            if not rows:
+                return []
+            blocks = self._replacement_blocks(connection, service_id, event_date)
+            day = date.fromisoformat(event_date)
+            sunday_months = {
+                (day + timedelta(days=offset)).strftime("%Y-%m")
+                for offset in range(-6, 7)
+                if (day + timedelta(days=offset)).weekday() == 6
+            }
+            approvals = {
+                row["month"]: row["approved_at"]
+                for row in connection.execute(
+                    "SELECT month, approved_at FROM schedule_plans "
+                    "WHERE service_id=? AND approved_json IS NOT NULL "
+                    "AND month BETWEEN ? AND ?",
+                    (service_id, min(sunday_months), max(sunday_months)),
+                )
+                if row["month"] in sunday_months and row["approved_at"]
+            }
+        owners = {}
+        effective = {key: set(entry["names"]) for key, entry in blocks.items()}
+        result = []
+        for row in rows:
+            item = dict(row)
+            task = item["task"]
+            candidates = {
+                sunday: entry for (name, sunday), entry in blocks.items() if name == task
+            }
+            owner = item["source_sunday"]
+            if owner is None and sunday_months <= approvals.keys() and all(
+                not _timestamp_after(item["created_at"], approvals[month])
+                for month in sunday_months
+            ):
+                continue
+            if owner is None and candidates:
+                if any(
+                    month not in approvals
+                    or _timestamp_after(approvals[month], item["created_at"])
+                    for month in sunday_months
+                    if all(sunday[:7] != month for sunday in candidates)
+                ) and any(
+                    not entry["approved_at"]
+                    or _timestamp_after(item["created_at"], entry["approved_at"])
+                    for entry in candidates.values()
+                ):
+                    raise ReplacementResolutionError(
+                        "Не удалось определить неделю старой замены после утверждения. "
+                        "Проверьте назначения и замену в графике служения."
+                    )
+                if len(candidates) > 1 and any(
+                    entry["approved_at"]
+                    and not _timestamp_after(item["created_at"], entry["approved_at"])
+                    for entry in candidates.values()
+                ):
+                    raise ReplacementResolutionError(
+                        "Не удалось определить неделю старой замены после утверждения. "
+                        "Проверьте назначения и замену в графике служения."
+                    )
+                matching = {
+                    sunday for sunday, entry in candidates.items()
+                    if item["old_name"] in entry["names"]
+                }
+                previous = owners.get((task, item["old_name"]))
+                if previous:
+                    matching.add(previous)
+                if len(matching) == 1:
+                    owner = next(iter(matching))
+                elif not matching and len(candidates) == 1:
+                    owner = next(iter(candidates))
+                else:
+                    raise ReplacementResolutionError(
+                        "Не удалось определить неделю сохранённой замены. "
+                        "Проверьте назначения и замену в графике служения."
+                    )
+            current = candidates.get(owner)
+            if owner and current is None:
+                continue
+            if (current and current["approved_at"]
+                    and not _timestamp_after(item["created_at"], current["approved_at"])):
+                continue
+            if owner:
+                if any(
+                    block_task == task and sunday != owner
+                    and item["old_name"] in names
+                    for (block_task, sunday), names in effective.items()
+                ):
+                    raise ReplacementResolutionError(
+                        "Не удалось безопасно применить замену: участник назначен "
+                        "на ту же задачу в другой неделе. Проверьте график."
+                    )
+                names = effective[(task, owner)]
+                names.discard(item["old_name"])
+                names.add(item["new_name"])
+                owners[(task, item["new_name"])] = owner
+            if source_sunday is not None and owner and owner != source_sunday:
+                continue
+            replacement = {
+                key: item[key] for key in
+                ("task", "old_name", "new_name", "telegram_id", "username", "source")
+            }
+            if include_source:
+                replacement["source_sunday"] = owner
+            result.append(replacement)
+        return result
 
     def set_group_reminder_period(
         self,
@@ -6892,9 +7127,9 @@ class ServiceRegistry:
         публикации в чате). Прежний график месяца (по опросу) заменяется;
         вернуть его — снова «🔄 Пересчитать» в «📅 График»."""
         _validate_positive_id(actor_id, "actor_id")
-        now = _utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = _utc_now()
             self._require_service_editor(connection, actor_id, service_id)
             self._require_service(connection, service_id)
             current_rules = dependent_tasks(self.plan_tasks(service_id, connection=connection))
@@ -7578,3 +7813,10 @@ def _username_binding_cutoff() -> str:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _timestamp_after(first: str, second: str) -> bool:
+    moments = [datetime.fromisoformat(value) for value in (first, second)]
+    if any(moment.tzinfo is None for moment in moments):
+        raise ValueError("У времени записи или утверждения отсутствует часовой пояс.")
+    return moments[0] > moments[1]
