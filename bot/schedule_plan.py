@@ -1213,15 +1213,19 @@ def plan_events(plan: dict, people: list[dict], *, keyed: bool = False) -> list[
 def _apply_assignment_replacements(
     assignments: dict[str, list[str]], replacements: list[dict], people: list[dict],
     *, keyed: bool = False, other_assignments: dict[str, list[str]] | None = None,
+    replacement_people: dict[str, dict] | None = None,
 ) -> dict[str, list[str]]:
     if not keyed:
         if other_assignments is None:
             return apply_replacements(assignments, replacements)
     by_key = {person["key"]: person for person in people}
+    if replacement_people is not None:
+        by_key.update(replacement_people)
 
     def person_key(
         name: str, task: str, telegram_id: int | None = None,
         assigned: Sequence[str] = (), *, require_unique: bool = False,
+        username: str = "",
     ) -> str:
         if telegram_id:
             matches = [person["key"] for person in people
@@ -1239,7 +1243,22 @@ def _apply_assignment_replacements(
                     "Нельзя однозначно определить участника сохранённой замены: "
                     "на одну дату назначены тёзки. Уточните назначения или дату задачи."
                 )
-        return matches[0] if len(matches) == 1 else name
+        if len(matches) == 1:
+            return matches[0]
+        if not matches and telegram_id and replacement_people is not None:
+            key = "\x1freplacement:" + json.dumps(
+                [telegram_id, name, username], ensure_ascii=False,
+            )
+            if key not in by_key:
+                person = {
+                    "key": key, "name": name, "telegram_id": telegram_id,
+                    "username": username,
+                    "tasks": [],
+                }
+                replacement_people[key] = person
+                by_key[key] = person
+            return key
+        return name
 
     def keyed_assignments(values):
         return {
@@ -1262,6 +1281,7 @@ def _apply_assignment_replacements(
             ) if keyed else replacement["old_name"],
             "new_name": person_key(
                 replacement["new_name"], task, replacement.get("telegram_id"),
+                username=replacement.get("username") or "",
             ) if keyed else replacement["new_name"],
         }
         belongs_elsewhere = (
@@ -1279,6 +1299,7 @@ def _apply_assignment_replacements(
 def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                                 draft: bool = False, keyed: bool = False,
                                 source_sunday: str | None = None,
+                                replacement_people: dict[str, dict] | None = None,
                                 ) -> dict[date, dict[str, list[str]]]:
     if draft:
         plan = {
@@ -1349,6 +1370,7 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                     for task in event_tasks
                 } if source_sunday is not None else None
             ),
+            replacement_people=replacement_people,
         )
         for task, info in current.items():
             names = day.setdefault(task, [])
