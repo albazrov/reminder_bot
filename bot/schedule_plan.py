@@ -1214,6 +1214,7 @@ def _apply_assignment_replacements(
     assignments: dict[str, list[str]], replacements: list[dict], people: list[dict],
     *, keyed: bool = False, other_assignments: dict[str, list[str]] | None = None,
     replacement_people: dict[str, dict] | None = None,
+    replacement_day: date | None = None,
 ) -> dict[str, list[str]]:
     if not keyed:
         if other_assignments is None:
@@ -1247,16 +1248,15 @@ def _apply_assignment_replacements(
             return matches[0]
         if not matches and telegram_id and replacement_people is not None:
             key = "\x1freplacement:" + json.dumps(
-                [telegram_id, name, username], ensure_ascii=False,
+                [replacement_day.isoformat() if replacement_day else None, task, telegram_id],
+                ensure_ascii=False,
             )
-            if key not in by_key:
-                person = {
-                    "key": key, "name": name, "telegram_id": telegram_id,
-                    "username": username,
-                    "tasks": [],
-                }
-                replacement_people[key] = person
-                by_key[key] = person
+            person = {
+                "key": key, "name": name, "telegram_id": telegram_id,
+                "username": username, "tasks": [],
+            }
+            replacement_people[key] = person
+            by_key[key] = person
             return key
         return name
 
@@ -1371,6 +1371,7 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                 } if source_sunday is not None else None
             ),
             replacement_people=replacement_people,
+            replacement_day=event.event_date,
         )
         for task, info in current.items():
             names = day.setdefault(task, [])

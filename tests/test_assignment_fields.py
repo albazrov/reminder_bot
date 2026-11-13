@@ -246,6 +246,19 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertIn('спевка — 31.12 — <a href="tg://user?id=699">External (@external)</a>', text)
         self.assertIn('звук — <a href="tg://user?id=699">External (@external)</a>', text)
 
+    def test_external_replacement_for_two_people_is_shown_once_with_latest_username(self):
+        self.plan("sound", {"звук": ["A", "B"]})
+        for original, username in (("A", "old_user"), ("B", "new_user")):
+            self.registry.set_replacement(
+                "sound", SUNDAY.isoformat(), "звук", original, "External",
+                telegram_id=699, username=username, source="poll", created_by=1001,
+            )
+        value = self.resolve().week
+        text = render_screen_chunks(value)[0]
+        self.assertEqual(text.count('tg://user?id=699'), 1)
+        self.assertIn('External (@new_user)', text)
+        self.assertNotIn('@old_user', text)
+
     def test_week_unlinked_username_and_html_are_rendered_safely(self):
         self.plan("sound", {"звук": ["Guest <name>"]})
         original_people = self.registry.readiness_people
