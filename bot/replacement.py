@@ -16,6 +16,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from .admin_report import refresh_admin_reports, report_recipients
 from .group_send import send_to_service_group
 from .presentation import apply_replacements, is_replaced  # noqa: F401
+from .service_registry import StaleReplacementRequest
 
 POLL_COLLECT = timedelta(hours=12)
 # Ответы собираются не позже чем за 12 часов до начала дня события.
@@ -125,6 +126,7 @@ async def _start_replacement_search_locked(
     if service is None:
         return None
     event_iso = event_date.isoformat()
+    started_at = datetime.now(timezone.utc).isoformat()
     if registry.find_active_replacement_request(
         service_id, event_iso, task, old_name
     ) or is_replaced(
@@ -143,6 +145,7 @@ async def _start_replacement_search_locked(
             request_id, service_id, event_iso, task, old_name,
             old_telegram_id, 0, 0, None,
             deadline.astimezone(timezone.utc).isoformat(), status="closed",
+            started_at=started_at,
         )
         await _notify(
             bot, admins,
@@ -183,6 +186,7 @@ async def _start_replacement_search_locked(
             chat_id, poll_message.message_id,
             getattr(notice, "message_id", None),
             deadline.astimezone(timezone.utc).isoformat(),
+            started_at=started_at,
         )
     except Exception:  # noqa: BLE001
         # Опрос без записи нельзя подсчитать — останавливаем его.
@@ -302,17 +306,33 @@ async def finish_replacement(
                 "Опрос замены %s не остановлен", poll["poll_id"],
                 exc_info=True,
             )
-    if substitute is None:
-        answer = choose_volunteer(registry, poll)
-        substitute = (
-            substitute_from_answer(registry, poll, answer) if answer else None
-        )
     service = registry.get_service(poll["service_id"])
     if service is None:
         return True
     event_date = date.fromisoformat(poll["event_date"])
     date_text = f"{event_date:%d.%m.%Y}"
     admins = report_recipients(registry, service["id"], admin_actor_id)
+
+    async def notify_stale() -> None:
+        await _notify(
+            bot, list(dict.fromkeys([*admins, *([actor_id] if actor_id else [])])),
+            f"⚠️ Запрос замены «{poll['task']}» · {service['name']} · "
+            f"{date_text} устарел после утверждения графика. Проверьте "
+            "назначение и при необходимости начните поиск замены заново.",
+            logger,
+        )
+
+    try:
+        registry.validate_replacement_request(poll)
+    except StaleReplacementRequest:
+        if registry.claim_replacement_request(poll["poll_id"]):
+            await notify_stale()
+        return False
+    if substitute is None:
+        answer = choose_volunteer(registry, poll)
+        substitute = (
+            substitute_from_answer(registry, poll, answer) if answer else None
+        )
     if substitute is None:
         await _notify(
             bot, admins,
@@ -330,8 +350,11 @@ async def finish_replacement(
             bot, registry, service, event_date, poll["task"], poll["old_name"],
             substitute, source=source, actor_id=actor_id,
             admin_actor_id=admin_actor_id, logger=logger,
-            report_limit=report_limit,
+            report_limit=report_limit, request_id=poll["poll_id"],
         )
+    except StaleReplacementRequest:
+        await notify_stale()
+        return False
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось назначить замену по опросу %s", poll["poll_id"])
         try:
@@ -364,6 +387,7 @@ async def assign_replacement(
     logger: logging.Logger,
     report_limit: int,
     expect_current: bool = False,
+    request_id: str | None = None,
 ) -> bool:
     """Сохраняет замену и сообщает о ней чату, админам и заменяющему.
 
@@ -374,7 +398,7 @@ async def assign_replacement(
     if not registry.set_replacement(
         service["id"], event_iso, task, old_name, substitute["name"],
         substitute.get("telegram_id"), substitute.get("username") or "",
-        source, actor_id, expect_current=expect_current,
+        source, actor_id, expect_current=expect_current, request_id=request_id,
     ):
         return False
     try:

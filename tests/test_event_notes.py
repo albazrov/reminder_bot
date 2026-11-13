@@ -40,16 +40,17 @@ class EventNotesTest(unittest.TestCase):
             1001, sunday, "После собрания общение <в зале>.", targets,
         )
 
-    def plan(self, sunday="2026-11-01", offset=0, task="звук"):
-        slots = {sunday: {task: ["A"]}}
+    def plan(self, sunday="2026-11-01", offset=0, task="звук",
+             service_id="sound", person="A"):
+        slots = {sunday: {task: [person]}}
         tasks = [{"name": task, "needed": 1, "max": 1, "day": offset}]
         self.registry.save_schedule_draft(
-            "sound", sunday[:7], run_id=None, dates=[sunday],
+            service_id, sunday[:7], run_id=None, dates=[sunday],
             tasks=tasks, slots=slots, last_served={},
         )
         return self.registry.approve_schedule_plan(
-            1001, "sound", sunday[:7], slots, chat_id=None, message_id=None,
-            approved_slot_days={sunday: {task: {"A": offset}}},
+            1001, service_id, sunday[:7], slots, chat_id=None, message_id=None,
+            approved_slot_days={sunday: {task: {person: offset}}},
         )
 
     def test_draft_published_snapshot_targets_and_unpublish(self):
@@ -185,23 +186,41 @@ class EventNotesTest(unittest.TestCase):
         self.assertFalse(broken["has_data"])
         self.assertIn("Не удалось прочитать заметки", broken["error"])
 
-    def test_published_note_replaces_excel_and_preserves_audience(self):
+    def test_published_note_adds_to_excel_and_preserves_audience(self):
         self.plan()
         self.excel_notes()
         self.note(targets=["sound"])
-        self.assertIn("членское", resolve_event_note(
+        unpublished = resolve_event_note(
             self.registry, "sound", date(2026, 11, 1), public_url="unused",
-        ))
+        )
+        self.assertIn("членское", unpublished)
+        self.assertNotIn("После собрания", unpublished)
         self.registry.publish_event_note(1001, "2026-11-01")
-        self.assertNotIn("членское", resolve_event_note(
+        sound_note = resolve_event_note(
             self.registry, "sound", date(2026, 11, 1), public_url="unused",
-        ))
+        )
+        self.assertIn("членское", sound_note)
+        self.assertIn("После собрания", sound_note)
         self.registry.set_service_enabled(1001, "kitchen", True)
+        self.registry.set_responsible_contact(1001, "kitchen", "в смене", "K", 502)
+        self.plan(task="в смене", service_id="kitchen", person="K")
+        kitchen_note = resolve_event_note(
+            self.registry, "kitchen", date(2026, 11, 1), public_url="unused",
+        )
+        self.assertIn("членское", kitchen_note)
+        self.assertNotIn("После собрания", kitchen_note)
         self.registry.save_event_note_draft(1001, "2026-11-01", "Только для Кухни", ["kitchen"])
         self.registry.publish_event_note(1001, "2026-11-01")
-        self.assertEqual(resolve_event_note(
+        sound_note = resolve_event_note(
             self.registry, "sound", date(2026, 11, 1), public_url="unused",
-        ), "")
+        )
+        self.assertIn("членское", sound_note)
+        self.assertNotIn("Только для Кухни", sound_note)
+        kitchen_note = resolve_event_note(
+            self.registry, "kitchen", date(2026, 11, 1), public_url="unused",
+        )
+        self.assertIn("членское", kitchen_note)
+        self.assertIn("Только для Кухни", kitchen_note)
         self.registry.unpublish_event_note(1001, "2026-11-01")
         self.assertIn("членское", resolve_event_note(
             self.registry, "sound", date(2026, 11, 1), public_url="unused",
@@ -240,6 +259,7 @@ class EventNotesTest(unittest.TestCase):
 
     def test_preview_delivery_resolver_parity_and_explicit_db_error(self):
         self.plan()
+        self.excel_notes()
         self.note()
         self.registry.publish_event_note(1001, "2026-11-01")
         preview = self.preview()
@@ -247,9 +267,12 @@ class EventNotesTest(unittest.TestCase):
         actual = app._render_group_reminder(
             "{informational_notes}\n{event_notes}", {}, self.registry.get_service("sound"),
             {"звук": ["A"]}, {}, "01.11.2026",
-            event_notes=resolve_event_note(self.registry, "sound", date(2026, 11, 1)),
+            event_notes=resolve_event_note(
+                self.registry, "sound", date(2026, 11, 1), public_url="unused",
+            ),
         )
         self.assertEqual(preview["text"], actual)
+        self.assertIn("2я часть членское", preview["text"])
         self.assertIn("<в зале>", plain_text(actual))
         with patch.object(self.registry, "resolve_event_note", side_effect=sqlite3.OperationalError("test")):
             broken = self.preview()

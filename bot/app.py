@@ -96,7 +96,7 @@ if __package__:
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from .service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
+    from .service_registry import DEFAULT_GROUP_TEMPLATE, ReplacementResolutionError, ServiceRegistry
     from .state import StateCache
     from .yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public, source_version
     from .backup import (
@@ -170,7 +170,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         refresh_user_reminder_jobs as refresh_user_reminder_schedule_jobs,
         scheduled_reminder_date,
     )
-    from bot.service_registry import DEFAULT_GROUP_TEMPLATE, ServiceRegistry
+    from bot.service_registry import DEFAULT_GROUP_TEMPLATE, ReplacementResolutionError, ServiceRegistry
     from bot.state import StateCache
     from bot.yandex_disk import RETRY_ATTEMPTS, RETRY_INTERVAL, download_public, source_version
     from bot.backup import (
@@ -665,9 +665,12 @@ def _saved_note_events(registry, public_url: str, first: date, last: date) -> li
 def _approved_service_events(
     registry, public_url: str, first: date, last: date, *,
     with_replacements: bool = True,
+    service_ids: set[str] | None = None,
 ) -> list:
     notes = _saved_note_events(registry, public_url, first, last)
     events = _apply_bot_plans(notes, registry, first, last, approved_only=True)
+    if service_ids is not None:
+        events = [event for event in events if event.service_id in service_ids]
     for service_id in sorted({event.service_id for event in events}):
         registry.ensure_member_contacts(service_id, _service_event_assignments([
             event for event in events if event.service_id == service_id
@@ -1116,7 +1119,7 @@ def _apply_bot_plans(
 
 async def _load_month_summary_events(
     loader, registry, cache: dict, now: datetime, *,
-    fresh: bool = False, **kwargs,
+    fresh: bool = False, service_ids: set[str] | None = None, **kwargs,
 ) -> list:
     public_url = kwargs.pop("public_url", None)
     if public_url is not None:
@@ -1124,6 +1127,7 @@ async def _load_month_summary_events(
         return _approved_service_events(
             registry, public_url, min(kwargs.get("since") or today, today),
             kwargs.get("until") or today + timedelta(weeks=UPCOMING_WEEKS_DEFAULT),
+            service_ids=service_ids,
         )
     forced_at = cache.get("forced_at")
     fresh = fresh and (
@@ -1152,6 +1156,8 @@ async def _load_month_summary_events(
     current = _apply_bot_plans(
         events, registry, start, limit, approved_only=True
     )
+    if service_ids is not None:
+        current = [event for event in current if event.service_id in service_ids]
     return _apply_event_replacements(current, registry)
 
 
@@ -1160,36 +1166,50 @@ def _apply_event_replacements(events: list, registry) -> list:
     уходит из задачи, заменяющий появляется."""
     if registry is None:
         return events
-    result = []
-    for event in events:
-        replacements = registry.list_replacements(
-            event.service_id, event.event_date.isoformat()
-        )
+    result = list(events)
+    groups = {}
+    for index, event in enumerate(events):
+        groups.setdefault((event.service_id, event.event_date), []).append(index)
+    for (service_id, event_date), indices in groups.items():
+        replacements = registry.list_replacements(service_id, event_date.isoformat())
         if not replacements:
-            result.append(event)
             continue
-        assignments = list(event.assignments)
+        assignments = {index: list(result[index].assignments) for index in indices}
         for item in replacements:
-            task_rows = [
-                row for row in assignments
+            matches = [
+                (index, position) for index in indices
+                for position, row in enumerate(assignments[index])
+                if row.task == item["task"] and not row.is_informational
+                and row.name == item["old_name"]
+            ]
+            if len(matches) > 1:
+                raise ReplacementResolutionError(
+                    "Не удалось определить назначение для замены: "
+                    "на одну дату приходятся несколько одинаковых назначений."
+                )
+            if matches:
+                index, position = matches[0]
+                assignments[index][position] = dataclass_replace(
+                    assignments[index][position], name=item["new_name"],
+                )
+                continue
+            candidates = [
+                (index, row) for index in indices for row in assignments[index]
                 if row.task == item["task"] and not row.is_informational
             ]
-            if not task_rows:
+            if not candidates or any(row.name == item["new_name"] for _, row in candidates):
                 continue
-            names = [row.name for row in task_rows]
-            if item["old_name"] in names:
-                assignments = [
-                    dataclass_replace(row, name=item["new_name"])
-                    if row in task_rows and row.name == item["old_name"]
-                    else row
-                    for row in assignments
-                ]
-            elif item["new_name"] not in names:
-                assignments.append(
-                    dataclass_replace(task_rows[0], name=item["new_name"])
+            candidate_indices = {index for index, _ in candidates}
+            if len(candidate_indices) != 1:
+                raise ReplacementResolutionError(
+                    "Не удалось определить неделю замены. Проверьте назначения "
+                    "в пересекающихся графиках."
                 )
-        unique = list(dict.fromkeys(assignments))
-        result.append(dataclass_replace(event, assignments=tuple(unique)))
+            index, row = candidates[0]
+            assignments[index].append(dataclass_replace(row, name=item["new_name"]))
+        for index in indices:
+            unique = tuple(dict.fromkeys(assignments[index]))
+            result[index] = dataclass_replace(result[index], assignments=unique)
     return result
 
 
@@ -1240,6 +1260,10 @@ async def get_group_reminder_preview(
             backup_manager=backup_manager,
             require_approved_plan=True,
         )
+    except ReplacementResolutionError as exc:
+        debug_logger.warning("Не удалось определить неделю замены для предпросмотра")
+        result["error"] = str(exc)
+        return result
     except Exception:
         debug_logger.exception(
             "Не удалось загрузить график для предпросмотра напоминания %s",
@@ -1276,11 +1300,16 @@ async def get_group_reminder_preview(
         (contact["task"], contact["name"]): contact for contact in contacts
     }
     result["event_date"] = event_date.isoformat()
-    result["schedule_state"] = [
-        event for event in _approved_service_events(
-            registry, credentials.yandex_public_url, event_date, event_date
-        ) if event.service_id == service["id"]
-    ]
+    try:
+        result["schedule_state"] = [
+            event for event in _approved_service_events(
+                registry, credentials.yandex_public_url, event_date, event_date
+            ) if event.service_id == service["id"]
+        ]
+    except ReplacementResolutionError as exc:
+        debug_logger.warning("Не удалось определить неделю замены для предпросмотра")
+        result["error"] = str(exc)
+        return result
     template = (
         body if body is not None
         else registry.resolve_group_text(reminder, service)
@@ -1303,7 +1332,7 @@ async def get_group_reminder_preview(
                 public_url=credentials.yandex_public_url if "{event_notes" in template else None,
             ),
         )
-    except AssignmentFieldResolutionError as exc:
+    except (AssignmentFieldResolutionError, ReplacementResolutionError) as exc:
         debug_logger.exception("Не удалось разрешить поля назначений")
         result["error"] = str(exc)
         return result
@@ -1361,6 +1390,10 @@ async def get_template_preview(
             raw_out=raw,
             backup_manager=backup_manager,
         )
+    except ReplacementResolutionError as exc:
+        debug_logger.warning("Не удалось определить неделю замены для предпросмотра")
+        result["error"] = str(exc)
+        return result
     except Exception:
         debug_logger.exception(
             "Не удалось загрузить график для предпросмотра шаблона %s",
@@ -1405,7 +1438,7 @@ async def get_template_preview(
                     ),
                 ),
             )
-    except AssignmentFieldResolutionError as exc:
+    except (AssignmentFieldResolutionError, ReplacementResolutionError) as exc:
         debug_logger.exception("Не удалось разрешить поля назначений шаблона")
         result["error"] = str(exc)
         return result

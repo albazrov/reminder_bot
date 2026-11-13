@@ -101,19 +101,20 @@ def resolve_event_note(registry, service_id: str, event_day: date,
     )
     if source_sunday is None:
         return ""
+    notes = []
     published = registry.resolve_event_note(service_id, source_sunday)
-    note = registry.get_event_note(source_sunday)
-    # A published note replaces Excel for the event, including its recipient restrictions.
-    if note is not None and note["published"]:
-        return published
-    if public_url is None:
-        return ""
-    source_key = hashlib.sha256(public_url.encode()).hexdigest()
-    assignments: dict[str, dict] = {}
-    for service, day, name, value in registry.get_schedule_notes(source_key):
-        if service != "assembly" or day != source_sunday:
-            continue
-        info = assignments.setdefault(name, {"names": [], "is_informational": True})
-        if value and value not in info["names"]:
-            info["names"].append(value)
-    return format_informational_notes(assignments)
+    if public_url is not None:
+        source_key = hashlib.sha256(public_url.encode()).hexdigest()
+        assignments: dict[str, dict] = {}
+        for service, day, name, value in registry.get_schedule_notes(source_key):
+            if service != "assembly" or day != source_sunday:
+                continue
+            info = assignments.setdefault(name, {"names": [], "is_informational": True})
+            if value and value not in info["names"]:
+                info["names"].append(value)
+        excel_notes = format_informational_notes(assignments)
+        if excel_notes:
+            notes.append(excel_notes)
+    if published:
+        notes.append(published)
+    return "\n\n".join(notes)
