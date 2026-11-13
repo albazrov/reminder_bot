@@ -6,7 +6,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +14,8 @@ from zoneinfo import ZoneInfo
 
 from bot import app, handlers, schedule_plan
 from bot.event_notes import (
-    EventNoteResolutionError, resolve_event_note, source_sunday_for_event,
+    EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes,
+    source_sunday_for_event,
 )
 from bot.service_registry import ServiceRegistry
 from bot.ui import plain_text, render_screen_chunks, visible_units
@@ -142,6 +143,154 @@ class EventNotesTest(unittest.TestCase):
         self.assertTrue(self.registry.is_group_reminder_delivered(
             reminder["id"], "2026-11-01", "group:-10002",
         ))
+
+    def test_scheduled_note_is_independent_and_sent_once_per_target(self):
+        self.registry.set_group_chat(1001, "kitchen", -10003, enabled=True)
+        self.note(targets=["sound", "kitchen"])
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+        self.plan()
+        self.assertEqual(self.registry.resolve_event_note(
+            "sound", "2026-11-01", include_scheduled=False), "")
+        self.assertEqual(self.registry.resolve_event_note("sound", "2026-11-01"),
+                         "После собрания общение <в зале>.")
+        self.assertEqual(resolve_event_note(
+            self.registry, "sound", date(2026, 11, 1),
+            template="{event_notes}", include_scheduled=False,
+        ), "")
+        bot = SimpleNamespace(send_message=AsyncMock())
+        notify = AsyncMock()
+        async def tick(now):
+            await send_scheduled_event_notes(bot, self.registry, now, LOG, notify)
+        asyncio.run(tick(datetime(2026, 10, 30, 18, 59, tzinfo=ZoneInfo("Europe/Moscow"))))
+        self.assertEqual(bot.send_message.await_count, 0)
+        now = datetime(2026, 10, 30, 19, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        asyncio.run(tick(now))
+        self.assertEqual(bot.send_message.await_count, 2)
+        self.assertEqual({call.args[0] for call in bot.send_message.await_args_list},
+                         {-10002, -10003})
+        asyncio.run(tick(now + timedelta(minutes=1)))
+        self.assertEqual(bot.send_message.await_count, 2)
+        notify.assert_not_awaited()
+
+    def test_scheduled_note_retry_and_unpublish(self):
+        self.note(targets=["sound"])
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("failed")))
+        notify = AsyncMock()
+        now = datetime(2026, 10, 30, 19, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
+        self.assertFalse(self.registry.event_note_was_delivered("2026-11-01", "sound"))
+        notify.assert_awaited_once()
+        bot.send_message.side_effect = None
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
+        self.assertTrue(self.registry.event_note_was_delivered("2026-11-01", "sound"))
+        self.registry.unpublish_event_note(1001, "2026-11-01")
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
+        self.assertEqual(bot.send_message.await_count, 2)
+
+    def test_schedule_snapshot_legacy_and_validation(self):
+        draft = self.note(targets=["sound"])
+        self.registry.publish_event_note(1001, "2026-11-01")
+        self.assertEqual(self.registry.resolve_event_note("sound", "2026-11-01"),
+                         draft["draft_body"])
+        for value in ("bad", "2026-11-02T00:00", "2026-10-30T19:00+03:00"):
+            with self.assertRaises(ValueError):
+                self.registry.set_event_note_send_at(1001, "2026-11-01", value)
+        with self.assertRaises(PermissionError):
+            self.registry.set_event_note_send_at(501, "2026-11-01", "2026-10-30T19:00")
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.assertIsNone(self.registry.get_event_note("2026-11-01")["published_send_at"])
+        self.registry.publish_event_note(1001, "2026-11-01")
+        self.assertEqual(self.registry.get_event_note("2026-11-01")["published_send_at"],
+                         "2026-10-30T19:00")
+
+    def test_missing_chat_does_not_block_other_targets_and_expires(self):
+        self.registry.set_service_enabled(1001, "kitchen", True)
+        self.note(targets=["sound", "kitchen"])
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+        bot = SimpleNamespace(send_message=AsyncMock())
+        notify = AsyncMock()
+        now = datetime(2026, 10, 30, 19, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
+        self.assertEqual(bot.send_message.await_count, 1)
+        self.assertEqual(bot.send_message.await_args.args[0], -10002)
+        self.assertEqual(notify.await_args.args[1], "kitchen")
+        self.assertFalse(self.registry.event_note_was_delivered("2026-11-01", "kitchen"))
+        self.registry.set_group_chat(1001, "kitchen", -10003, enabled=True)
+        asyncio.run(send_scheduled_event_notes(
+            bot, self.registry, datetime(2026, 11, 2, 1, tzinfo=now.tzinfo), LOG, notify,
+        ))
+        self.assertEqual(bot.send_message.await_count, 1)
+        self.assertIn("срок", notify.await_args.args[2])
+        self.assertTrue(self.registry.event_note_expiry_alerted("2026-11-01", "kitchen"))
+        count = notify.await_count
+        asyncio.run(send_scheduled_event_notes(
+            bot, self.registry, datetime(2026, 11, 3, 1, tzinfo=now.tzinfo), LOG, notify,
+        ))
+        self.assertEqual(notify.await_count, count)
+
+    def test_long_outage_warns_once_for_all_service_note(self):
+        self.note()
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+        bot = SimpleNamespace(send_message=AsyncMock())
+        notify = AsyncMock(return_value=True)
+        now = datetime(2026, 11, 5, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
+        notify.assert_awaited_once()
+        self.assertIn("срок отправки прошёл", notify.await_args.args[2])
+        bot.send_message.assert_not_awaited()
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
+        notify.assert_awaited_once()
+
+    def test_all_services_expiry_alert_is_not_repeated_after_per_service_alerts(self):
+        self.note()
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+        bot = SimpleNamespace(send_message=AsyncMock())
+        notify = AsyncMock(return_value=True)
+        tz = ZoneInfo("Europe/Moscow")
+        asyncio.run(send_scheduled_event_notes(
+            bot, self.registry, datetime(2026, 11, 2, 1, tzinfo=tz), LOG, notify,
+        ))
+        initial = notify.await_count
+        self.assertGreater(initial, 0)
+        asyncio.run(send_scheduled_event_notes(
+            bot, self.registry, datetime(2026, 11, 3, 1, tzinfo=tz), LOG, notify,
+        ))
+        self.assertEqual(notify.await_count, initial)
+        self.assertTrue(self.registry.event_note_expiry_alerted("2026-11-01", "*"))
+
+    def test_chat_change_during_previous_delivery_uses_new_chat(self):
+        self.registry.set_group_chat(1001, "kitchen", -10003, enabled=True)
+        self.note(targets=["sound", "kitchen"])
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+
+        async def send(chat_id, text, **kwargs):
+            if chat_id == -10003:
+                self.registry.set_group_chat(1001, "sound", -10004, enabled=True)
+
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=send))
+        notify = AsyncMock()
+        now = datetime(2026, 10, 30, 19, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, notify))
+        self.assertEqual([call.args[0] for call in bot.send_message.await_args_list],
+                         [-10003, -10004])
+
+    def test_long_emoji_note_fits_single_telegram_message(self):
+        self.registry.save_event_note_draft(1001, "2026-11-01", "🙂" * 2000, ["sound"])
+        self.registry.set_event_note_send_at(1001, "2026-11-01", "2026-10-30T19:00")
+        self.registry.publish_event_note(1001, "2026-11-01")
+        bot = SimpleNamespace(send_message=AsyncMock())
+        now = datetime(2026, 10, 30, 19, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        asyncio.run(send_scheduled_event_notes(bot, self.registry, now, LOG, AsyncMock()))
+        self.assertEqual(bot.send_message.await_count, 1)
+        text = bot.send_message.await_args.args[1]
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
 
     def excel_notes(self):
         source = hashlib.sha256(b"unused").hexdigest()
@@ -467,6 +616,45 @@ class EventNoteHandlerTest(unittest.TestCase):
         self.assertFalse(self.registry.list_event_notes()[0]["published"])
         forbidden = self.click("evn:home", actor=501)
         self.assertIn("администраторам", forbidden.answer.await_args.args[0])
+
+    def test_ui_configures_schedule_and_publishes_snapshot(self):
+        now = datetime.now(ZoneInfo("UTC"))
+        sunday = now.date() + timedelta(days=(6 - now.weekday()) % 7 + 7)
+        self.click("evn:home")
+        day_button = self.button("evn:day:")
+        self.click(day_button.rsplit(":", 1)[0] + ":" + sunday.isoformat())
+        self.click(self.button("evn:text:"))
+        self.message.text = "Информация к собранию"
+        asyncio.run(self.input(self.message))
+        self.click(self.button("evn:schedule:"))
+        send_at = (now + timedelta(days=1)).replace(second=0, microsecond=0, tzinfo=None)
+        self.message.text = send_at.strftime("%d.%m.%Y %H:%M")
+        asyncio.run(self.input(self.message))
+        note = self.registry.get_event_note(sunday)
+        self.assertEqual(note["draft_send_at"], send_at.isoformat(timespec="minutes"))
+        self.assertIsNone(note["published_send_at"])
+        self.click(self.button("evn:publish:"))
+        self.click(self.button("evn:publishok:"))
+        self.assertEqual(self.registry.get_event_note(sunday)["published_send_at"],
+                         send_at.isoformat(timespec="minutes"))
+
+    def test_ui_allows_updating_published_note_after_scheduled_time(self):
+        now = datetime.now(ZoneInfo("UTC"))
+        sunday = now.date() + timedelta(days=(6 - now.weekday()) % 7)
+        self.registry.save_event_note_draft(1001, sunday, "Первый текст", ["sound"])
+        send_at = (now - timedelta(minutes=5)).replace(tzinfo=None, second=0, microsecond=0)
+        self.registry.set_event_note_send_at(1001, sunday, send_at.isoformat(timespec="minutes"))
+        self.registry.publish_event_note(1001, sunday)
+        self.click("evn:home")
+        day_button = self.button("evn:day:")
+        self.click(day_button.rsplit(":", 1)[0] + ":" + sunday.isoformat())
+        self.click(self.button("evn:text:"))
+        self.message.text = "Исправленный текст"
+        asyncio.run(self.input(self.message))
+        self.click(self.button("evn:publish:"))
+        confirm = self.click(self.button("evn:publishok:"))
+        self.assertFalse(confirm.answer.await_args.args)
+        self.assertEqual(self.registry.get_event_note(sunday)["published_body"], "Исправленный текст")
 
     def test_concurrent_edit_cannot_publish_newer_unseen_text(self):
         self.click("evn:home")

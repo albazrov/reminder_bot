@@ -604,6 +604,19 @@ class ServiceRegistry:
                     published_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS event_note_deliveries (
+                    event_sunday TEXT NOT NULL,
+                    service_id TEXT NOT NULL,
+                    delivered_at TEXT NOT NULL,
+                    PRIMARY KEY (event_sunday, service_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS event_note_expiry_alerts (
+                    event_sunday TEXT NOT NULL,
+                    service_id TEXT NOT NULL,
+                    PRIMARY KEY (event_sunday, service_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS service_task_dependencies (
                     service_id TEXT NOT NULL,
                     task TEXT NOT NULL,
@@ -1030,6 +1043,8 @@ class ServiceRegistry:
                 ("readiness_runs", "reverse_poll",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("event_notes", "revision", "INTEGER NOT NULL DEFAULT 1"),
+                ("event_notes", "draft_send_at", "TEXT"),
+                ("event_notes", "published_send_at", "TEXT"),
                 ("service_replacements", "source_sunday", "TEXT"),
             ):
                 columns = {
@@ -7627,7 +7642,8 @@ class ServiceRegistry:
             connection.execute(
                 "UPDATE event_notes SET published_body=draft_body, "
                 "published_targets_json=draft_targets_json, published_by=?, "
-                "published_at=?, revision=revision+1 WHERE event_sunday=?",
+                "published_send_at=draft_send_at, published_at=?, "
+                "revision=revision+1 WHERE event_sunday=?",
                 (actor_id, now, sunday),
             )
             self._audit(
@@ -7649,7 +7665,8 @@ class ServiceRegistry:
             cursor = connection.execute(
                 "UPDATE event_notes SET published_body=NULL, "
                 "published_targets_json=NULL, published_by=NULL, "
-                "published_at=NULL, revision=revision+1 WHERE event_sunday=? "
+                "published_send_at=NULL, published_at=NULL, "
+                "revision=revision+1 WHERE event_sunday=? "
                 "AND published_body IS NOT NULL",
                 (sunday,),
             )
@@ -7660,16 +7677,80 @@ class ServiceRegistry:
                 )
         return cursor.rowcount > 0
 
-    def resolve_event_note(self, service_id: str, event_sunday: str | date) -> str:
+    def set_event_note_send_at(
+        self, actor_id: int, event_sunday: str | date, send_at: str | None,
+        *, expected_revision: int | None = None,
+    ) -> dict:
+        _validate_positive_id(actor_id, "actor_id")
+        sunday = self._event_note_sunday(event_sunday)
+        if send_at is not None:
+            try:
+                parsed = datetime.fromisoformat(send_at)
+            except (TypeError, ValueError):
+                raise ValueError("Укажите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ.") from None
+            if (parsed.tzinfo is not None or parsed.second or parsed.microsecond
+                    or parsed.isoformat(timespec="minutes") != send_at
+                    or parsed.date() > date.fromisoformat(sunday)):
+                raise ValueError("Время отправки должно быть не позднее дня собрания.")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_service_editor(connection, actor_id, "assembly")
+            self._check_event_note_revision(connection, sunday, expected_revision)
+            cursor = connection.execute(
+                "UPDATE event_notes SET draft_send_at=?, updated_by=?, updated_at=?, "
+                "revision=revision+1 WHERE event_sunday=?",
+                (send_at, actor_id, _utc_now(), sunday),
+            )
+            if not cursor.rowcount:
+                raise ValueError("Сначала сохраните текст заметки.")
+            self._audit(connection, actor_id, "event_note_schedule", "assembly",
+                        {"event_sunday": sunday})
+        return self.get_event_note(sunday)
+
+    def event_note_was_delivered(self, event_sunday: str, service_id: str) -> bool:
+        with self._connection(notify=False) as connection:
+            return connection.execute(
+                "SELECT 1 FROM event_note_deliveries "
+                "WHERE event_sunday=? AND service_id=?",
+                (event_sunday, service_id),
+            ).fetchone() is not None
+
+    def mark_event_note_delivered(self, event_sunday: str, service_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO event_note_deliveries "
+                "(event_sunday, service_id, delivered_at) VALUES (?, ?, ?)",
+                (event_sunday, service_id, _utc_now()),
+            )
+
+    def event_note_expiry_alerted(self, event_sunday: str, service_id: str) -> bool:
+        with self._connection(notify=False) as connection:
+            return connection.execute(
+                "SELECT 1 FROM event_note_expiry_alerts "
+                "WHERE event_sunday=? AND service_id=?",
+                (event_sunday, service_id),
+            ).fetchone() is not None
+
+    def mark_event_note_expiry_alerted(self, event_sunday: str, service_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO event_note_expiry_alerts "
+                "(event_sunday, service_id) VALUES (?, ?)",
+                (event_sunday, service_id),
+            )
+
+    def resolve_event_note(self, service_id: str, event_sunday: str | date, *,
+                           include_scheduled: bool = True) -> str:
         """Return the published note for a service without changing registry state."""
         sunday = self._event_note_sunday(event_sunday)
         with self._connection(notify=False) as connection:
             row = connection.execute(
-                "SELECT published_body, published_targets_json "
+                "SELECT published_body, published_targets_json, published_send_at "
                 "FROM event_notes WHERE event_sunday = ?",
                 (sunday,),
             ).fetchone()
-        if row is None or row["published_body"] is None:
+        if (row is None or row["published_body"] is None
+                or (row["published_send_at"] and not include_scheduled)):
             return ""
         targets = (
             json.loads(row["published_targets_json"])
