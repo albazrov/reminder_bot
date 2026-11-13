@@ -665,9 +665,12 @@ def _saved_note_events(registry, public_url: str, first: date, last: date) -> li
 def _approved_service_events(
     registry, public_url: str, first: date, last: date, *,
     with_replacements: bool = True,
+    service_ids: set[str] | None = None,
 ) -> list:
     notes = _saved_note_events(registry, public_url, first, last)
     events = _apply_bot_plans(notes, registry, first, last, approved_only=True)
+    if service_ids is not None:
+        events = [event for event in events if event.service_id in service_ids]
     for service_id in sorted({event.service_id for event in events}):
         registry.ensure_member_contacts(service_id, _service_event_assignments([
             event for event in events if event.service_id == service_id
@@ -1116,7 +1119,7 @@ def _apply_bot_plans(
 
 async def _load_month_summary_events(
     loader, registry, cache: dict, now: datetime, *,
-    fresh: bool = False, **kwargs,
+    fresh: bool = False, service_ids: set[str] | None = None, **kwargs,
 ) -> list:
     public_url = kwargs.pop("public_url", None)
     if public_url is not None:
@@ -1124,6 +1127,7 @@ async def _load_month_summary_events(
         return _approved_service_events(
             registry, public_url, min(kwargs.get("since") or today, today),
             kwargs.get("until") or today + timedelta(weeks=UPCOMING_WEEKS_DEFAULT),
+            service_ids=service_ids,
         )
     forced_at = cache.get("forced_at")
     fresh = fresh and (
@@ -1152,6 +1156,8 @@ async def _load_month_summary_events(
     current = _apply_bot_plans(
         events, registry, start, limit, approved_only=True
     )
+    if service_ids is not None:
+        current = [event for event in current if event.service_id in service_ids]
     return _apply_event_replacements(current, registry)
 
 

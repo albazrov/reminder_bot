@@ -15,6 +15,7 @@ from datetime import date, datetime, time, timedelta
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from .presentation import personal_schedule_lines
+from .service_registry import ReplacementResolutionError
 
 MONTHS = (
     "январь", "февраль", "март", "апрель", "май", "июнь",
@@ -148,12 +149,23 @@ async def send_due_month_summaries(
     for (year, month), users in due.items():
         key = month_key(year, month)
         for item in users:
-            events = await load_events(since=since, until=until, fresh=fresh)
-            events_of_month = month_events(events, year, month)
-            published = {event.service_id for event in events_of_month}
             telegram_id = item["telegram_id"]
             linked = linked_assignments(registry, telegram_id)
-            if {service_id for service_id, _, _ in linked} - published and (
+            service_ids = {service_id for service_id, _, _ in linked}
+            try:
+                events = await load_events(
+                    since=since, until=until, fresh=fresh, service_ids=service_ids,
+                )
+            except ReplacementResolutionError:
+                logger.warning(
+                    "Сводка на месяц %s отложена: неоднозначная замена "
+                    "в связанном служении.", key, exc_info=True,
+                )
+                run.waiting = True
+                continue
+            events_of_month = month_events(events, year, month)
+            published = {event.service_id for event in events_of_month}
+            if service_ids - published and (
                 now < last_chance((year, month), item)
             ):
                 run.waiting = True
