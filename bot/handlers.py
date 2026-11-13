@@ -4666,9 +4666,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )])
         await _send_dialog(
             message, f"СОБРАНИЕ › Заметки › {month_title(month.year, month.month)}\n\n"
-            "Выберите воскресное событие. Опубликованный текст можно включить "
-            "в напоминания других служений полем {event_notes}. "
-            "Публикация сама ничего не рассылает.",
+            "Выберите воскресное событие. Для отдельной отправки в чаты "
+            "служений задайте дату и время и опубликуйте заметку.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keep_rows=True,
             _dialog_keyboard_limit=sum(len(row) for row in rows),
@@ -4687,6 +4686,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         audience = "все служения" if targets is None else ", ".join(
             names.get(item, item) for item in targets
         )
+        send_at = note.get("draft_send_at") if note else None
+        published_at = note.get("published_send_at") if note else None
+        def display_send_at(value):
+            return datetime.fromisoformat(value).strftime("%d.%m.%Y в %H:%M") if value else "не задано"
         text = (
             f"СОБРАНИЕ › Заметка › {date.fromisoformat(sunday):%d.%m.%Y}\n\n"
             f"{notice}\n\n" if notice else
@@ -4695,12 +4698,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text += (
             f"Статус: {'опубликована' if note and note['published'] else 'черновик'}.\n"
             f"Адресаты черновика: {audience}.\n\n"
+            f"Отправка черновика: {display_send_at(send_at)}.\n"
+            f"Отправка опубликованной заметки: {display_send_at(published_at)}.\n\n"
             + (note["draft_body"] if note else "Текста пока нет. Нажмите «Изменить текст».")
-            + "\n\nИзменения черновика видны в напоминаниях только после публикации."
+            + "\n\nИзменения вступают в силу после публикации. "
+              "Уже доставленная заметка повторно в тот же чат не отправляется."
         )
         buttons = [
             event_note_button("✏️ Изменить текст", "text", state),
             event_note_button("👥 Адресаты", "targets", state),
+            event_note_button("🕒 Время отправки", "schedule", state),
             event_note_button("👁 Предпросмотр", "preview", state),
             event_note_button("✅ Опубликовать", "publish", state),
         ]
@@ -4710,6 +4717,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         await _send_dialog(
             message, text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[item] for item in buttons]),
+            _dialog_keep_rows=True, _dialog_keyboard_limit=len(buttons),
             parse_mode=None,
         )
 
@@ -4772,7 +4780,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 parts = callback.data.split(":")
                 state = pending_inputs.get(actor_id) or {}
                 if (len(parts) != 4 or state.get("operation") not in
-                        {"event_note", "event_note_input"} or state.get("token") != parts[2]):
+                        {"event_note", "event_note_input", "event_note_schedule_input"}
+                        or state.get("token") != parts[2]):
                     raise ValueError("Этот экран устарел. Откройте заметки заново.")
                 _, action, _, value = parts
                 sunday = state.get("event_sunday")
@@ -4792,6 +4801,20 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         callback.message, "Отправьте текст заметки (до 2000 символов).\n"
                         "Например: «После собрания общение в большом зале».\n"
                         "Это текст без автоматических упоминаний людей.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            event_note_button("⬅️ К заметке", "edit", state),
+                        ]]), parse_mode=None,
+                    )
+                elif action == "schedule":
+                    if not registry.get_event_note(sunday):
+                        raise ValueError("Сначала сохраните текст заметки.")
+                    state.update(operation="event_note_schedule_input", token=secrets.token_hex(4))
+                    await _send_dialog(
+                        callback.message,
+                        "Введите дату и время отправки в часовом поясе бота: "
+                        "ДД.ММ.ГГГГ ЧЧ:ММ. Например: 18.11.2026 19:00.\n"
+                        "Отправка должна быть в будущем и не позже дня собрания.\n"
+                        "Для отключения отдельной отправки введите «нет».",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                             event_note_button("⬅️ К заметке", "edit", state),
                         ]]), parse_mode=None,
@@ -4837,7 +4860,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         callback.message,
                         ("Опубликовать черновик для выбранных служений?"
                          if action == "publish" else "Убрать заметку из будущих напоминаний?")
-                        + "\nУже отправленные сообщения не меняются. Рассылка не запускается.",
+                        + "\nЕсли задано время, сообщение будет отправлено в чаты "
+                          "по расписанию. Уже доставленные сообщения не изменятся "
+                          "и повторно не отправятся.",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                             [event_note_button("✅ Подтвердить", action + "ok", state)],
                             [event_note_button("⬅️ К заметке", "edit", state)],
@@ -4846,6 +4871,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 elif action in {"publishok", "unpublishok"}:
                     if state.get("step") != action[:-2]:
                         raise ValueError("Подтверждение устарело.")
+                    if action == "publishok":
+                        note = registry.get_event_note(sunday)
+                        send_at = note.get("draft_send_at") if note else None
+                        now = datetime.now(context.timezone)
+                        previous_schedule = (
+                            note and note["published"]
+                            and send_at == note["published_send_at"]
+                            and now.date() <= date.fromisoformat(sunday)
+                        )
+                        if send_at and not previous_schedule and datetime.fromisoformat(
+                            send_at
+                        ).replace(tzinfo=context.timezone) <= now:
+                            raise ValueError("Время отправки прошло. Укажите новое время.")
                     method = registry.publish_event_note if action == "publishok" else registry.unpublish_event_note
                     method(actor_id, sunday, expected_revision=state["revision"])
                     await show_event_note_detail(callback.message, actor_id, sunday, "✅ Сохранено.")
@@ -14371,7 +14409,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message.from_user
             and (
                 pending_inputs.get(message.from_user.id) or {}
-            ).get("operation") == "event_note_input"
+            ).get("operation") in {"event_note_input", "event_note_schedule_input"}
         ),
     )
     async def on_event_note_text(message: Message) -> None:
@@ -14386,7 +14424,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         registry = service_registry()
         if (
             not pending
-            or pending.get("operation") != "event_note_input"
+            or pending.get("operation") not in {"event_note_input", "event_note_schedule_input"}
             or registry is None
             or not is_service_admin(actor_id, "assembly")
         ):
@@ -14397,17 +14435,30 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         try:
-            registry.save_event_note_draft(
-                actor_id,
-                pending["event_sunday"],
-                message.text,
-                pending.get("targets"),
-                expected_revision=pending["revision"],
-            )
+            if pending["operation"] == "event_note_schedule_input":
+                if message.text.strip().lower() == "нет":
+                    send_at = None
+                else:
+                    try:
+                        moment = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M")
+                    except ValueError:
+                        raise ValueError("Введите дату и время: ДД.ММ.ГГГГ ЧЧ:ММ.") from None
+                    if moment.replace(tzinfo=context.timezone) <= datetime.now(context.timezone):
+                        raise ValueError("Время отправки должно быть в будущем.")
+                    send_at = moment.isoformat(timespec="minutes")
+                registry.set_event_note_send_at(
+                    actor_id, pending["event_sunday"], send_at,
+                    expected_revision=pending["revision"],
+                )
+            else:
+                registry.save_event_note_draft(
+                    actor_id, pending["event_sunday"], message.text,
+                    pending.get("targets"), expected_revision=pending["revision"],
+                )
         except (ValueError, PermissionError) as exc:
             await _send_dialog(
                 message,
-                f"❌ {exc}\n\nОтправьте текст заметки ещё раз "
+                f"❌ {exc}\n\nПопробуйте ещё раз "
                 "или нажмите «Отмена».",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(
@@ -14431,7 +14482,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             actor_id,
             pending["event_sunday"],
-            "Черновик сохранён. Он пока не виден в напоминаниях.",
+            "Черновик сохранён. Изменения вступят в силу после публикации.",
         )
 
     @admin_router.message(F.text & ~F.text.startswith("/"))
