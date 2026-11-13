@@ -1257,7 +1257,7 @@ def _apply_assignment_replacements(
                 }
                 replacement_people[key] = person
                 by_key[key] = person
-                return key
+            return key
         return name
 
     def keyed_assignments(values):
