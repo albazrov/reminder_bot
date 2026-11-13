@@ -666,6 +666,25 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertFalse(result["has_data"])
         self.assertEqual(result["error"], message)
 
+    def test_preview_and_manual_state_ignore_unrelated_service_conflicts(self):
+        self.plan("kitchen", {"старший": ["Other"]})
+        original = self.registry.list_replacements
+
+        def replacements(service, day, **kwargs):
+            if service == "kitchen":
+                raise ReplacementResolutionError("Неоднозначная замена")
+            return original(service, day, **kwargs)
+
+        with patch.object(self.registry, "list_replacements", side_effect=replacements):
+            result = self.preview("{task_assignments}", manual=True)
+            self.assertTrue(result["has_data"], result)
+            state = app._group_preview_state(
+                self.registry, self.credentials.yandex_public_url, "sound", SUNDAY,
+            )
+        self.assertEqual(state, result["schedule_state"])
+        self.assertTrue(state)
+        self.assertTrue(all(event.service_id == "sound" for event in state))
+
     def test_template_preview_uses_same_fields_and_exposes_warnings(self):
         template = "{week_task_assignments}\n" + assignment_field("kitchen")
         with patch("bot.app._next_sunday_in_tz", return_value=SUNDAY), patch(

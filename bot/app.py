@@ -1213,6 +1213,13 @@ def _apply_event_replacements(events: list, registry) -> list:
     return result
 
 
+def _group_preview_state(registry, public_url: str, service_id: str,
+                         event_date: date) -> list:
+    return _approved_service_events(
+        registry, public_url, event_date, event_date, service_ids={service_id},
+    )
+
+
 async def get_group_reminder_preview(
     reminder_id: int,
     credentials,
@@ -1301,11 +1308,9 @@ async def get_group_reminder_preview(
     }
     result["event_date"] = event_date.isoformat()
     try:
-        result["schedule_state"] = [
-            event for event in _approved_service_events(
-                registry, credentials.yandex_public_url, event_date, event_date
-            ) if event.service_id == service["id"]
-        ]
+        result["schedule_state"] = _group_preview_state(
+            registry, credentials.yandex_public_url, service["id"], event_date,
+        )
     except ReplacementResolutionError as exc:
         debug_logger.warning("Не удалось определить неделю замены для предпросмотра")
         result["error"] = str(exc)
@@ -2663,12 +2668,10 @@ async def _run_locked(args: CliArgs) -> None:
 
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
-        context.group_preview_state = lambda service_id, event_day: [
-            event for event in _approved_service_events(
-                service_registry, credentials.yandex_public_url,
-                date.fromisoformat(event_day), date.fromisoformat(event_day),
-            ) if event.service_id == service_id
-        ]
+        context.group_preview_state = lambda service_id, event_day: _group_preview_state(
+            service_registry, credentials.yandex_public_url, service_id,
+            date.fromisoformat(event_day),
+        )
         context.assignment_fields_state = lambda service_id, event_day, template, task: (
             resolve_assignment_fields(
                 service_registry, service_id, date.fromisoformat(event_day),
