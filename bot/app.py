@@ -59,7 +59,7 @@ if __package__:
         resolve_assignments,
     )
     from .admin_report import report_text, send_admin_reports
-    from .event_notes import EventNoteResolutionError, resolve_event_note
+    from .event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes
     from .handlers import register, send_to_service_group
     from .logger import setup_loggers
     from .notifier import (
@@ -130,7 +130,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         resolve_assignments,
     )
     from bot.admin_report import report_text, send_admin_reports
-    from bot.event_notes import EventNoteResolutionError, resolve_event_note
+    from bot.event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes
     from bot.assignment_fields import (
         AssignmentFields, AssignmentFieldResolutionError, resolve_assignment_fields,
     )
@@ -1334,6 +1334,7 @@ async def get_group_reminder_preview(
             event_notes=resolve_event_note(
                 registry, service["id"], event_date, reminder.get("task"),
                 template=template,
+                include_scheduled=False,
                 public_url=credentials.yandex_public_url if "{event_notes" in template else None,
             ),
         )
@@ -1437,6 +1438,7 @@ async def get_template_preview(
                 event_notes=resolve_event_note(
                     registry, service_id, event_date,
                     template=template or DEFAULT_GROUP_TEMPLATE,
+                    include_scheduled=False,
                     public_url=(
                         credentials.yandex_public_url if template and "{event_notes" in template
                         else None
@@ -1768,6 +1770,7 @@ async def _process_service_reminder(
             event_notes=resolve_event_note(
                 registry, service_id, event_date, reminder.get("task"),
                 template=group_template,
+                include_scheduled=False,
                 public_url=credentials.yandex_public_url if "{event_notes" in group_template else None,
             ),
         )
@@ -2316,6 +2319,7 @@ async def _prepare_service_test_previews(
                 informational_notes=format_informational_notes(assignments, service["id"]),
                 event_notes=resolve_event_note(
                     registry, service_id, sunday_date, template=effective_group_template,
+                    include_scheduled=False,
                     public_url=(
                         credentials.yandex_public_url
                         if "{event_notes" in effective_group_template else None
@@ -3125,6 +3129,44 @@ async def _run_locked(args: CliArgs) -> None:
                 replace_existing=True,
                 misfire_grace_time=None,
                 coalesce=True,
+            )
+
+            event_note_alerts: dict[tuple[str, str, str], datetime] = {}
+
+            async def event_note_tick() -> None:
+                now = datetime.now(tz)
+
+                async def notify_note_failure(sunday: str, service_id: str, reason: str) -> bool:
+                    key = (sunday, service_id, reason)
+                    if key in event_note_alerts and now - event_note_alerts[key] < timedelta(hours=1):
+                        return False
+                    debug_logger.warning(
+                        "Общая заметка на %s не доставлена служению %s: %s",
+                        sunday, service_id, reason,
+                    )
+                    sent = await _notify_admin(
+                        bot, credentials.admin_tg_id,
+                        f"Общая заметка на {sunday} не доставлена служению "
+                        f"«{service_id}»: {reason}. Проверьте настройки и журнал.",
+                        debug_logger,
+                    )
+                    if sent:
+                        event_note_alerts[key] = now
+                    return sent
+
+                try:
+                    await send_scheduled_event_notes(
+                        bot, service_registry, now, debug_logger, notify_note_failure,
+                    )
+                except (sqlite3.Error, OSError, ValueError):
+                    debug_logger.exception("Не удалось обработать рассылку общих заметок")
+                    await notify_note_failure(
+                        "неизвестную дату", "рассылка", "ошибка обработки",
+                    )
+
+            scheduler.add_job(
+                event_note_tick, "cron", minute="*", id="event-note-delivery",
+                replace_existing=True, coalesce=True, max_instances=1,
             )
 
             month_summary_pause: dict[str, datetime] = {}
