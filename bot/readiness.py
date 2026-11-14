@@ -1,7 +1,7 @@
 """Опрос готовности (этап 5.2–5.3).
 
-Один Telegram-опрос на служение и месяц: варианты — воскресенья
-следующего месяца и «❌ Не смогу». Человек отвечает «когда свободен»,
+Один Telegram-опрос на служение и месяц: варианты — фактические даты
+с задачами или только даты, плюс «❌ Не смогу». Человек отвечает «когда свободен»,
 на задачу его ставит распределение (`schedule_planner`) по его задачам
 («Списки» ∪ привязки в боте).
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time as time_module
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -177,6 +178,24 @@ def option_parts(key: str) -> tuple[str, str | None]:
     return day, task if separator else None
 
 
+def option_task(option: dict) -> str | None:
+    if option.get("date_only"):
+        return None
+    return option.get("task") or (
+        option["tasks"][0] if len(option.get("tasks", ())) == 1 else None
+    )
+
+
+def option_slots(option: dict) -> Iterator[tuple[date, str]]:
+    task_weeks = option.get("task_weeks")
+    if task_weeks is None:
+        tasks = [option["task"]] if option.get("task") else option.get("tasks", ())
+        task_weeks = {task: option.get("weeks", ()) for task in tasks}
+    for task, weeks in task_weeks.items():
+        for week in weeks:
+            yield date.fromisoformat(week), task
+
+
 def option_weeks(
     options: list[dict],
 ) -> tuple[dict[str, set[date]], dict[str, set[date]]]:
@@ -185,9 +204,7 @@ def option_weeks(
     by_date: dict[str, set[date]] = {}
     for option in options:
         day = option["date"]
-        task = option.get("task") or (
-            option["tasks"][0] if len(option.get("tasks", ())) == 1 else None
-        )
+        task = option_task(option)
         weeks = {date.fromisoformat(value) for value in option.get("weeks", ())}
         by_option[option_key(day, task)] = weeks
         by_date.setdefault(day, set()).update(weeks)
@@ -203,8 +220,7 @@ def answer_dates(option_ids, options, *, reverse_poll: bool = False
     dates = [
         option_key(
             option["date"],
-            option.get("task")
-            or (option["tasks"][0] if len(option.get("tasks", ())) == 1 else None),
+            option_task(option),
         ) if isinstance(option, dict) else option
         for option in options
     ]
@@ -267,14 +283,10 @@ def slot_availability(available: dict[str, list[str]],
     """Translate poll answers into confirmed task service dates."""
     week_set = set(weeks)
     options_by_date: dict[str, set[tuple[date, str]]] = {}
+    date_only = {option["date"] for option in options if option.get("date_only")}
     for option in options:
         day = option["date"]
-        tasks = [option["task"]] if option.get("task") else option.get("tasks", ())
-        for week in option.get("weeks", ()):
-            for task in tasks:
-                options_by_date.setdefault(day, set()).add(
-                    (date.fromisoformat(week), task)
-                )
+        options_by_date.setdefault(day, set()).update(option_slots(option))
 
     result = {}
     for key, values in available.items():
@@ -284,6 +296,13 @@ def slot_availability(available: dict[str, list[str]],
             actual_date = date.fromisoformat(day)
             if task is not None:
                 allowed.add((actual_date, task))
+            elif day in date_only:
+                for week, task_name in options_by_date.get(day, ()):
+                    if (
+                        task_name in people[key]["tasks"]
+                        and slot_dates.get((week, task_name, key), week) == actual_date
+                    ):
+                        allowed.add((actual_date, task_name))
             elif actual_date in week_set:
                 for task_name in people[key]["tasks"]:
                     allowed.add((
@@ -655,8 +674,9 @@ def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
 
 
 def poll_options(registry, service_id: str, year: int, month: int,
-                 *, reverse_poll: bool = False) -> list[dict]:
-    """Доступность по каждой фактической дате и задаче отдельно."""
+                 *, reverse_poll: bool = False,
+                 validate_limit: bool = True) -> list[dict]:
+    """Доступность по фактическим датам, с задачами или без них."""
     settings = registry.get_readiness_settings(service_id)
     tasks = registry.plan_tasks(service_id)
     people = registry.readiness_people(service_id)
@@ -682,16 +702,34 @@ def poll_options(registry, service_id: str, year: int, month: int,
                 })
                 if sunday.isoformat() not in item["weeks"]:
                     item["weeks"].append(sunday.isoformat())
+    items = list(by_day_task.values())
+    if settings.get("dates_only"):
+        by_day: dict[str, dict] = {}
+        for item in items:
+            grouped = by_day.setdefault(item["date"], {
+                "date": item["date"], "date_only": True, "tasks": [], "weeks": [],
+                "task_weeks": {},
+            })
+            grouped["task_weeks"][item["task"]] = item["weeks"]
+            for field in ("tasks", "weeks"):
+                for value in item[field]:
+                    if value not in grouped[field]:
+                        grouped[field].append(value)
+        items = list(by_day.values())
     result = []
-    for (actual_day, _), item in sorted(by_day_task.items()):
-        label = f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
+    for item in sorted(items, key=lambda item: (item["date"], item.get("task", ""))):
+        actual_day = date.fromisoformat(item["date"])
+        label = (
+            f"{actual_day:%d.%m}" if item.get("date_only")
+            else f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
+        )
         if len(label) > 100:
             raise ValueError(
                 f"Слишком длинное название задач для варианта опроса "
                 f"{actual_day:%d.%m}."
             )
         result.append({**item, "label": label})
-    if len(result) + 1 + int(reverse_poll) > 12:
+    if validate_limit and len(result) + 1 + int(reverse_poll) > 12:
         raise ValueError(
             "Опрос не запущен: Telegram допускает не более 12 вариантов, "
             "а для выбранных дат задач их получилось больше."
@@ -704,8 +742,7 @@ def run_option_dates(run: dict) -> list[str]:
     options = run.get("options") or []
     return [
         option_key(
-            item["date"], item.get("task")
-            or (item["tasks"][0] if len(item.get("tasks", ())) == 1 else None),
+            item["date"], option_task(item),
         )
         for item in options
     ] if options else list(run["dates"])
@@ -714,8 +751,7 @@ def run_option_dates(run: dict) -> list[str]:
 def run_option_label(run: dict, day: str) -> str:
     for option in run.get("options") or ():
         key = option_key(
-            option["date"], option.get("task")
-            or (option["tasks"][0] if len(option.get("tasks", ())) == 1 else None),
+            option["date"], option_task(option),
         )
         if key == day:
             return option.get("label") or option["date"]
@@ -1259,15 +1295,11 @@ def free_days(registry, run: dict, summary: Summary) -> list[str]:
         ]
     result = []
     for option in options:
-        tasks = [option["task"]] if option.get("task") else option.get("tasks", ())
         if any(
-            (date.fromisoformat(week), task) in open_slots
-            for week in option.get("weeks", ())
-            for task in tasks
+            slot in open_slots for slot in option_slots(option)
         ):
             result.append(option_key(
-                option["date"], option.get("task")
-                or (tasks[0] if len(tasks) == 1 else None)
+                option["date"], option_task(option)
             ))
     return result
 
