@@ -1,9 +1,8 @@
 """Замена ответственного (этап 3.3).
 
-«🚫 Не смогу» в личном напоминании запускает поиск замены: объявление и
-неанонимный опрос «Кто сможет…» в чате служения, сообщение админам. Итог
-подводится по сроку опроса или раньше — командой админа /change. Замена
-действует на одну дату и главнее графика.
+«🚫 Не смогу» в личном напоминании сохраняет запрос для ручной замены
+и сообщает только админам. Ранее запущенные групповые опросы продолжают
+обрабатываться. Замена действует на одну дату и главнее графика.
 """
 from __future__ import annotations
 
@@ -86,12 +85,13 @@ async def start_replacement_search(
     logger: logging.Logger,
     schedule_close: ScheduleClose | None,
     now: datetime | None = None,
+    notify_group: bool = True,
 ) -> dict | None:
     """Объявление и опрос в чате служения; админам — как назначить самому.
 
     Запрос замены сохраняется всегда: без опроса (нет чата, опрос не
-    отправился) он сразу ждёт /change. Возвращает запрос или None (уже
-    есть невыполненный запрос на это)."""
+    отправился, либо notify_group=False) он сразу ждёт /change.
+    Возвращает запрос или None (уже есть невыполненный запрос на это)."""
     key = (service_id, event_date.isoformat(), task, old_name)
     # Блокировки прошедших дат больше не нужны; текущие не удаляются, чтобы
     # ожидающий вызов и новый не получили разные блокировки.
@@ -105,6 +105,7 @@ async def start_replacement_search(
             bot, registry, service_id, event_date, task, old_name,
             old_telegram_id, admin_actor_id=admin_actor_id, tz=tz,
             logger=logger, schedule_close=schedule_close, now=now,
+            notify_group=notify_group,
         )
 
 
@@ -122,6 +123,7 @@ async def _start_replacement_search_locked(
     logger: logging.Logger,
     schedule_close: ScheduleClose | None,
     now: datetime | None = None,
+    notify_group: bool = True,
 ) -> dict | None:
     service = registry.get_service(service_id)
     if service is None:
@@ -156,6 +158,10 @@ async def _start_replacement_search_locked(
         )
         return registry.get_replacement_poll(request_id)
 
+    if not notify_group:
+        return await manual_request(
+            "Назначьте замену вручную; ответ участника не публикуется в чате."
+        )
     chat_id = service.get("group_chat_id")
     if not chat_id or not service.get("enabled", True):
         return await manual_request(
