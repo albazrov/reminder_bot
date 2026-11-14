@@ -48,12 +48,11 @@ def resolve_assignment_fields(
     task: str | None = None,
 ) -> AssignmentFields:
     from .event_notes import source_sunday_for_event
-    from .presentation import display_name, task_emoji
+    from .presentation import display_name, person_label, task_emoji
     from .schedule_plan import _effective_plan_assignments
     from .excel_parser import is_informational_name
     from .service_registry import task_token
     from .services import sort_tasks_for_display
-    from .ui import user_link
 
     fields = [name for _, name, _, _ in Formatter().parse(template) if name]
     references = {
@@ -104,9 +103,12 @@ def resolve_assignment_fields(
             selected = matches[0]
         people = registry.readiness_people(source_id)
         by_key = {person["key"]: person for person in people}
+        replacement_people: dict[str, dict] = {}
         assignments = _effective_plan_assignments(
             registry, plan, people, keyed=True, source_sunday=sunday,
+            replacement_people=replacement_people if own else None,
         )
+        by_key.update(replacement_people)
         lines = []
         rows = []
         for day, tasks in sorted(assignments.items()):
@@ -121,9 +123,10 @@ def resolve_assignment_fields(
                     if not key:
                         continue
                     person = by_key.get(key)
-                    label = display_name(person, key)
-                    if own and person and person.get("telegram_id"):
-                        label = user_link(person["telegram_id"], label)
+                    label = (
+                        person_label(name, key, {(name, key): person})
+                        if own and person else display_name(person, key)
+                    )
                     day_label = f" — {day:%d.%m}" if own and day.isoformat() != sunday else ""
                     lines.append(f"{task_emoji(name)} {name}{day_label} — {label}")
                     rows.append((day.isoformat(), name, key, label))

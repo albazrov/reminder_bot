@@ -142,6 +142,162 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertIn('<a href="tg://user?id=503">C</a>', rendered)
         self.assertNotIn("@", rendered)
 
+    def test_week_shows_usernames_and_links_without_changing_other_service(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "A", 501, username="sound_user",
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "спевка", "C", 503, username="rehearsal_user",
+        )
+        self.registry.set_responsible_contact(
+            1001, "order", "старший", "D", 504, username="other_user",
+        )
+        result = self.resolve("{week_task_assignments}\n" + assignment_field("order"))
+        rendered = render_screen_chunks(result.week)[0]
+        self.assertIn('<a href="tg://user?id=501">A (@sound_user)</a>', rendered)
+        self.assertIn('спевка — 31.12 — <a href="tg://user?id=503">C (@rehearsal_user)</a>', rendered)
+        self.assertIn('<a href="tg://user?id=502">B</a>', rendered)
+        self.assertNotIn("@other_user", result.services["order"])
+        self.assertNotIn("LINK:", result.services["order"])
+        self.assertEqual(self.resolve(assignment_field("sound")).services["sound"].count("@"), 0)
+
+    def test_week_username_change_invalidates_preview_state(self):
+        before = self.resolve()
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "A", 501, username="new_user",
+        )
+        after = self.resolve()
+        self.assertNotEqual(before.state, after.state)
+        self.assertIn("A (@new_user)", plain_text(after.week))
+
+    def test_week_replacement_uses_substitute_username(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "сборка", "B", 502, username="substitute",
+        )
+        self.registry.set_replacement(
+            "sound", SUNDAY.isoformat(), "звук", "A", "B",
+            telegram_id=502, username="substitute", source="admin", created_by=1001,
+        )
+        text = render_screen_chunks(self.resolve().week)[0]
+        self.assertIn('звук — <a href="tg://user?id=502">B (@substitute)</a>', text)
+        self.assertNotIn(">A</a>", text)
+
+    def test_week_external_replacement_uses_saved_identity_and_username(self):
+        self.registry.set_replacement(
+            "sound", SUNDAY.isoformat(), "звук", "A", "External <name>",
+            telegram_id=699, username="external", source="admin", created_by=1001,
+        )
+        before = self.resolve()
+        text = render_screen_chunks(before.week)[0]
+        self.assertIn(
+            'звук — <a href="tg://user?id=699">External &lt;name&gt; (@external)</a>',
+            text,
+        )
+        self.assertNotIn(">A</a>", text)
+        with self.registry._connection() as connection:
+            connection.execute(
+                "UPDATE service_replacements SET username = 'updated' "
+                "WHERE service_id = 'sound' AND old_name = 'A'",
+            )
+        after = self.resolve()
+        self.assertIn("External <name> (@updated)", plain_text(after.week))
+        self.assertNotEqual(before.state, after.state)
+        other = self.resolve(assignment_field("sound")).services["sound"]
+        self.assertIn("External <name>", other)
+        self.assertNotIn("@updated", other)
+        self.assertNotIn("LINK:", other)
+
+    def test_week_external_replacement_chain_keeps_final_identity(self):
+        self.registry.set_replacement(
+            "sound", SUNDAY.isoformat(), "звук", "A", "External",
+            telegram_id=699, username="external", source="admin", created_by=1001,
+        )
+        self.registry.set_replacement(
+            "sound", SUNDAY.isoformat(), "звук", "External", "Final",
+            telegram_id=700, username="final", source="admin", created_by=1001,
+        )
+        text = render_screen_chunks(self.resolve().week)[0]
+        self.assertIn('звук — <a href="tg://user?id=700">Final (@final)</a>', text)
+        self.assertNotIn("@external", text)
+
+    def test_external_replacement_keeps_each_dates_saved_label(self):
+        self.registry.set_replacement(
+            "sound", date(2026, 12, 31).isoformat(), "спевка", "C", "Old Name",
+            telegram_id=699, username="old_user", source="admin", created_by=1001,
+        )
+        self.registry.set_replacement(
+            "sound", SUNDAY.isoformat(), "звук", "A", "New Name",
+            telegram_id=699, username="new_user", source="admin", created_by=1001,
+        )
+        text = render_screen_chunks(self.resolve().week)[0]
+        self.assertIn('спевка — 31.12 — <a href="tg://user?id=699">Old Name (@old_user)</a>', text)
+        self.assertIn('звук — <a href="tg://user?id=699">New Name (@new_user)</a>', text)
+
+    def test_external_replacement_on_two_dates_keeps_both_mentions(self):
+        for day, task, original in (
+            (date(2026, 12, 31), "спевка", "C"),
+            (SUNDAY, "звук", "A"),
+        ):
+            self.registry.set_replacement(
+                "sound", day.isoformat(), task, original, "External",
+                telegram_id=699, username="external", source="admin", created_by=1001,
+            )
+        text = render_screen_chunks(self.resolve().week)[0]
+        self.assertIn('спевка — 31.12 — <a href="tg://user?id=699">External (@external)</a>', text)
+        self.assertIn('звук — <a href="tg://user?id=699">External (@external)</a>', text)
+
+    def test_external_replacement_for_two_people_is_shown_once_with_latest_username(self):
+        self.plan("sound", {"звук": ["A", "B"]})
+        for original, username in (("A", "old_user"), ("B", "new_user")):
+            self.registry.set_replacement(
+                "sound", SUNDAY.isoformat(), "звук", original, "External",
+                telegram_id=699, username=username, source="poll", created_by=1001,
+            )
+        value = self.resolve().week
+        text = render_screen_chunks(value)[0]
+        self.assertEqual(text.count('tg://user?id=699'), 1)
+        self.assertIn('External (@new_user)', text)
+        self.assertNotIn('@old_user', text)
+
+    def test_week_unlinked_username_and_html_are_rendered_safely(self):
+        self.plan("sound", {"звук": ["Guest <name>"]})
+        original_people = self.registry.readiness_people
+
+        def people(service):
+            result = original_people(service)
+            if service == "sound":
+                result.append({
+                    "key": "Guest <name>", "name": "Guest <name>",
+                    "username": "guest", "telegram_id": None, "tasks": ["звук"],
+                })
+            return result
+
+        with patch.object(self.registry, "readiness_people", side_effect=people):
+            text = render_screen_chunks(self.resolve().week)[0]
+        self.assertIn("Guest &lt;name&gt; (@guest)", text)
+        self.assertNotIn("tg://user", text)
+
+    def test_week_namesakes_keep_exact_identity_and_escape_names(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Same <name>", 601, username="first",
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "сборка", "Same <name>", 602, username="second",
+        )
+        with self.registry._connection() as connection:
+            connection.execute(
+                "UPDATE responsible_contacts SET telegram_id = 601, username = 'first' "
+                "WHERE service_id = 'sound' AND task = 'звук' AND name = 'Same <name>'",
+            )
+        people = {
+            person["telegram_id"]: person["key"]
+            for person in self.registry.readiness_people("sound")
+        }
+        self.plan("sound", {"звук": [people[601]], "сборка": [people[602]]})
+        text = render_screen_chunks(self.resolve().week)[0]
+        self.assertIn('<a href="tg://user?id=601">Same &lt;name&gt; (@first)</a>', text)
+        self.assertIn('<a href="tg://user?id=602">Same &lt;name&gt; (@second)</a>', text)
+
     def test_namesakes_keep_exact_identity_and_safe_mentions(self):
         self.registry.set_responsible_contact(
             1001, "order", "старший", "Same <name>", 601, username="first",
@@ -726,6 +882,12 @@ class AssignmentFieldsTest(unittest.TestCase):
     def test_mock_group_delivery_matches_preview_and_never_resends_on_related_change(self):
         reminder = self.registry.list_group_reminders("sound")[0]
         template = "{week_task_assignments}\n" + assignment_field("order", "старший")
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "A", 501, username="sound_user",
+        )
+        self.registry.set_responsible_contact(
+            1001, "order", "старший", "D", 504, username="other_user",
+        )
         self.registry.update_group_reminder(
             1001, reminder["id"], days=3, body=template,
         )
@@ -750,6 +912,9 @@ class AssignmentFieldsTest(unittest.TestCase):
         sends = [call for call in bot.send_message.await_args_list if call.args[0] == -10002]
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0].args[1], render_screen_chunks(preview["text"])[0])
+        self.assertIn('<a href="tg://user?id=501">A (@sound_user)</a>', sends[0].args[1])
+        self.assertIn("⭐ старший — D", sends[0].args[1])
+        self.assertNotIn("@other_user", sends[0].args[1])
         self.registry.set_replacement(
             "order", SUNDAY.isoformat(), "старший", "D", "E",
             telegram_id=505, username="", source="admin", created_by=1001,
