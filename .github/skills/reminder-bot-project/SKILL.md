@@ -427,6 +427,9 @@ Raspberry Pi specifics:
   applies only to eligible tasks on that actual day, not the entire week.
   Options are snapshotted in the run; changing settings must not reinterpret
   existing answers. Reverse mode works in both formats.
+  Manual-editor `_selected_slot` accepts the week-date fallback only for
+  legacy summaries without date options; selecting Sunday must not confirm
+  a weekday task in candidates, choice warnings, or plan-text marks.
 - `show_readiness_overview` uses `intro_text`, `question_text`, and
   `poll_options`, including reverse-mode and final options, without sending
   an intro or poll to the service chat. It displays `preview_note` explaining
