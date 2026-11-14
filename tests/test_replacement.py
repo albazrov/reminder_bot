@@ -208,6 +208,9 @@ class SearchFlowTest(Base):
         poll = self.start()
         self.assertEqual(poll["status"], "open")
         self.assertEqual(poll["notice_message_id"], 100)
+        notice = self.sent_to(-1005)[0]
+        self.assertIn('<a href="tg://user?id=4004">Алексей</a>', notice)
+        self.assertNotIn("@alex_one", notice)
         kwargs = self.bot.send_poll.await_args.kwargs
         self.assertEqual(kwargs["options"], ["Могу", "Не смогу"])
         self.assertFalse(kwargs["is_anonymous"])
@@ -304,7 +307,10 @@ class SearchFlowTest(Base):
             self.registry.list_replacements("sound", EVENT.isoformat())[0]["new_name"],
             "Борис",
         )
-        self.assertIn("Борис (@boris_b) вместо Алексей", self.sent_to(-1005)[0])
+        announcement = self.sent_to(-1005)[0]
+        self.assertIn('<a href="tg://user?id=5005">Борис</a>', announcement)
+        self.assertIn('<a href="tg://user?id=4004">Алексей</a>', announcement)
+        self.assertNotIn("@boris_b", announcement)
         self.assertIn("Вы назначены", self.sent_to(MEMBER)[0])
         self.assertEqual(
             self.registry.get_confirmation("sound", EVENT.isoformat(), "звук", MEMBER),
@@ -576,7 +582,10 @@ class DirectChangeTest(HandlersTest):
         self.assertIn("✅ Замена назначена", done.answer.await_args.args[0])
         row = self.registry.list_replacements("sound", self.day.isoformat())[0]
         self.assertEqual((row["old_name"], row["new_name"]), ("Алексей", "Борис"))
-        self.assertIn("Борис (@boris_b) вместо Алексей", self.sent_to(-1005)[0])
+        announcement = self.sent_to(-1005)[0]
+        self.assertIn('<a href="tg://user?id=5005">Борис</a>', announcement)
+        self.assertIn('<a href="tg://user?id=4004">Алексей</a>', announcement)
+        self.assertNotIn("@boris_b", announcement)
 
         many = self.message(ADMIN, "/change спевка @boris_b")
         asyncio.run(self.change(many))
@@ -627,8 +636,9 @@ class DirectChangeTest(HandlersTest):
             week = await self._press(weeks, "нед.")
             text = week.answer.await_args.args[0]
             self.assertIn("📋 График на", text)
-            self.assertIn(f"сборка — {self.day:%d.%m} — Алексей", text)
-            self.assertIn(f"спевка — {self.day:%d.%m} — Вера, Глеб", text)
+            self.assertIn(f"{self.day:%d.%m}:", text)
+            self.assertIn("🧰 сборка — Алексей", text)
+            self.assertIn("🎶 спевка — Вера, Глеб", text)
             labels = [
                 item.text for row in
                 week.answer.await_args.kwargs["reply_markup"].inline_keyboard
@@ -649,9 +659,17 @@ class DirectChangeTest(HandlersTest):
             self.assertIn("👤 Выбрать пользователя Telegram", labels)
             self.assertEqual(labels[-2:], ["⬅️ К неделе", "📅 К графику"])
             self.assertIn("📋 График на", candidates.answer.await_args.args[0])
+            self.assertIn(
+                "Вместо: Алексей\n\nℹ️",
+                candidates.answer.await_args.args[0],
+            )
             confirm = await self._press(candidates, "Борис")
-            self.assertIn("Алексей → Борис", confirm.answer.await_args.args[0])
-            self.assertIn("📋 График на", confirm.answer.await_args.args[0])
+            confirm_text = confirm.answer.await_args.args[0]
+            self.assertIn(
+                "Алексей → Борис (@boris_b)\n\nℹ️ Замена действует",
+                confirm_text,
+            )
+            self.assertIn("📋 График на", confirm_text)
             confirm_rows = confirm.answer.await_args.kwargs[
                 "reply_markup"
             ].inline_keyboard
@@ -663,6 +681,8 @@ class DirectChangeTest(HandlersTest):
             # После замены — снова неделя, с отметкой.
             text = result.answer.await_args.args[0]
             self.assertIn("✅ Замена назначена", text)
+            self.assertIn("\n\n✅ Замена назначена", text)
+            self.assertIn("\n\n📋 График на", text)
             self.assertIn("Неделя", text)
             row = self.registry.list_replacements("sound", self.day.isoformat())[0]
             self.assertEqual((row["task"], row["new_name"]), ("сборка", "Борис"))

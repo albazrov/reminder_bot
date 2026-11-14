@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
-from bot.excel_parser import ServiceAssignment, ServiceEvent
+from bot import readiness
+from bot.excel_parser import RosterMember, ServiceAssignment, ServiceEvent
 from bot.handlers import register, router
 from bot.month_summary import month_title, next_month
 from bot.navigation import NAV_CANCEL_TEXT, NAV_HINT, NAV_HOME_TEXT
@@ -6882,6 +6883,97 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         self.context.bot.stop_poll = AsyncMock()
         asyncio.run(run())
 
+    def test_readiness_menu_layout_and_poll_overview_do_not_send_poll(self):
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Участник графика", ("звук",)),
+        ]})
+        self.context.bot.send_poll = AsyncMock()
+        handler = self.callback_handler("on_readiness")
+
+        async def press(data):
+            callback = SimpleNamespace(
+                data=data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await handler(callback)
+            return callback
+
+        async def run():
+            screen = await press("rdy:open:sound")
+            today = datetime.now(ZoneInfo("UTC")).date()
+            target_year, target_month = readiness.target_month(today)
+            target_name = month_title(target_year, target_month).split()[0]
+            current_name = month_title(today.year, today.month).split()[0]
+            rows = screen.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            labels = [[button.text for button in row] for row in rows]
+            self.assertEqual(len(labels), 8)
+            self.assertEqual(labels[0], ["🟢 Включить", "👁 Обзор"])
+            self.assertEqual(labels[1], [
+                f"🗳 Запуск {target_name[:3].capitalize()}",
+                f"⏭ Пропуск {target_name[:3].capitalize()}",
+            ])
+            self.assertEqual(
+                labels[2], ["↔️ «Наоборот» выкл", "📝 Тексты"]
+            )
+            self.assertEqual(
+                labels[3], ["⏳ Срок", "🕒 Начало", "🏁 Окончание"]
+            )
+            self.assertEqual(
+                labels[4], ["👥 Команда", "🔢 В месяц", "🔔 Напоминание"]
+            )
+            self.assertEqual(
+                labels[5], ["📆 Дни служения", "📅 Свой день"]
+            )
+            self.assertEqual(
+                labels[6][0], f"📋 График {current_name.capitalize()}"
+            )
+            self.assertEqual(
+                labels[6][1],
+                f"🧮 График {target_name[:3].capitalize()} (авто)",
+            )
+            self.assertEqual(labels[7], ["⬅️ К графику", "❓ Справка"])
+
+            preview = await press("rdy:overview:sound")
+            text = preview.message.answer.await_args.args[0]
+            self.assertIn("💬 Сообщение перед опросом", text)
+            self.assertIn("📊 Опрос в Telegram", text)
+            self.assertIn("Когда можешь служить", text)
+            self.assertIn("срок как при", text)
+            self.assertIn(
+                "При запуске вручную срок рассчитывается заново от текущего времени.",
+                text,
+            )
+            first = date(target_year, target_month, 1)
+            first_sunday = first + timedelta(days=(6 - first.weekday()) % 7)
+            self.assertIn(f"• {first_sunday:%d.%m} — звук", text)
+            self.assertIn("Это только предпросмотр", text)
+            self.context.bot.send_poll.assert_not_awaited()
+
+            month_arg = f"{target_year:04d}{target_month:02d}"
+            skipped = await press(f"rdy:skip:sound:{month_arg}")
+            skipped_rows = skipped.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertEqual(
+                [button.callback_data for button in skipped_rows[1]],
+                [f"rdy:unskip:sound:{month_arg}"],
+            )
+            restored = await press(f"rdy:unskip:sound:{month_arg}")
+            restored_rows = restored.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertEqual(
+                restored_rows[1][0].callback_data,
+                f"rdy:start:sound:{month_arg}",
+            )
+            self.context.bot.send_poll.assert_not_awaited()
+
+        asyncio.run(run())
+
     def test_auto_button_builds_current_month_without_poll_or_excel(self):
         from bot.excel_parser import RosterMember
 
@@ -9186,6 +9278,68 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             self.assertEqual(member["telegram_id"], 77777)
             self.assertFalse(member["in_list"])
+
+        asyncio.run(run())
+
+    def test_replacement_week_separates_days_and_tasks(self):
+        today = datetime.now(ZoneInfo("UTC")).date()
+        sunday = today + timedelta(days=(6 - today.weekday()) % 7 + 7)
+        friday = sunday - timedelta(days=2)
+        following_sunday = sunday + timedelta(days=7)
+        self.context.load_upcoming_service_events = AsyncMock(return_value=[
+            ServiceEvent(
+                "sound", friday,
+                (ServiceAssignment("спевка", "Елисей"),),
+            ),
+            ServiceEvent(
+                "sound", sunday,
+                (
+                    ServiceAssignment("звук", "Василий"),
+                    ServiceAssignment("сборка", "Матвей"),
+                ),
+            ),
+            ServiceEvent(
+                "sound", following_sunday,
+                (ServiceAssignment("звук", "Алексей"),),
+            ),
+        ])
+
+        async def run():
+            open_callback = SimpleNamespace(
+                data="rdy:repl:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_readiness")(open_callback)
+            date_screen = open_callback.message
+            week_button = next(
+                button
+                for row in date_screen.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("rpl:")
+                and ":week:" in button.callback_data
+            )
+            week_callback = SimpleNamespace(
+                data=week_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=date_screen,
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_replace_action")(week_callback)
+            text = week_callback.message.answer.await_args.args[0]
+            self.assertIn(f"пт {friday:%d.%m}:", text)
+            self.assertIn(f"вс {sunday:%d.%m}:", text)
+            self.assertIn(
+                f"пт {friday:%d.%m}:\n"
+                "      🎶 спевка — Елисей\n\n"
+                f"   вс {sunday:%d.%m}:\n",
+                text,
+            )
+            self.assertIn("звук — Василий\n", text)
+            self.assertIn("сборка — Матвей\n", text)
 
         asyncio.run(run())
 

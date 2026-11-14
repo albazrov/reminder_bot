@@ -196,7 +196,8 @@ class ServicePreviewTest(unittest.TestCase):
             self.assertEqual(result["send_date"], "24.10.2026")
             self.assertEqual(result["time"], reminder["reminder_time"])
             self.assertIn("Звук · 25.10.2026", result["text"])
-            self.assertIn("Алексей (@alex)", plain_text(result["text"]))
+            self.assertIn("Алексей", plain_text(result["text"]))
+            self.assertNotIn("@alex", result["text"])
             self.assertIn("📌 2-я часть нет", result["text"])
 
     def test_group_reminder_preview_falls_back_to_builtin_template(self):
@@ -541,16 +542,18 @@ class ServicePreviewTest(unittest.TestCase):
 
             self.assertIn("Звук", preview["group_text"])
             group_text = plain_text(preview["group_text"])
-            self.assertIn("🎚️ Микшер\n• Алексей (@alex)", group_text)
+            self.assertIn("🎚️ Микшер\n• Алексей", group_text)
             self.assertNotIn("12345", group_text)
             self.assertIn(
-                '<a href="tg://user?id=12345">Алексей (@alex)</a>',
+                '<a href="tg://user?id=12345">Алексей</a>',
                 "".join(render_screen_chunks(preview["group_text"], limit=4096)),
             )
+            self.assertNotIn("@alex", preview["group_text"])
             self.assertIn("• Мария · не привязан", preview["group_text"])
             self.assertIn("{task_assignments}", preview["example_group_template"])
             example_text = plain_text(preview["example_group_text"])
-            self.assertIn("Алексей (@alex)", example_text)
+            self.assertIn("Алексей", example_text)
+            self.assertNotIn("@alex", example_text)
             self.assertNotIn("12345", example_text)
             self.assertEqual(len(preview["personal_messages"]), 3)
             alex_message = preview["personal_messages"][0]
@@ -768,7 +771,8 @@ class ServicePreviewTest(unittest.TestCase):
             previews = asyncio.run(run())
             self.assertIn("Новый Звук", previews["group_text"])
             group_text = plain_text(previews["group_text"])
-            self.assertIn("Алексей (@alex)", group_text)
+            self.assertIn("Алексей", group_text)
+            self.assertNotIn("@alex", group_text)
             self.assertNotIn("12345", group_text)
             self.assertEqual(
                 previews["personal_messages"][0]["text"],
