@@ -5762,6 +5762,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = (
             f"👁 Обзор опроса · {service_label(service)} · "
             f"{month_title(year, month)}\n\n"
+            f"ℹ️ {readiness.preview_note(run, settings, year, month, now)}\n"
+            "При запуске вручную срок рассчитывается заново от текущего "
+            "времени.\n\n"
             "💬 Сообщение перед опросом:\n"
             f"{intro}\n\n"
             "📊 Опрос в Telegram:\n"
