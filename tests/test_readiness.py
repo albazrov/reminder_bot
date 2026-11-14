@@ -264,6 +264,97 @@ class ReadinessFlowTest(unittest.TestCase):
             self.registry.set_readiness_settings(
                 1001, "sound", reverse_poll=1
             )
+        self.assertFalse(settings["dates_only"])
+        self.registry.set_readiness_settings(1001, "sound", dates_only=True)
+        self.assertTrue(self.registry.get_readiness_settings("sound")["dates_only"])
+        with self.assertRaises(ValueError):
+            self.registry.set_readiness_settings(1001, "sound", dates_only=1)
+
+    def test_dates_only_setting_migrates_existing_database(self):
+        with self.registry._connection() as connection:
+            connection.execute("ALTER TABLE readiness_settings DROP COLUMN dates_only")
+        self.registry.initialize(1001, -10001)
+        self.assertFalse(self.registry.get_readiness_settings("sound")["dates_only"])
+        self.assertTrue(self.registry.get_readiness_settings("sound")["enabled"])
+
+    def test_dates_only_launch_and_snapshot(self):
+        self.registry.set_readiness_settings(1001, "sound", dates_only=True)
+        bot = fake_bot()
+        run = self.launch(bot)
+        self.assertEqual(bot.send_poll.await_args.kwargs["options"], [
+            "01.11", "08.11", "15.11", "22.11", "29.11",
+            "❌ Не смогу в этом месяце",
+        ])
+        self.assertEqual(readiness.run_option_dates(run), run["dates"])
+        dates = readiness.answer_dates([0], run["options"])
+        self.assertEqual(dates, ["2026-11-01"])
+        self.registry.set_readiness_settings(1001, "sound", dates_only=False)
+        self.registry.record_readiness_answer(
+            run["poll_id"], 501, "alex", "Алексей", dates,
+        )
+        summary = readiness.summarize(self.registry, run)
+        self.assertEqual(summary.available["Алексей"], ["2026-11-01"])
+        self.assertEqual(readiness.run_option_label(run, dates[0]), "01.11")
+        self.assertTrue(any(
+            "Алексей" in names for (day, _), names in summary.plan.slots.items()
+            if day == date(2026, 11, 1)
+        ))
+
+    def test_dates_only_respects_actual_task_and_personal_days(self):
+        people = {"А": {"tasks": ["раньше", "позже"]}}
+        week = date(2026, 11, 1)
+        later = date(2026, 11, 2)
+        slots = {(week, "раньше", "А"): week, (week, "позже", "А"): later}
+        options = [
+            {"date": day.isoformat(), "date_only": True, "tasks": [task],
+             "weeks": [week.isoformat()], "label": day.strftime("%d.%m")}
+            for day, task in ((week, "раньше"), (later, "позже"))
+        ]
+        self.assertEqual(readiness.answer_dates([0], options), ["2026-11-01"])
+        available = readiness.slot_availability(
+            {"А": ["2026-11-01"]}, people, (week,), slots, options,
+        )
+        self.assertEqual(available["А"], frozenset({(week, "раньше")}))
+        available = readiness.slot_availability(
+            {"А": ["2026-11-02"]}, people, (week,), slots, options,
+        )
+        self.assertEqual(available["А"], frozenset({(later, "позже")}))
+
+    def test_dates_only_reverse_and_distinct_task_dates(self):
+        self.registry.set_service_task_day(1001, "sound", "сборка", -3)
+        self.registry.set_readiness_settings(
+            1001, "sound", dates_only=True, reverse_poll=True,
+        )
+        run = self.launch(fake_bot())
+        self.assertEqual(len(run["options"]), 10)
+        self.assertEqual(run["options"][0]["label"], "29.10")
+        marked = readiness.answer_dates([0], run["options"], reverse_poll=True)
+        self.registry.record_readiness_answer(
+            run["poll_id"], 501, "alex", "Алексей", marked,
+        )
+        summary = readiness.summarize(self.registry, run)
+        self.assertNotIn("2026-10-29", summary.available["Алексей"])
+        self.assertIn("2026-11-01", summary.available["Алексей"])
+        self.assertIn(
+            (date(2026, 10, 29), "сборка"), summary.unavailable["Алексей"],
+        )
+
+    def test_dates_only_keeps_exact_task_weeks_on_overlapping_calendar_day(self):
+        self.registry.set_readiness_settings(1001, "sound", dates_only=True)
+        tasks = [{"name": "А", "day": None}, {"name": "Б", "day": None}]
+        people = [
+            {"tasks": ["А"], "day_offset": 1},
+            {"tasks": ["Б"], "day_offset": -6},
+        ]
+        with (
+            patch.object(self.registry, "plan_tasks", return_value=tasks),
+            patch.object(self.registry, "readiness_people", return_value=people),
+        ):
+            options = readiness.poll_options(self.registry, "sound", 2026, 11)
+        overlapping = next(item for item in options if item["date"] == "2026-11-02")
+        self.assertEqual(set(readiness.option_slots(overlapping)), {
+            (date(2026, 11, 1), "А"), (date(2026, 11, 8), "Б"),
+        })
 
     def launch(self, bot):
         return asyncio.run(readiness.launch_run(
@@ -370,6 +461,9 @@ class ReadinessFlowTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "не более 12 вариантов"):
                 readiness.poll_options(self.registry, "sound", 2026, 11)
+            self.assertEqual(len(readiness.poll_options(
+                self.registry, "sound", 2026, 11, validate_limit=False,
+            )), 15)
 
         one_task = [{**tasks[0], "day": 0}]
         one_person = [{**people[0], "tasks": ["сб"]}]

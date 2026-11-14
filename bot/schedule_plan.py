@@ -389,7 +389,7 @@ def _selected_slot(summary: Summary, key: str, day: str, task: str,
     return (
         option_key(service_day.isoformat(), task) in available
         or service_day.isoformat() in available
-        or day in available
+        or (not summary.date_options and day in available)
     )
 
 

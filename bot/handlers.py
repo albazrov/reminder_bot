@@ -740,6 +740,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         keyboard_limit = kwargs.pop("_dialog_keyboard_limit", 6)
         keep_rows = kwargs.pop("_dialog_keep_rows", False)
         text_limit = kwargs.pop("_dialog_text_limit", 500)
+        error_navigation = kwargs.pop("_dialog_error_navigation", True)
         markup = kwargs.pop("reply_markup", None)
         sent_ids = kwargs.pop("_dialog_sent_ids", None)
         actor_id = getattr(getattr(target, "chat", None), "id", None)
@@ -749,7 +750,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if chat_type == ChatType.PRIVATE
             else None
         )
-        if (chat_type == ChatType.PRIVATE
+        if (error_navigation and chat_type == ChatType.PRIVATE
                 and text.lstrip().startswith(("❌", "⚠️"))
                 and (markup is None or isinstance(markup, InlineKeyboardMarkup))):
             rows = (
@@ -5631,6 +5632,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else "выключен — отмеченные даты доступны"
             )
         )
+        lines.append(
+            "📋 Варианты: "
+            + ("только даты" if settings["dates_only"] else "даты и задачи")
+        )
         current_key = f"{now.year:04d}-{now.month:02d}"
         current_plan = registry.get_schedule_plan(service_id, current_key)
         current_run = registry.get_readiness_run(service_id, current_key)
@@ -5668,6 +5673,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     "rev", service_id,
                 ),
                 readiness_button("📝 Тексты", "texts", service_id),
+                readiness_button("📋 Варианты", "format", service_id),
             ],
             [
                 readiness_button("⏳ Срок", "dur", service_id),
@@ -5720,6 +5726,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             _dialog_keep_rows=True,
             # Экран раздела — одним сообщением (кнопки под всем текстом).
             _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            _dialog_error_navigation=False,
             parse_mode=None,
         )
 
@@ -5750,11 +5757,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         options = readiness.poll_options(
             registry, service_id, year, month,
             reverse_poll=settings["reverse_poll"],
+            validate_limit=False,
         )
         labels = [item["label"] for item in options]
         if settings["reverse_poll"]:
             labels.append("✅ Смогу в любые даты")
         labels.append(readiness.phrase(settings, "cant"))
+        limit_note = (
+            f"⚠️ Получилось {len(labels)} вариантов, Telegram допускает не более "
+            "12. Для запуска выберите «Варианты» → «Только даты» "
+            "или измените дни задач.\n\n"
+            if len(labels) > 12 else ""
+        )
         chat_note = (
             "⚠️ Чат служения не привязан — опрос не удастся отправить.\n\n"
             if not service.get("group_chat_id") else ""
@@ -5762,6 +5776,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         text = (
             f"👁 Обзор опроса · {service_label(service)} · "
             f"{month_title(year, month)}\n\n"
+            f"{limit_note}"
             f"ℹ️ {readiness.preview_note(run, settings, year, month, now)}\n"
             "При запуске вручную срок рассчитывается заново от текущего "
             "времени.\n\n"
@@ -5779,6 +5794,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("⬅️ К опросу", "open", service_id),
             ]]),
             _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            _dialog_error_navigation=False,
             parse_mode=None,
         )
 
@@ -7315,12 +7331,50 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await show_readiness_overview(callback.message, service_id)
                 await _answer_callback(callback)
                 return
+            elif action == "format":
+                await _send_dialog(
+                    callback.message,
+                    f"📋 {service_label(service)} › График › Опрос › Варианты\n\n"
+                    "«Даты и задачи» — отдельный ответ для каждой даты и задачи.\n\n"
+                    "«Только даты» — один ответ на фактическую дату. Выбор "
+                    "означает готовность ко всем доступным вам задачам в этот "
+                    "день. Задачи в разные дни остаются разными датами.\n\n"
+                    "Настройка действует на следующий запуск. Уже отправленный "
+                    "опрос и его ответы не меняются.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [readiness_button(
+                            ("✅ " if not settings["dates_only"] else "")
+                            + "Даты и задачи", "fmt", service_id, "tasks",
+                        )],
+                        [readiness_button(
+                            ("✅ " if settings["dates_only"] else "")
+                            + "Только даты", "fmt", service_id, "dates",
+                        )],
+                        [readiness_button("⬅️ К опросу", "open", service_id)],
+                    ]),
+                    _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                )
+                await _answer_callback(callback)
+                return
+            elif action == "fmt":
+                if arg not in {"dates", "tasks"}:
+                    await _answer_callback(callback, "⚠️ Неизвестный формат")
+                    return
+                registry.set_readiness_settings(
+                    actor_id, service_id, dates_only=arg == "dates",
+                )
+                notice = (
+                    "✅ Варианты: только даты" if arg == "dates"
+                    else "✅ Варианты: даты и задачи"
+                )
             elif action == "help":
                 await _send_dialog(
                     callback.message,
                     f"❓ {service_label(service)} › График › Опрос › Справка\n\n"
                     "👁 Обзор показывает вступительное сообщение, вопрос и "
                     "варианты опроса — без отправки в чат.\n\n"
+                    "📋 Варианты — даты с задачами или только фактические "
+                    "даты, общие для всех доступных человеку задач.\n\n"
                     "🟢 Включить — разрешить автоматический запуск. Запуск "
                     "вручную доступен отдельно.\n\n"
                     "🗳 Запуск / ⏭ Пропуск — запустить опрос на месяц или "
