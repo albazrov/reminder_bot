@@ -321,9 +321,13 @@ Raspberry Pi specifics:
   answer). An answered task/date gets no more personal reminders. A new
   "declined" sends `notify_admins_declined` and calls the optional
   `context.on_assignment_declined` hook (replacement search, stage 3.3).
-- Replacement (stage 3.3, `bot/replacement.py`): a new "declined" calls
-  `context.on_assignment_declined` = `start_replacement_search` (notice +
-  non-anonymous poll via `send_to_service_group`, row in `replacement_polls`,
+- Personal answers never publish confirmation/decline to the service group,
+  including assembly. Declines notify admins and refresh their reports.
+  The default `context.on_assignment_declined` hook calls
+  `start_replacement_search(notify_group=False)`: a closed, unfilled manual
+  request is saved for `/change`, without group notices, polls or close jobs.
+- Replacement (stage 3.3, `bot/replacement.py`): previously started group
+  polls remain supported (`send_to_service_group`, row in `replacement_polls`,
   `context.schedule_replacement_close` adds APScheduler job
   `replacement-poll-{poll_id}`; open polls are rescheduled on startup).
   `poll_deadline`: min(now+12h, event day start−12h), at least 1h. Votes:

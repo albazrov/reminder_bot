@@ -409,10 +409,88 @@ class HandlersTest(Base):
             text=text, reply_to_message=reply_to, answer=AsyncMock(),
         )
 
-    def test_hook_starts_search_and_poll_answers_are_recorded(self):
-        asyncio.run(self.context.on_assignment_declined(
-            "sound", EVENT, "звук", "Алексей", telegram_id=OLD
-        ))
+    def test_hook_keeps_manual_request_private_and_admin_can_replace(self):
+        async def run():
+            await self.context.on_assignment_declined(
+                "sound", EVENT, "звук", "Алексей", telegram_id=OLD
+            )
+            requests = self.registry.list_unfilled_replacement_requests(
+                EVENT.isoformat()
+            )
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["status"], "closed")
+            self.bot.send_poll.assert_not_awaited()
+            self.bot.stop_poll.assert_not_awaited()
+            self.assertTrue(self.bot.send_message.await_args_list)
+            self.assertTrue(all(
+                call.args[0] == ADMIN
+                for call in self.bot.send_message.await_args_list
+            ))
+            before = self.bot.send_message.await_count
+            await self.context.on_assignment_declined(
+                "sound", EVENT, "звук", "Алексей", telegram_id=OLD
+            )
+            self.assertEqual(self.bot.send_message.await_count, before)
+            done = self.message(ADMIN, "/change звук @boris_b")
+            await self.change(done)
+            self.assertIn("✅ Замена назначена", done.answer.await_args.args[0])
+            self.assertEqual(
+                self.registry.list_unfilled_replacement_requests(
+                    EVENT.isoformat()
+                ), []
+            )
+        asyncio.run(run())
+
+    def test_personal_answers_only_notify_admins_for_all_services(self):
+        answer = [
+            item.callback for router in self.routers
+            for item in router.callback_query.handlers
+            if item.callback.__name__ == "on_personal_answer"
+        ][-1]
+        for index, (service_id, task) in enumerate((
+            ("sound", "звук"), ("assembly", "Ведущий"), ("kitchen", "в смене")
+        )):
+            with self.subTest(service=service_id):
+                self.registry.set_group_chat(
+                    SUPER, service_id, -2000 - index, enabled=True
+                )
+                self.registry.add_service_admin(SUPER, service_id, ADMIN)
+                self.registry.set_responsible_contact(
+                    SUPER, service_id, task, "Алексей", OLD, "alex_one"
+                )
+                self.registry.save_admin_report(
+                    service_id, EVENT.isoformat(), ADMIN, 100,
+                    {task: {"names": ["Алексей"]}},
+                )
+                for kind, status in (("c", "confirmed"), ("d", "declined")):
+                    self.bot.send_message.reset_mock()
+                    self.bot.edit_message_text.reset_mock()
+                    cb = SimpleNamespace(
+                        from_user=SimpleNamespace(id=OLD),
+                        data=f"pcf:{kind}:{service_id}:{EVENT:%Y%m%d}:{task_token(task)}",
+                        answer=AsyncMock(), message=None,
+                    )
+                    asyncio.run(answer(cb))
+                    self.assertEqual(
+                        self.registry.get_confirmation(
+                            service_id, EVENT.isoformat(), task, OLD
+                        ), status, cb.answer.await_args,
+                    )
+                    self.bot.edit_message_text.assert_awaited_once()
+                    self.assertEqual(
+                        self.bot.edit_message_text.await_args.kwargs["chat_id"], ADMIN
+                    )
+                    self.assertTrue(all(
+                        call.args[0] == ADMIN
+                        for call in self.bot.send_message.await_args_list
+                    ))
+                    if kind == "d":
+                        self.assertTrue(self.bot.send_message.await_args_list)
+                    self.bot.send_poll.assert_not_awaited()
+                    self.bot.stop_poll.assert_not_awaited()
+
+    def test_existing_poll_answers_are_recorded(self):
+        self.start()
         poll = self.registry.list_open_replacement_polls()[0]
         asyncio.run(self.poll_answer(SimpleNamespace(
             poll_id=poll["poll_id"], option_ids=[0],
@@ -835,8 +913,10 @@ class DirectChangeTest(HandlersTest):
 
     def test_replace_screen_closes_open_request(self):
         async def run():
-            await self.context.on_assignment_declined(
-                "sound", self.day, "звук", "Алексей", telegram_id=OLD
+            await start_replacement_search(
+                self.bot, self.registry, "sound", self.day, "звук", "Алексей", OLD,
+                admin_actor_id=SUPER, tz=TZ, logger=MagicMock(),
+                schedule_close=self.schedule_close,
             )
             self.assertEqual(len(self.registry.list_open_replacement_polls()), 1)
             done = self.message(ADMIN, "/change звук @boris_b")
@@ -915,8 +995,10 @@ class DirectChangeTest(HandlersTest):
             ServiceAssignment("звук", "Алексей"),
             ServiceAssignment("звук", "Глеб"),
         ))
-        asyncio.run(self.context.on_assignment_declined(
-            "sound", self.day, "звук", "Алексей", telegram_id=OLD
+        asyncio.run(start_replacement_search(
+            self.bot, self.registry, "sound", self.day, "звук", "Алексей", OLD,
+            admin_actor_id=SUPER, tz=TZ, logger=MagicMock(),
+            schedule_close=self.schedule_close,
         ))
         poll = self.registry.list_open_replacement_polls()[0]
         other = self.day + timedelta(days=7)
