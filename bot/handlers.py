@@ -5550,13 +5550,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         free_plan = plan if plan is not None and plan["run_id"] is None and (
             run is None or run["status"] == "skipped"
         ) else None
-        free_row = [
-            readiness_button("📋 График", "plan", service_id, month_arg)
-            if free_plan is not None else
-            readiness_button(
-                "🧮 Составить без опроса", "pfree", service_id, month_arg
-            )
-        ]
         if run is None:
             lines.append(
                 f"Опрос на {title}: ещё не запускался"
@@ -5587,12 +5580,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             rows.append([
                 readiness_button(
-                    "🗳 Запустить опрос", "start", service_id, month_arg
+                    f"🗳 Запуск {title.split()[0][:3].capitalize()}",
+                    "start", service_id, month_arg,
                 ),
-                readiness_button(f"⏭ Пропустить {title.split()[0]}",
-                                 "skip", service_id, month_arg),
+                readiness_button(
+                    f"⏭ Пропуск {title.split()[0][:3].capitalize()}",
+                    "skip", service_id, month_arg,
+                ),
             ])
-            rows.append(free_row)
         elif run["status"] == "skipped":
             lines.append(
                 f"Опрос на {title}: ⏭ пропущен — автоматически не "
@@ -5600,10 +5595,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             rows.append([
                 readiness_button(
-                    "↩️ Не пропускать", "unskip", service_id, month_arg
+                    "↩️ Вернуть опрос", "unskip", service_id, month_arg
                 ),
             ])
-            rows.append(free_row)
         elif run["status"] == "open":
             lines.append(
                 f"Опрос на {title}: 🟢 идёт до "
@@ -5614,14 +5608,6 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("⏳ +1 день", "extend", service_id, month_arg),
                 readiness_button("⏹ Завершить", "finish", service_id, month_arg),
             ])
-            rows.append([
-                readiness_button("📋 Предварительный график", "pprev",
-                                 service_id, month_arg),
-            ])
-            rows.append([
-                readiness_button("🔄 Перезапустить", "restart", service_id,
-                                 month_arg),
-            ])
         else:
             lines.append(f"Опрос на {title}: ✅ завершён.")
             if plan is not None and plan["run_id"] == run["id"]:
@@ -5630,25 +5616,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 readiness_button("📋 График", "plan", service_id, month_arg),
                 readiness_button("📊 Итог опроса", "progress", service_id, month_arg),
             ])
-            rows.append([
-                readiness_button("▶️ Запустить заново", "restart", service_id,
-                                 month_arg),
-            ])
         if free_plan is not None:
             lines.append(plan_status(free_plan))
-        rows.append([
-            readiness_button("⏳ Срок", "dur", service_id),
-            readiness_button("🕒 Начало", "time", service_id),
-            readiness_button("🏁 Окончание", "dlt", service_id),
-        ])
-        rows.append([
-            readiness_button("🔔 Напоминание", "rem", service_id),
-            readiness_button("👥 Нужно людей", "people", service_id, "o"),
-            readiness_button(
-                "🔕 Выключить" if settings["enabled"] else "🟢 Включить",
-                "toggle", service_id,
-            ),
-        ])
         window = (settings["day_from"], settings["day_to"])
         lines.append("📆 Дни служения: " + DAY_WINDOWS.get(window, "свои"))
         lines.append(
@@ -5662,31 +5631,85 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else "выключен — отмеченные даты доступны"
             )
         )
-        rows.append([
-            readiness_button("📆 Дни служения", "days", service_id),
-            readiness_button("📅 Свой день", "own", service_id),
-            readiness_button("🔢 В месяц", "lim", service_id),
-        ])
-        rows.append([readiness_button(
-            "↔️ Выключить «Наоборот»" if settings["reverse_poll"]
-            else "↔️ Включить «Наоборот»",
-            "rev", service_id,
-        )])
-        rows.append([
-            readiness_button("📝 Тексты", "texts", service_id),
-        ])
         current_key = f"{now.year:04d}-{now.month:02d}"
         current_plan = registry.get_schedule_plan(service_id, current_key)
-        if current_plan is not None:
-            # График текущего месяца можно править и после его начала.
-            rows.append([readiness_button(
-                f"📋 График на {month_title(now.year, now.month)}", "plan",
-                service_id, current_key.replace("-", ""),
-            )])
-        rows.append([InlineKeyboardButton(
-            text="⬅️ К графику",
-            callback_data=f"rdy:month:{service_id}",
-        )])
+        current_run = registry.get_readiness_run(service_id, current_key)
+        current_title = month_title(now.year, now.month).split()[0].capitalize()
+        target_month_short = title.split()[0][:3].capitalize()
+        current_graph_action = (
+            "plan" if plan_current(current_run, current_plan) else "cgraph"
+        )
+        if run is not None and run["status"] == "open":
+            target_graph_action = "pprev"
+            target_graph_text = f"📊 График {target_month_short}"
+        elif free_plan is not None:
+            target_graph_action = "plan"
+            target_graph_text = f"📋 График {target_month_short} (авто)"
+        elif run is not None and run["status"] == "closed" and plan is not None:
+            target_graph_action = "plan"
+            target_graph_text = f"📋 График {target_month_short}"
+        else:
+            target_graph_action = "pfree"
+            target_graph_text = f"🧮 График {target_month_short} (авто)"
+
+        rows = [
+            [
+                readiness_button(
+                    "🔕 Выключить" if settings["enabled"] else "🟢 Включить",
+                    "toggle", service_id,
+                ),
+                readiness_button("👁 Обзор", "overview", service_id),
+            ],
+            *rows,
+            [
+                readiness_button(
+                    "↔️ «Наоборот» вкл" if settings["reverse_poll"]
+                    else "↔️ «Наоборот» выкл",
+                    "rev", service_id,
+                ),
+                readiness_button("📝 Тексты", "texts", service_id),
+            ],
+            [
+                readiness_button("⏳ Срок", "dur", service_id),
+                readiness_button("🕒 Начало", "time", service_id),
+                readiness_button("🏁 Окончание", "dlt", service_id),
+            ],
+            [
+                readiness_button("👥 Команда", "people", service_id, "o"),
+                readiness_button("🔢 В месяц", "lim", service_id),
+                readiness_button("🔔 Напоминание", "rem", service_id),
+            ],
+            [
+                readiness_button("📆 Дни служения", "days", service_id),
+                readiness_button("📅 Свой день", "own", service_id),
+            ],
+            [
+                readiness_button(
+                    f"📋 График {current_title}", current_graph_action,
+                    service_id, current_key.replace("-", ""),
+                ),
+                readiness_button(
+                    target_graph_text, target_graph_action, service_id,
+                    month_arg,
+                ),
+            ],
+            [
+                readiness_button("⬅️ К графику", "month", service_id),
+                readiness_button("❓ Справка", "help", service_id),
+            ],
+        ]
+        if run is not None and run["status"] == "open":
+            rows.append([
+                readiness_button("📋 Предварительный график", "pprev",
+                                 service_id, month_arg),
+                readiness_button("🔄 Перезапустить", "restart", service_id,
+                                 month_arg),
+            ])
+        elif run is not None and run["status"] == "closed":
+            rows.append([
+                readiness_button("▶️ Запустить заново", "restart", service_id,
+                                 month_arg),
+            ])
         if notice:
             lines = [notice, ""] + lines
         await _send_dialog(
@@ -5696,6 +5719,62 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             _dialog_keyboard_limit=sum(len(row) for row in rows),
             _dialog_keep_rows=True,
             # Экран раздела — одним сообщением (кнопки под всем текстом).
+            _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+            parse_mode=None,
+        )
+
+    async def show_readiness_overview(message: Message, service_id: str) -> None:
+        """Preview the actual intro, Telegram poll question, and options."""
+        registry = service_registry()
+        service = registry.get_service(service_id)
+        if service is None:
+            await _send_dialog(message, "Служение не найдено.", parse_mode=None)
+            return
+        now = datetime.now(context.timezone)
+        year, month = readiness.target_month(now.date())
+        key = f"{year:04d}-{month:02d}"
+        settings = registry.get_readiness_settings(service_id)
+        run = registry.get_readiness_run(service_id, key)
+        deadline = readiness.preview_deadline(
+            run, settings, year, month, now,
+        )
+        intro = readiness.intro_text(
+            service, registry.readiness_people(service_id), year, month,
+            deadline, context.timezone, settings.get("intro_template"),
+            readiness.phrase(settings, "own_days"), settings["reverse_poll"],
+        )
+        question = readiness.question_text(
+            service, year, month, settings.get("question_template"),
+            settings["reverse_poll"],
+        )
+        options = readiness.poll_options(
+            registry, service_id, year, month,
+            reverse_poll=settings["reverse_poll"],
+        )
+        labels = [item["label"] for item in options]
+        if settings["reverse_poll"]:
+            labels.append("✅ Смогу в любые даты")
+        labels.append(readiness.phrase(settings, "cant"))
+        chat_note = (
+            "⚠️ Чат служения не привязан — опрос не удастся отправить.\n\n"
+            if not service.get("group_chat_id") else ""
+        )
+        text = (
+            f"👁 Обзор опроса · {service_label(service)} · "
+            f"{month_title(year, month)}\n\n"
+            "💬 Сообщение перед опросом:\n"
+            f"{intro}\n\n"
+            "📊 Опрос в Telegram:\n"
+            f"{question}\n\n"
+            "Варианты ответа (можно выбрать несколько):\n"
+            + "\n".join(f"• {label}" for label in labels)
+            + "\n\nℹ️ Это только предпросмотр — сообщения в чат не отправлены."
+        )
+        await _send_dialog(
+            message, chat_note + text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                readiness_button("⬅️ К опросу", "open", service_id),
+            ]]),
             _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
             parse_mode=None,
         )
@@ -7200,6 +7279,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
                 await _answer_callback(callback)
                 return
+            if action == "cgraph":
+                current = now.date().replace(day=1)
+                if arg != current.strftime("%Y%m"):
+                    raise ValueError("Этот график больше не относится к текущему месяцу.")
+                await show_month_graph(
+                    callback.message, actor_id, service_id,
+                    month=current,
+                )
+                await _answer_callback(callback)
+                return
             if action in PLAN_ACTIONS:
                 await on_plan_action(
                     callback, action, service, arg, actor_id, now
@@ -7219,6 +7308,32 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             if action == "open":
                 pass
+            elif action == "overview":
+                await show_readiness_overview(callback.message, service_id)
+                await _answer_callback(callback)
+                return
+            elif action == "help":
+                await _send_dialog(
+                    callback.message,
+                    f"❓ {service_label(service)} › График › Опрос › Справка\n\n"
+                    "👁 Обзор показывает вступительное сообщение, вопрос и "
+                    "варианты опроса — без отправки в чат.\n\n"
+                    "🟢 Включить — разрешить автоматический запуск. Запуск "
+                    "вручную доступен отдельно.\n\n"
+                    "🗳 Запуск / ⏭ Пропуск — запустить опрос на месяц или "
+                    "не запускать его автоматически.\n\n"
+                    "↔️ «Наоборот» меняет смысл выбора: отмечайте даты, когда "
+                    "не сможете служить.\n\n"
+                    "«Команда», сроки и дни задают состав и параметры "
+                    "распределения. График становится действующим только "
+                    "после проверки и утверждения.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        readiness_button("⬅️ К опросу", "open", service_id),
+                    ]]),
+                    parse_mode=None,
+                )
+                await _answer_callback(callback)
+                return
             elif action == "toggle":
                 registry.set_readiness_settings(
                     actor_id, service_id, enabled=not settings["enabled"]
@@ -13219,6 +13334,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         ]
 
+    def replace_day_groups(
+        items: list[tuple],
+    ) -> list[tuple[date, list[tuple]]]:
+        days: list[tuple[date, list[tuple]]] = []
+        for day, task, names in items:
+            if not days or days[-1][0] != day:
+                days.append((day, []))
+            days[-1][1].append((task, names))
+        return days
+
     def replace_month_text(pending: dict) -> str:
         """Текущий график месяца выбранной недели (решение 17, 5в): все
         задачи и назначения с заменами, выбранная неделя — ▶️."""
@@ -13235,23 +13360,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"📋 График на {month_title(sunday.year, sunday.month)} "
             f"({source}, с заменами):"
         ]
+        first_week = True
         for block in pending.get("month_weeks") or pending["weeks"]:
             if (block["date"].year, block["date"].month) != (
                 sunday.year, sunday.month
             ):
                 continue
+            if not first_week:
+                lines.append("")
+            first_week = False
             mark = "▶️" if block["date"] == sunday else "🗓"
             lines.append(f"{mark} {week_title(block)}")
-            by_day: dict = {}
-            for day, task, names in week_items(block, pending["service_id"]):
-                by_day.setdefault(day, []).append(
-                    f"{task_emoji(task)} {task}: {', '.join(names)}"
+            for day_index, (day, tasks) in enumerate(
+                replace_day_groups(week_items(block, pending["service_id"]))
+            ):
+                if day_index:
+                    lines.append("")
+                lines.append(f"   {_WEEKDAYS[day.weekday()]} {day:%d.%m}:")
+                lines.extend(
+                    f"      {task_emoji(task)} {task}: {', '.join(names)}"
+                    for task, names in tasks
                 )
-            lines += [
-                f"   {_WEEKDAYS[day.weekday()]} {day:%d.%m} — "
-                + "; ".join(parts)
-                for day, parts in by_day.items()
-            ]
         return "\n".join(lines)
 
     def replace_bottom(pending: dict, back: str = "week") -> list:
@@ -13339,9 +13468,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"{title}\n⚪ В этом и следующем месяце назначений в графике "
                 "нет."
             )
+        elif notice:
+            text = (
+                f"{title}\n\n{notice}\n\n"
+                "ℹ️ Выберите неделю, затем задачу — замена действует только "
+                "на её дату."
+            )
         else:
             text = (
-                f"{title}\n{notice + chr(10) if notice else ''}"
+                f"{title}\n"
                 "ℹ️ Выберите неделю, затем задачу — замена действует только "
                 "на её дату."
             )
@@ -13360,21 +13495,24 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending["step"] = "replace_week"
         for key in ("event", "task", "old_name", "task_people", "substitute"):
             pending.pop(key, None)
-        lines = [
-            f"🔁 {pending['label']} › График › Замены",
-            *([notice] if notice else []),
+        lines = [f"🔁 {pending['label']} › График › Замены"]
+        if notice:
+            lines.extend(["", notice])
+        lines.extend([
             "",
             replace_month_text(pending),
             "",
             f"Неделя {week_title(pending['week'])}:",
-            *(
-                f"   {task_emoji(task)} {task} — {day:%d.%m} — "
-                + ", ".join(names)
-                for day, task, names in items
-            ),
-            "",
-            "ℹ️ Выберите задачу.",
-        ]
+        ])
+        for day_index, (day, tasks) in enumerate(replace_day_groups(items)):
+            if day_index:
+                lines.append("")
+            lines.append(f"   {_WEEKDAYS[day.weekday()]} {day:%d.%m}:")
+            lines.extend(
+                f"      {task_emoji(task)} {task} — {', '.join(names)}"
+                for task, names in tasks
+            )
+        lines.extend(["", "ℹ️ Выберите задачу."])
         rows = [
             [replace_button(
                 f"{task_emoji(task)} {task} · {_WEEKDAYS[day.weekday()]} "
@@ -13398,8 +13536,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             message,
             f"🔁 Замены · {pending['label']}\n\n"
             f"{replace_month_text(pending)}\n\n"
-            f"«{pending['task']}» · {pending['event'].event_date:%d.%m.%Y}\n"
-            "ℹ️ Кого нужно заменить?",
+            f"«{pending['task']}» · {pending['event'].event_date:%d.%m.%Y}"
+            "\n\nℹ️ Кого нужно заменить?",
             rows,
         )
 
@@ -13452,7 +13590,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"{replace_month_text(pending)}\n\n"
             f"«{pending['task']}» · "
             f"{pending['event'].event_date:%d.%m.%Y}\n"
-            f"Вместо: {pending['old_name']}\n"
+            f"Вместо: {pending['old_name']}\n\n"
             + (
                 "ℹ️ Выберите, кто заменит (люди служения с этой задачей; ⚪ — "
                 "без Telegram), или выберите пользователя Telegram."
@@ -13479,7 +13617,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"🗓 {pending['event'].event_date:%d.%m.%Y} · "
             f"«{pending['task']}»\n"
             f"{pending['old_name']} → "
-            f"{person_label(substitute['name'], substitute.get('username'))}\n"
+            f"{person_label(substitute['name'], substitute.get('username'))}"
+            "\n\n"
             "ℹ️ Замена действует только на эту дату и главнее графика. Чат "
             "служения, админы и заменяющий получат сообщение.",
             rows,

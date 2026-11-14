@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from bot import readiness
 from bot.excel_parser import RosterMember
 from bot.service_registry import ServiceRegistry
+from bot.ui import plain_text, render_screen_chunks
 
 TZ = ZoneInfo("Europe/Moscow")
 LOG = logging.getLogger("test-readiness")
@@ -141,26 +142,40 @@ class ReadinessDatesTest(unittest.TestCase):
             readiness.option_label("2026-11-01", (-1, 1)), "сб 31.10–пн 02.11"
         )
         people = [
-            {"name": "Катя Степанова", "tasks": ["уборка"], "day_offset": -3},
+            {"name": "Катя Степанова", "tasks": ["уборка"], "day_offset": -3,
+             "telegram_id": 321, "username": "katya"},
             {"name": "Анна", "tasks": ["уборка"], "day_offset": None},
             {"name": "Ушёл", "tasks": [], "day_offset": -1},
         ]
         self.assertEqual(
-            readiness.own_days_note(people),
+            plain_text(readiness.own_days_note(people)),
             "📅 Свой день: Катя Степанова — по четвергам",
         )
         self.assertEqual(readiness.own_days_note(people[1:]), "")
         twins = [
-            {"name": "Аня", "key": "Аня · 1", "tasks": ["у"], "day_offset": -3,
-             "username": "anya1"},
-            {"name": "Аня", "key": "Аня · 2", "tasks": ["у"], "day_offset": -1},
+            {"name": "Аня", "key": "Аня · 123", "tasks": ["у"], "day_offset": -3,
+             "username": "anya1", "telegram_id": 123},
+            {"name": "Аня", "key": "Аня · 456", "tasks": ["у"], "day_offset": -1,
+             "telegram_id": 456},
             {"name": "Вика", "key": "Вика", "tasks": ["у"], "day_offset": -2,
              "in_roster": False},
         ]
         self.assertEqual(
-            readiness.own_days_note(twins),
-            "📅 Свой день: Аня (@anya1) — по четвергам; Аня · 2 — по субботам",
+            plain_text(readiness.own_days_note(twins)),
+            "📅 Свой день: Аня (1) — по четвергам; Аня (2) — по субботам",
         )
+        self.assertIn(
+            '<a href="tg://user?id=123">Аня (1)</a>',
+            "".join(render_screen_chunks(readiness.own_days_note(twins))),
+        )
+        self.assertIn(
+            '<a href="tg://user?id=456">Аня (2)</a>',
+            "".join(render_screen_chunks(readiness.own_days_note(twins))),
+        )
+        note = readiness.own_days_note(twins)
+        self.assertNotIn("123", plain_text(note))
+        self.assertNotIn("456", plain_text(note))
+        self.assertNotIn("@anya1", readiness.own_days_note(twins))
         service = {"name": "Звук"}
         self.assertEqual(
             readiness.question_text(service, 2026, 11, "👥"),
@@ -267,7 +282,10 @@ class ReadinessFlowTest(unittest.TestCase):
         options = bot.send_poll.await_args.kwargs["options"]
         self.assertEqual(options[0], "29.10 — звук")
         intro = bot.send_message.await_args.args[1]
-        self.assertIn("📅 Свой день: Алексей — по четвергам", intro)
+        self.assertIn(
+            '<a href="tg://user?id=501">Алексей</a> — по четвергам', intro,
+        )
+        self.assertNotIn("@", intro)
 
     def test_launch_snapshots_date_options_and_reverse_mode(self):
         self.registry.set_service_task_day(1001, "sound", "сборка", -3)
@@ -387,9 +405,10 @@ class ReadinessFlowTest(unittest.TestCase):
             bot.send_poll.await_args.kwargs["options"][-1], "🙈 Пропускаю месяц"
         )
         self.assertIn(
-            "🗓 Особые дни: Алексей — по четвергам",
+            '<a href="tg://user?id=501">Алексей</a> — по четвергам',
             bot.send_message.await_args.args[1],
         )
+        self.assertNotIn("@", bot.send_message.await_args.args[1])
 
     def test_poll_question_template(self):
         self.registry.set_readiness_settings(

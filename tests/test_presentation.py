@@ -20,19 +20,20 @@ class FormatTaskAssignmentsTest(unittest.TestCase):
             self.assignments, self.contacts, mark_unlinked=True
         )
 
-        self.assertIn(f"• {user_link(12345, 'Алексей (@alex)')}", text)
+        self.assertIn(f"• {user_link(12345, 'Алексей')}", text)
         self.assertIn(f"• {user_link(67890, 'Мария')}", text)
         self.assertEqual(
             plain_text(text),
             "🎚️ Микшер\n"
-            "• Алексей (@alex)\n"
+            "• Алексей\n"
             "• Мария\n"
-            "• Иван (@ivan)\n"
+            "• Иван\n"
             "• Олег · не привязан",
         )
         rendered = "".join(render_screen_chunks(text, limit=4096))
-        self.assertIn('<a href="tg://user?id=12345">Алексей (@alex)</a>', rendered)
+        self.assertIn('<a href="tg://user?id=12345">Алексей</a>', rendered)
         self.assertIn('<a href="tg://user?id=67890">Мария</a>', rendered)
+        self.assertNotIn("@alex", rendered)
         self.assertNotIn("\x00", rendered)
 
     def test_unlinked_mark_is_optional(self):

@@ -27,6 +27,7 @@ reminder_bot_logs_backup/
 logs_backup/
 
 # Служебное
+.tmp/
 .run_state/
 *.log
 qodo_review.md

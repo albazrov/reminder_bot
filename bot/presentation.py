@@ -82,17 +82,15 @@ def person_label(
     mark_unlinked: bool = False,
     display_names: Mapping[str, str] | None = None,
 ) -> str:
-    """Имя ответственного: ссылка на Telegram, если человек привязан."""
+    """Имя ответственного: ссылка по Telegram ID, без показа username."""
     contact = (contacts or {}).get((task, name))
-    username = contact.get("username") if contact else None
     shown_name = (display_names or {}).get(name) or display_name(contact, name)
-    label = f"{shown_name} (@{username})" if username else shown_name
     telegram_id = contact.get("telegram_id") if contact else None
     if telegram_id:
-        return user_link(telegram_id, label)
+        return user_link(telegram_id, shown_name)
     if contact is None and mark_unlinked:
         return f"{shown_name} · не привязан"
-    return label
+    return shown_name
 
 
 def format_task_responsibles(
