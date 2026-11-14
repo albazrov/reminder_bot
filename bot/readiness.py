@@ -724,22 +724,27 @@ def run_option_label(run: dict, day: str) -> str:
 
 def own_days_note(people: list[dict], title: str | None = None) -> str:
     """Сноска к опросу: у кого свой день служения."""
-    def label(person: dict) -> str:
-        # Однофамильцы различаются: @username, иначе ключ состава.
-        if person.get("key", person["name"]) == person["name"]:
-            return person["name"]
-        if person.get("username"):
-            return f"{person['name']} (@{person['username']})"
-        return person["key"]
-
     # Выбывшие из состава в сноску не попадают.
-    own = [
-        f"{label(person)} — "
-        + WEEKDAYS_PLURAL[(6 + person["day_offset"]) % 7]
+    people_with_own_days = [
+        person
         for person in people
         if person["tasks"] and person.get("day_offset") is not None
         and person.get("in_roster", True)
     ]
+    name_counts: dict[str, int] = {}
+    for person in people_with_own_days:
+        name_counts[person["name"]] = name_counts.get(person["name"], 0) + 1
+    name_indexes: dict[str, int] = {}
+    own = []
+    for person in people_with_own_days:
+        name = person["name"]
+        if name_counts[name] > 1:
+            name_indexes[name] = name_indexes.get(name, 0) + 1
+            name = f"{name} ({name_indexes[name]})"
+        own.append(
+            f"{user_link(person.get('telegram_id'), name)} — "
+            f"{WEEKDAYS_PLURAL[(6 + person['day_offset']) % 7]}"
+        )
     title = title or READINESS_PHRASES["own_days"][0]
     return (f"{title} " + "; ".join(own)) if own else ""
 

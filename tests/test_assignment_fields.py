@@ -142,7 +142,7 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertIn('<a href="tg://user?id=503">C</a>', rendered)
         self.assertNotIn("@", rendered)
 
-    def test_week_shows_usernames_and_links_without_changing_other_service(self):
+    def test_week_shows_id_links_without_usernames_or_changing_other_service(self):
         self.registry.set_responsible_contact(
             1001, "sound", "звук", "A", 501, username="sound_user",
         )
@@ -154,23 +154,24 @@ class AssignmentFieldsTest(unittest.TestCase):
         )
         result = self.resolve("{week_task_assignments}\n" + assignment_field("order"))
         rendered = render_screen_chunks(result.week)[0]
-        self.assertIn('<a href="tg://user?id=501">A (@sound_user)</a>', rendered)
-        self.assertIn('спевка — 31.12 — <a href="tg://user?id=503">C (@rehearsal_user)</a>', rendered)
+        self.assertIn('<a href="tg://user?id=501">A</a>', rendered)
+        self.assertIn('спевка — 31.12 — <a href="tg://user?id=503">C</a>', rendered)
         self.assertIn('<a href="tg://user?id=502">B</a>', rendered)
         self.assertNotIn("@other_user", result.services["order"])
         self.assertNotIn("LINK:", result.services["order"])
         self.assertEqual(self.resolve(assignment_field("sound")).services["sound"].count("@"), 0)
 
-    def test_week_username_change_invalidates_preview_state(self):
+    def test_week_username_change_does_not_change_rendered_state(self):
         before = self.resolve()
         self.registry.set_responsible_contact(
             1001, "sound", "звук", "A", 501, username="new_user",
         )
         after = self.resolve()
-        self.assertNotEqual(before.state, after.state)
-        self.assertIn("A (@new_user)", plain_text(after.week))
+        self.assertEqual(before.state, after.state)
+        self.assertEqual(plain_text(before.week), plain_text(after.week))
+        self.assertNotIn("@new_user", after.week)
 
-    def test_week_replacement_uses_substitute_username(self):
+    def test_week_replacement_uses_substitute_id_link_without_username(self):
         self.registry.set_responsible_contact(
             1001, "sound", "сборка", "B", 502, username="substitute",
         )
@@ -179,10 +180,11 @@ class AssignmentFieldsTest(unittest.TestCase):
             telegram_id=502, username="substitute", source="admin", created_by=1001,
         )
         text = render_screen_chunks(self.resolve().week)[0]
-        self.assertIn('звук — <a href="tg://user?id=502">B (@substitute)</a>', text)
+        self.assertIn('звук — <a href="tg://user?id=502">B</a>', text)
+        self.assertNotIn("@substitute", text)
         self.assertNotIn(">A</a>", text)
 
-    def test_week_external_replacement_uses_saved_identity_and_username(self):
+    def test_week_external_replacement_uses_saved_identity_without_username(self):
         self.registry.set_replacement(
             "sound", SUNDAY.isoformat(), "звук", "A", "External <name>",
             telegram_id=699, username="external", source="admin", created_by=1001,
@@ -190,7 +192,7 @@ class AssignmentFieldsTest(unittest.TestCase):
         before = self.resolve()
         text = render_screen_chunks(before.week)[0]
         self.assertIn(
-            'звук — <a href="tg://user?id=699">External &lt;name&gt; (@external)</a>',
+            'звук — <a href="tg://user?id=699">External &lt;name&gt;</a>',
             text,
         )
         self.assertNotIn(">A</a>", text)
@@ -200,8 +202,8 @@ class AssignmentFieldsTest(unittest.TestCase):
                 "WHERE service_id = 'sound' AND old_name = 'A'",
             )
         after = self.resolve()
-        self.assertIn("External <name> (@updated)", plain_text(after.week))
-        self.assertNotEqual(before.state, after.state)
+        self.assertIn("External <name>", plain_text(after.week))
+        self.assertEqual(before.state, after.state)
         other = self.resolve(assignment_field("sound")).services["sound"]
         self.assertIn("External <name>", other)
         self.assertNotIn("@updated", other)
@@ -217,7 +219,7 @@ class AssignmentFieldsTest(unittest.TestCase):
             telegram_id=700, username="final", source="admin", created_by=1001,
         )
         text = render_screen_chunks(self.resolve().week)[0]
-        self.assertIn('звук — <a href="tg://user?id=700">Final (@final)</a>', text)
+        self.assertIn('звук — <a href="tg://user?id=700">Final</a>', text)
         self.assertNotIn("@external", text)
 
     def test_external_replacement_keeps_each_dates_saved_label(self):
@@ -230,8 +232,8 @@ class AssignmentFieldsTest(unittest.TestCase):
             telegram_id=699, username="new_user", source="admin", created_by=1001,
         )
         text = render_screen_chunks(self.resolve().week)[0]
-        self.assertIn('спевка — 31.12 — <a href="tg://user?id=699">Old Name (@old_user)</a>', text)
-        self.assertIn('звук — <a href="tg://user?id=699">New Name (@new_user)</a>', text)
+        self.assertIn('спевка — 31.12 — <a href="tg://user?id=699">Old Name</a>', text)
+        self.assertIn('звук — <a href="tg://user?id=699">New Name</a>', text)
 
     def test_external_replacement_on_two_dates_keeps_both_mentions(self):
         for day, task, original in (
@@ -243,10 +245,10 @@ class AssignmentFieldsTest(unittest.TestCase):
                 telegram_id=699, username="external", source="admin", created_by=1001,
             )
         text = render_screen_chunks(self.resolve().week)[0]
-        self.assertIn('спевка — 31.12 — <a href="tg://user?id=699">External (@external)</a>', text)
-        self.assertIn('звук — <a href="tg://user?id=699">External (@external)</a>', text)
+        self.assertIn('спевка — 31.12 — <a href="tg://user?id=699">External</a>', text)
+        self.assertIn('звук — <a href="tg://user?id=699">External</a>', text)
 
-    def test_external_replacement_for_two_people_is_shown_once_with_latest_username(self):
+    def test_external_replacement_for_two_people_is_shown_once_without_username(self):
         self.plan("sound", {"звук": ["A", "B"]})
         for original, username in (("A", "old_user"), ("B", "new_user")):
             self.registry.set_replacement(
@@ -256,7 +258,8 @@ class AssignmentFieldsTest(unittest.TestCase):
         value = self.resolve().week
         text = render_screen_chunks(value)[0]
         self.assertEqual(text.count('tg://user?id=699'), 1)
-        self.assertIn('External (@new_user)', text)
+        self.assertIn('External</a>', text)
+        self.assertNotIn('@new_user', text)
         self.assertNotIn('@old_user', text)
 
     def test_week_unlinked_username_and_html_are_rendered_safely(self):
@@ -274,7 +277,8 @@ class AssignmentFieldsTest(unittest.TestCase):
 
         with patch.object(self.registry, "readiness_people", side_effect=people):
             text = render_screen_chunks(self.resolve().week)[0]
-        self.assertIn("Guest &lt;name&gt; (@guest)", text)
+        self.assertIn("Guest &lt;name&gt;", text)
+        self.assertNotIn("@guest", text)
         self.assertNotIn("tg://user", text)
 
     def test_week_namesakes_keep_exact_identity_and_escape_names(self):
@@ -295,8 +299,8 @@ class AssignmentFieldsTest(unittest.TestCase):
         }
         self.plan("sound", {"звук": [people[601]], "сборка": [people[602]]})
         text = render_screen_chunks(self.resolve().week)[0]
-        self.assertIn('<a href="tg://user?id=601">Same &lt;name&gt; (@first)</a>', text)
-        self.assertIn('<a href="tg://user?id=602">Same &lt;name&gt; (@second)</a>', text)
+        self.assertIn('<a href="tg://user?id=601">Same &lt;name&gt;</a>', text)
+        self.assertIn('<a href="tg://user?id=602">Same &lt;name&gt;</a>', text)
 
     def test_namesakes_keep_exact_identity_and_safe_mentions(self):
         self.registry.set_responsible_contact(
@@ -912,7 +916,8 @@ class AssignmentFieldsTest(unittest.TestCase):
         sends = [call for call in bot.send_message.await_args_list if call.args[0] == -10002]
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0].args[1], render_screen_chunks(preview["text"])[0])
-        self.assertIn('<a href="tg://user?id=501">A (@sound_user)</a>', sends[0].args[1])
+        self.assertIn('<a href="tg://user?id=501">A</a>', sends[0].args[1])
+        self.assertNotIn("@sound_user", sends[0].args[1])
         self.assertIn("⭐ старший — D", sends[0].args[1])
         self.assertNotIn("@other_user", sends[0].args[1])
         self.registry.set_replacement(

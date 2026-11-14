@@ -17,6 +17,7 @@ from .admin_report import refresh_admin_reports, report_recipients
 from .group_send import send_to_service_group
 from .presentation import apply_replacements, is_replaced  # noqa: F401
 from .service_registry import StaleReplacementRequest
+from .ui import send_telegram_screen, user_link
 
 POLL_COLLECT = timedelta(hours=12)
 # Ответы собираются не позже чем за 12 часов до начала дня события.
@@ -161,12 +162,16 @@ async def _start_replacement_search_locked(
             "Чат служения не привязан — опрос не запущен."
         )
     try:
+        notice_text = (
+            f"🚫 {user_link(old_telegram_id, old_name)} не сможет участвовать "
+            f"в задаче «{task}» {date_text}. Нужна замена — ответьте в опросе до "
+            f"{_local(deadline, tz)}."
+        )
         notice = await send_to_service_group(
-            bot.send_message, chat_id,
-            f"🚫 {old_name} не сможет участвовать в задаче «{task}» "
-            f"{date_text}. Нужна замена — ответьте в опросе до "
-            f"{_local(deadline, tz)}.",
-            service, registry=registry, logger=logger, parse_mode=None,
+            lambda target, text, **kwargs: send_telegram_screen(
+                bot.send_message, target, text, limit=4096, **kwargs,
+            ),
+            chat_id, notice_text, service, registry=registry, logger=logger,
         )
         poll_message = await send_to_service_group(
             bot.send_poll, chat_id,
@@ -456,24 +461,36 @@ async def _announce_replacement(
         except (PermissionError, ValueError):
             pass
     date_text = f"{event_date:%d.%m.%Y}"
-    label = person_label(substitute["name"], substitute.get("username"))
-    text = (
-        f"✅ Замена: «{task}» {date_text} — {label} вместо {old_name}."
+    old_contact = registry.get_responsible_contact(
+        service["id"], task, old_name,
+    )
+    group_text = (
+        f"✅ Замена: «{task}» {date_text} — "
+        f"{user_link(substitute.get('telegram_id'), substitute['name'])} "
+        f"вместо {user_link((old_contact or {}).get('telegram_id'), old_name)}."
+    )
+    admin_text = (
+        f"✅ Замена: «{task}» {date_text} — "
+        f"{person_label(substitute['name'], substitute.get('username'))} "
+        f"вместо {old_name}."
     )
     how = "по опросу" if source == "poll" else "назначил админ"
     failed: list[str] = []
     if service.get("group_chat_id") and service.get("enabled", True):
         try:
             await send_to_service_group(
-                bot.send_message, service["group_chat_id"], text, service,
-                registry=registry, logger=logger, parse_mode=None,
+                lambda target, text, **kwargs: send_telegram_screen(
+                    bot.send_message, target, text, limit=4096, **kwargs,
+                ),
+                service["group_chat_id"], group_text, service,
+                registry=registry, logger=logger,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось объявить замену в чате служения")
             failed.append("чат служения")
     if await _notify(
         bot, report_recipients(registry, service["id"], admin_actor_id),
-        f"{text} ({service['name']}, {how})", logger,
+        f"{admin_text} ({service['name']}, {how})", logger,
     ):
         failed.append("админы")
     if substitute.get("telegram_id") and await _notify(

@@ -1474,7 +1474,8 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     if call.args[0] == -10001
                 )
                 self.assertIn("Ведущий:", group_text)
-                self.assertIn("anna_lead", group_text)
+                self.assertIn('<a href="tg://user?id=2002">Анна</a>', group_text)
+                self.assertNotIn("@anna_lead", group_text)
                 self.assertNotIn("Иван", group_text)
 
                 other_date = date(2026, 10, 18) - timedelta(
