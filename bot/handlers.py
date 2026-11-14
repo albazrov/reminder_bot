@@ -13180,6 +13180,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             telegram_id, admin_actor_id=context.admin_id,
             tz=context.timezone, logger=debug,
             schedule_close=getattr(context, "schedule_replacement_close", None),
+            notify_group=False,
         )
 
     async def close_replacement_poll(
@@ -15774,22 +15775,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "status=%s",
                 service_id, task, cb.from_user.id, event_date, status,
             )
-            if status == "confirmed" and service_id == "assembly" and service:
-                # Как прежде у Собрания: подтверждение видно в группе.
-                try:
-                    await send_to_service_group(
-                        context.bot.send_message,
-                        service["group_chat_id"],
-                        f"🔔 Участник {name} подтвердил задачу «{task}»",
-                        service,
-                        registry=registry,
-                        logger=debug,
-                        parse_mode=None,
-                    )
-                except Exception:  # noqa: BLE001
-                    debug.exception("Не удалось отправить апдейт в группу")
             if status == "declined" and service:
-                # Поиск замены (этап 3.3).
+                # Сохраняем запрос для админа без публикации личного ответа.
                 on_declined = getattr(context, "on_assignment_declined", None)
                 if callable(on_declined):
                     try:
