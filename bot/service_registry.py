@@ -372,6 +372,8 @@ class ServiceRegistry:
                     day_to INTEGER NOT NULL DEFAULT 0,
                     reverse_poll INTEGER NOT NULL DEFAULT 0
                         CHECK (reverse_poll IN (0, 1)),
+                    dates_only INTEGER NOT NULL DEFAULT 0
+                        CHECK (dates_only IN (0, 1)),
                     updated_at TEXT NOT NULL
                 );
 
@@ -1016,6 +1018,8 @@ class ServiceRegistry:
                 ("readiness_settings", "day_from", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "day_to", "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "reverse_poll",
+                 "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "dates_only",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("service_members", "day_offset", "INTEGER"),
                 ("service_members", "month_min", "INTEGER"),
@@ -6331,6 +6335,7 @@ class ServiceRegistry:
         "day_from": 0,
         "day_to": 0,
         "reverse_poll": False,
+        "dates_only": False,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -6341,7 +6346,7 @@ class ServiceRegistry:
                 "closed_template, chat_reminder_template, question_template, "
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
-                "people_needed, people_max, day_from, day_to, reverse_poll "
+                "people_needed, people_max, day_from, day_to, reverse_poll, dates_only "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
@@ -6352,6 +6357,7 @@ class ServiceRegistry:
         settings = {
             **dict(row), "enabled": bool(row["enabled"]),
             "reverse_poll": bool(row["reverse_poll"]),
+            "dates_only": bool(row["dates_only"]),
         }
         settings["phrases"] = json.loads(settings.pop("phrases_json") or "{}")
         return settings
@@ -6381,6 +6387,8 @@ class ServiceRegistry:
             raise ValueError("enabled должен быть логическим значением")
         if not isinstance(new["reverse_poll"], bool):
             raise ValueError("reverse_poll должен быть логическим значением")
+        if not isinstance(new["dates_only"], bool):
+            raise ValueError("dates_only должен быть логическим значением")
         for key in ("start_time", "deadline_time"):
             if not isinstance(new[key], str) or not re.fullmatch(
                 r"(?:[01]\d|2[0-3]):[0-5]\d", new[key]
@@ -6471,9 +6479,9 @@ class ServiceRegistry:
                 "closed_template, chat_reminder_template, question_template, "
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
-                "people_needed, people_max, day_from, day_to, reverse_poll, "
+                "people_needed, people_max, day_from, day_to, reverse_poll, dates_only, "
                 "updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -6494,6 +6502,7 @@ class ServiceRegistry:
                 "people_max = excluded.people_max, "
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
                 "reverse_poll = excluded.reverse_poll, "
+                "dates_only = excluded.dates_only, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
@@ -6507,7 +6516,7 @@ class ServiceRegistry:
                     new["month_min"], new["month_max"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"],
-                    int(new["reverse_poll"]), now,
+                    int(new["reverse_poll"]), int(new["dates_only"]), now,
                 ),
             )
             if (new["day_from"], new["day_to"]) != (

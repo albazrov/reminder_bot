@@ -30,8 +30,8 @@ current environment.
 |---|---|---|
 | Checkout | `/Users/alex/projects/app/reminder_bot_fork`, branch `dev` | `/mnt/external_data/reminder_bot/test`; prod: `/home/pi/app/reminder_bot/prod` |
 | `$PY` | `/Users/alex/projects/.venv/bin/python` (shared venv; never create a new one; install with `$PY -m pip install -r requirements.txt`) | `/home/pi/.venv/bin/python` |
-| Temp files, test `TMPDIR`, scratch worktrees | `/Users/alex/projects/.tmp/reminder_bot` (not `/tmp`, not the project folder) | `/dev/shm/app/reminder_bot/src/.tmp` (RAM, not the SD card) |
-| Diagnostic workbooks/logs | `/Users/alex/projects/.tmp/reminder_bot/debug/` (dir 700, files 600) | `/dev/shm/reminder_bot/debug/` (dir 700, files 600) |
+| Temp files, test `TMPDIR`, scratch worktrees | Inside the project (`.tmp/tests/` for tests), or at most one directory above its root; never system temp directories | `/dev/shm/app/reminder_bot/src/.tmp` (RAM, not the SD card) |
+| Diagnostic workbooks/logs | Inside project `.tmp/debug/` (dir 700, files 600); never commit or print private participant data | `/dev/shm/reminder_bot/debug/` (dir 700, files 600) |
 | Role | write code, run tests, open PRs | run the bot (test/prod); code arrives only through GitHub |
 | Bot process | never run with the test/prod `BOT_TOKEN` (two pollers on one token conflict); a local run needs a separate dev bot token | `manage.sh` / cron watchdog; do not stop, restart or deploy without an explicit request |
 | Tests | `TMPDIR=… $PY -m unittest discover -s tests -q > <tmp>/full.log 2>&1` in the background; some tests are skipped on macOS (POSIX-only) | run in the background too: a heavy foreground run can be killed (exit 137) |
@@ -76,7 +76,22 @@ Raspberry Pi specifics:
   they are not implemented in the current work. Check for duplicates first;
   update an existing issue when appropriate and share the issue link.
 
-## Status snapshot (09.11.2026)
+## Release checkpoint (14.11.2026)
+
+- Participant name links, replacement-menu formatting, and readiness-poll
+  overview are committed as `5fd9068` and `d380074` on `dev`.
+- PR #56 (`dev` → `test`) is merged as `7512491`; CI and test deployment
+  passed. PR #57 (`test` → `main`) is merged as `852ea376`; CI, review (5/5,
+  no actionable findings), and production workflow `43584342858` passed.
+  Manual Telegram acceptance was not performed.
+- The new poll-format package (`dates_only`, full overview despite the option
+  limit, no extra home button) is prepared for the next release; its final
+  deployment status must be checked separately.
+- Full local validation after the review fix: 985 tests, 11 skipped.
+  Re-check GitHub before any further release action; this is a dated
+  checkpoint, not permission to merge or deploy.
+
+## Historical status snapshot (09.11.2026)
 
 - The backup reliability work is released to prod. Latest prod commit:
   `e46d6c8607c519c7321f19908d70cd82e0715757`; workflow `41918073648` passed.
@@ -398,6 +413,32 @@ Raspberry Pi specifics:
 
 ### Stage 5: readiness poll and schedule planning
 
+- Readiness settings use the explicitly requested eight-row layout:
+  enable / overview; launch / skip; reverse / texts; duration / start / end;
+  team / monthly limits / reminder; service days / own day; current / target
+  month graphs; back / help. The settings label is «👥 Команда»; task settings
+  may still use «👥 Нужно людей». Open/closed poll lifecycle actions replace
+  the launch row and add state-specific actions below the settings.
+  A skipped month offers only unskip, then normal launch.
+- The reverse / texts row also includes «📋 Варианты»: `dates_only`
+  (boolean readiness setting, default false) selects dates with tasks or
+  only actual calendar dates. Date-only options carry `date_only: True`;
+  use `option_task` to preserve date keys even for a single task. Selection
+  applies only to eligible tasks on that actual day, not the entire week.
+  Options are snapshotted in the run; changing settings must not reinterpret
+  existing answers. Reverse mode works in both formats.
+- `show_readiness_overview` uses `intro_text`, `question_text`, and
+  `poll_options`, including reverse-mode and final options, without sending
+  an intro or poll to the service chat. It displays `preview_note` explaining
+  the deadline source and warns that manual launch recalculates the deadline
+  from the current time. Tests must assert no `send_poll`.
+  Overview passes `validate_limit=False` to show all options with a warning;
+  real launch still enforces the 12-option limit including final choices.
+  These complete screens supply their own back navigation and suppress
+  automatic error-navigation buttons (`_dialog_error_navigation=False`).
+- Replacement menus separate days with blank lines and put tasks on new
+  lines; status messages separate the completed action from extra guidance.
+
 - `bot/schedule_planner.py` is pure (no Telegram/DB): `PlanInput` (dates,
   `needed` per task, `free` dates per person, `tasks` per person = «Списки»
   ∪ bot bindings, `last_served` from the previous month) → `build_plan` →
@@ -712,7 +753,9 @@ Raspberry Pi specifics:
   service_name/month/month_in, ≤300, sent with `question_parse_mode=None`,
   blank → default); «📝 Тексты» (`show_readiness_texts`, kind "q").
   Poll options by day window (`readiness.option_label`), intro footnote
-  `own_days_note` (readiness_people `in_roster`, @username for same names).
+  `own_days_note` (`readiness_people.in_roster`) labels namesakes as
+  `Имя (1)`, `Имя (2)`;
+  never expose their internal key, Telegram ID, or username in the label.
 - Reverse mode («↔️ Наоборот», `readiness_settings.reverse_poll`, snapshotted
   in `readiness_runs.reverse_poll`): marked options mean «cannot»;
   `question_text(..., reverse_poll)` and `intro_text(..., reverse_poll)` use
@@ -759,7 +802,12 @@ Raspberry Pi specifics:
   marker string. Markers are never split across chunks; a link label longer
   than the screen is shown as plain text. Malformed markers render as
   literal text instead of raising. Templates reject `\x00`.
-- Linked contacts render as `Имя (@username)` wrapped in a mention.
+- In messages about the current service, linked participants render as
+  `user_link(telegram_id, name)`: only the name is visible, without username.
+  Keep an unbound name as plain text; do not guess an account by name.
+  Administrator account-identification and binding screens may retain
+  usernames. Group replacement announcements use the shared HTML renderer,
+  not raw rich-text markers or hand-built HTML.
 
 ### Roles, /start, and command menus
 

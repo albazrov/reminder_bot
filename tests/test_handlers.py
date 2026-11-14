@@ -6917,7 +6917,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 f"⏭ Пропуск {target_name[:3].capitalize()}",
             ])
             self.assertEqual(
-                labels[2], ["↔️ «Наоборот» выкл", "📝 Тексты"]
+                labels[2], ["↔️ «Наоборот» выкл", "📝 Тексты", "📋 Варианты"]
             )
             self.assertEqual(
                 labels[3], ["⏳ Срок", "🕒 Начало", "🏁 Окончание"]
@@ -6951,6 +6951,43 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             first_sunday = first + timedelta(days=(6 - first.weekday()) % 7)
             self.assertIn(f"• {first_sunday:%d.%m} — звук", text)
             self.assertIn("Это только предпросмотр", text)
+            self.context.bot.send_poll.assert_not_awaited()
+
+            formats = await press("rdy:format:sound")
+            self.assertIn("Только даты", formats.message.answer.await_args.args[0])
+            changed = await press("rdy:fmt:sound:dates")
+            self.assertIn("только даты", changed.message.answer.await_args.args[0])
+            self.assertTrue(self.registry.get_readiness_settings("sound")["dates_only"])
+            preview = await press("rdy:overview:sound")
+            text = preview.message.answer.await_args.args[0]
+            self.assertIn(f"• {first_sunday:%d.%m}\n", text)
+            self.assertNotIn(" — звук", text)
+            await press("rdy:fmt:sound:tasks")
+
+            self.registry.sync_service_rosters({"sound": [
+                RosterMember("Участник графика", ("звук", "сборка", "спевка")),
+            ]})
+            self.registry.set_service_task_enabled(67890, "sound", "спевка", True)
+            overflow = await press("rdy:overview:sound")
+            overflow_text = overflow.message.answer.await_args.args[0]
+            self.assertIn("Telegram допускает не более 12", overflow_text)
+            self.assertIn("📊 Опрос в Telegram", overflow_text)
+            self.assertIn(" — спевка", overflow_text)
+            overflow_rows = overflow.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertFalse(any(
+                b.text == "🏠 В начало" for row in overflow_rows for b in row
+            ))
+            failed = await press(
+                f"rdy:start:sound:{target_year:04d}{target_month:02d}"
+            )
+            failed_rows = failed.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertFalse(any(
+                b.text == "🏠 В начало" for row in failed_rows for b in row
+            ))
             self.context.bot.send_poll.assert_not_awaited()
 
             month_arg = f"{target_year:04d}{target_month:02d}"
