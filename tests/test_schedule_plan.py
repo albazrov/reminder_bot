@@ -1130,7 +1130,7 @@ class SchedulePlanTest(unittest.TestCase):
             "🗓 Неделя 26.10–01.11\n   сб 31.10\n     🎚️ звук",
             text,
         )
-        self.assertIn("      • Алексей (чт 05.11)", text)
+        self.assertIn("      • Алексей° (чт 05.11)", text)
         # Рядом служит Глеб без своего дня — период для него показывается.
         self.assertIn(
             "🗓 Неделя 02.11–08.11\n   сб 07.11", text
@@ -1494,7 +1494,7 @@ class SchedulePlanTest(unittest.TestCase):
         text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
         self.assertIn(
             "🗓 Неделя 26.10–01.11\n   ср 28.10\n     🧰 сборка\n"
-            f"        • {assembly_person}\n   вс 01.11\n     🎚️ звук\n"
+            f"        • {assembly_person}°\n   вс 01.11\n     🎚️ звук\n"
             f"        • {sound_person}",
             text,
         )
@@ -1549,7 +1549,7 @@ class SchedulePlanTest(unittest.TestCase):
             -3,
         )
         self.assertIn(
-            f"• {assembly_person} (чт 29.10)",
+            f"• {assembly_person}° (чт 29.10)",
             schedule_plan.plan_text("ЗВУК", plan, summary, TZ),
         )
         # С окном служения задачи без своего дня — под периодом окна.
@@ -1600,7 +1600,7 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertTrue(plan["dirty"])
         summary = readiness.summarize(self.registry, self.run, with_plan=False)
         self.assertIn(
-            "• Борис (пт 13.11)",
+            "• Борис° (пт 13.11)",
             schedule_plan.plan_text("ЗВУК", plan, summary, TZ),
         )
         published = schedule_plan.publication_text(
@@ -1715,6 +1715,44 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("🗓 01.11\n   🎚️ звук\n      • Борис\n", text)
         self.assertIn("• Борис°", text)
         self.assertIn("° не отмечал(а) эту дату в опросе", text)
+
+    def test_actual_date_answers_do_not_confirm_other_days_in_manual_editor(self):
+        plan = self.draft()
+        day = "2026-11-01"
+        for task in plan["tasks"]:
+            if task["name"] == "сборка":
+                task["day"] = -3
+        summary = readiness.summarize(self.registry, self.run, with_plan=False)
+        plan["slots"] = {
+            event_day: {"звук": [], "сборка": []}
+            for event_day in plan["slots"]
+        }
+        for legacy, selected in (
+            (False, day),
+            (False, "2026-10-29"),
+            (False, readiness.option_key("2026-10-29", "сборка")),
+            (True, day),
+        ):
+            with self.subTest(legacy=legacy, selected=selected):
+                summary.date_options = not legacy
+                summary.answered["Алексей"] = [selected]
+                summary.available["Алексей"] = [selected]
+                free, _, rest = schedule_plan.candidates(
+                    plan, summary, day, "сборка",
+                )
+                expected = legacy or selected != day
+                self.assertEqual("Алексей" in free, expected)
+                self.assertEqual("Алексей" in rest, not expected)
+                notes = schedule_plan.choice_notes(
+                    plan, summary, "Алексей", day, "сборка",
+                )
+                self.assertEqual(
+                    "⚠️ не отметил(а) 29.10" in notes, not expected,
+                )
+                plan["slots"][day]["сборка"] = ["Алексей"]
+                text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+                self.assertEqual("• Алексей°" in text, not expected)
+                plan["slots"][day]["сборка"] = []
 
     def test_served_days_counts_distinct_actual_dates(self):
         plan = {
