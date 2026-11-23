@@ -507,6 +507,63 @@ class ReadinessFlowTest(unittest.TestCase):
         )
         self.assertEqual(summary.available["Алексей"], [])
 
+    def test_allocation_priority_includes_silent_and_auto_uses_minimum_load(self):
+        dates = [day.isoformat() for day in readiness.month_sundays(2026, 11)[:4]]
+        options = [
+            {
+                "date": day, "task": "звук", "tasks": ["звук"],
+                "weeks": [day],
+            }
+            for day in dates
+        ]
+        run = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open", dates=dates, options=options,
+        )
+        people = [
+            {
+                "key": "respondent", "name": "Ответил", "telegram_id": 501,
+                "tasks": frozenset({"звук"}), "day_offset": None,
+                "month_limit": None, "week_tasks": None,
+            },
+            {
+                "key": "silent", "name": "Промолчал", "telegram_id": 502,
+                "tasks": frozenset({"звук"}), "day_offset": None,
+                "month_limit": None, "week_tasks": None,
+            },
+        ]
+        answer = {
+            "telegram_id": 501,
+            "dates": [readiness.option_key(day, "звук") for day in dates],
+        }
+        task = {
+            "name": "звук", "needed": 1, "max": 1, "position": "0",
+            "implicit": False, "day": None,
+        }
+        with (
+            patch.object(self.registry, "readiness_people", return_value=people),
+            patch.object(
+                self.registry, "list_service_tasks",
+                return_value=[{"name": "звук", "same_week": False}],
+            ),
+            patch.object(self.registry, "plan_tasks", return_value=[task]),
+            patch.object(
+                self.registry, "list_readiness_answers", return_value=[answer],
+            ),
+        ):
+            balanced = readiness.summarize(self.registry, run)
+            self.registry.set_readiness_settings(
+                1001, "sound",
+                allocation_priority=readiness.ALLOCATION_RESPONDENTS_FIRST,
+            )
+            respondents_first = readiness.summarize(self.registry, run)
+            automatic = readiness.summarize(
+                self.registry, run, assume_free=True,
+            )
+
+        self.assertEqual(balanced.plan.load(), {"respondent": 2, "silent": 2})
+        self.assertEqual(respondents_first.plan.load(), {"respondent": 4})
+        self.assertEqual(automatic.plan.load(), {"respondent": 2, "silent": 2})
+
     def test_poll_options_refuse_more_than_telegram_limit(self):
         tasks = [
             {"name": name, "needed": 1, "max": 1, "position": name,

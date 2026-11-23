@@ -6568,6 +6568,50 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_allocation_priority_can_be_changed_from_people_settings(self):
+        async def press(data):
+            callback = SimpleNamespace(
+                data=data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_readiness")(callback)
+            return callback
+
+        async def run():
+            people = await press("rdy:people:sound:t")
+            buttons = [
+                button
+                for row in people.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertIn(
+                "rdy:alloc:sound:t",
+                [button.callback_data for button in buttons],
+            )
+
+            choices = await press("rdy:alloc:sound:t")
+            text = choices.message.answer.await_args.args[0]
+            self.assertIn("Меньше участий у каждого", text)
+            self.assertIn("Сначала ответившие", text)
+            self.assertIn("График «Авто» всегда", text)
+
+            selected = await press("rdy:allocset:sound:2.t")
+            self.assertEqual(
+                self.registry.get_readiness_settings("sound")[
+                    "allocation_priority"
+                ],
+                2,
+            )
+            self.assertIn(
+                "сначала ответившие", selected.message.answer.await_args.args[0]
+            )
+
+        asyncio.run(run())
+
     def test_readiness_screen_settings_skip_start_and_votes(self):
         self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
         self.context.bot.send_poll = AsyncMock(return_value=SimpleNamespace(

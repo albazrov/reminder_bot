@@ -117,6 +117,43 @@ class ServiceRegistryTest(unittest.TestCase):
             )["all_dates_option"]
         )
 
+    def test_readiness_allocation_priority_defaults_and_validates(self):
+        settings = self.registry.get_readiness_settings("sound")
+        self.assertEqual(settings["allocation_priority"], 1)
+
+        updated = self.registry.set_readiness_settings(
+            1001, "sound", allocation_priority=2,
+        )
+        self.assertEqual(updated["allocation_priority"], 2)
+        for invalid in (0, 3, True, 1.0, "1"):
+            with self.subTest(value=invalid), self.assertRaises(ValueError):
+                self.registry.set_readiness_settings(
+                    1001, "sound", allocation_priority=invalid,
+                )
+        self.assertEqual(
+            self.registry.get_readiness_settings("sound")[
+                "allocation_priority"
+            ],
+            2,
+        )
+
+    def test_readiness_allocation_priority_migration_defaults_to_all_people(self):
+        self.registry.set_readiness_settings(
+            1001, "sound", allocation_priority=2,
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "ALTER TABLE readiness_settings DROP COLUMN allocation_priority"
+            )
+
+        self.registry.initialize(1001, -10001)
+        self.assertEqual(
+            self.registry.get_readiness_settings("sound")[
+                "allocation_priority"
+            ],
+            1,
+        )
+
     def test_readiness_migration_repairs_corrupt_options_preserving_valid_runs(self):
         broken = self.registry.create_readiness_run(
             "sound", "2026-10", status="open", dates=["2026-10-04"]

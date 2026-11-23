@@ -168,6 +168,12 @@ UNAVAILABLE_ALL = "__no_available_dates__"
 AVAILABLE_ALL = "__all_dates_available__"
 OPTION_SEPARATOR = "\x1f"
 AVAILABLE_ALL_LABEL = "✅ Смогу в любые даты"
+ALLOCATION_MINIMUM_LOAD = 1
+ALLOCATION_RESPONDENTS_FIRST = 2
+ALLOCATION_PRIORITY_LABELS = {
+    ALLOCATION_MINIMUM_LOAD: "минимум участий всей команды",
+    ALLOCATION_RESPONDENTS_FIRST: "сначала ответившие, молчавшие — резерв",
+}
 
 
 def option_key(day: str, task: str | None = None) -> str:
@@ -445,11 +451,15 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             else:
                 free[name] = frozenset(date.fromisoformat(day) for day in dates)
         # Не ответившие (и люди без Telegram) — по общей логике: свободны
-        # во все даты, но ставятся после ответивших.
+        # во все даты. В приоритете 2 они остаются резервом после ответивших.
         silent = {person["key"] for person in summary.not_answered}
         free.update({name: week_dates for name in silent})
         # Лимит служений в месяц: личный главнее лимита служения.
         settings = registry.get_readiness_settings(run["service_id"])
+        allocation_priority = (
+            ALLOCATION_MINIMUM_LOAD if assume_free
+            else settings["allocation_priority"]
+        )
         by_person = {person["key"]: person for person in people}
         slot_dates = {}
         for sunday in week_dates:
@@ -511,7 +521,11 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             availability=availability,
             unavailable=summary.unavailable,
             slot_dates=slot_dates,
-            reluctant=frozenset(silent),
+            reluctant=(
+                frozenset(silent)
+                if allocation_priority == ALLOCATION_RESPONDENTS_FIRST
+                else frozenset()
+            ),
             last_served=dict(last_served or {}),
             limits=limits,
             bundles=summary.bundles,

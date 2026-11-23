@@ -194,6 +194,22 @@ class SchedulePlannerTest(unittest.TestCase):
         self.assertEqual(plan.covered(), 8)
         self.assertLessEqual(max(loads.values()) - min(loads.values()), 1)
 
+    def test_including_nonrespondents_balances_monthly_load(self):
+        dates = SUNDAYS[:4]
+        free = {name: set(dates) for name in ("Алексей", "Борис")}
+        tasks = {name: {"звук"} for name in free}
+        balanced = build_plan(plan_input(
+            free, tasks, needed={"звук": 1}, dates=dates,
+        ))
+        respondents_first = build_plan(plan_input(
+            free, tasks, needed={"звук": 1}, dates=dates,
+            reluctant={"Борис"},
+        ))
+
+        self.assertEqual(balanced.covered_required(), 4)
+        self.assertEqual(balanced.load(), {"Алексей": 2, "Борис": 2})
+        self.assertEqual(respondents_first.load(), {"Алексей": 4})
+
     def test_alternates_to_keep_interval(self):
         plan = build_plan(plan_input(
             {"Алексей": set(SUNDAYS[:4]), "Борис": set(SUNDAYS[:4])},

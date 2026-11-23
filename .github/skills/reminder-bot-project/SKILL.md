@@ -613,8 +613,11 @@ Raspberry Pi specifics:
   empty. Two passes over the month: required seats for all dates (then
   `improve_plan`), then optional seats only for respondents with no
   service within a week either way; improvement never puts a reluctant
-  person beyond `needed`. `summarize` adds non-respondents (incl. no
-  Telegram) as reluctant; `progress_text` lists respondents with dates and
+  person beyond `needed`. `readiness_settings.allocation_priority`: 1 treats
+  silent people as equally eligible to minimize monthly participation per
+  person; 2 marks them reluctant so respondents are preferred and silent
+  people cover required gaps. `summarize(assume_free=True)` always uses 1
+  for no-poll «Авто» plans. `progress_text` lists respondents with dates and
   the plan per Sunday and task («*» = non-respondent).
 - Monthly limit (step 4a): `PlanInput.limits` {key: (min, max|None)} from
   `summarize` (personal `service_members.month_min/max` via

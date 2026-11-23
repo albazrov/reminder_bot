@@ -374,6 +374,8 @@ class ServiceRegistry:
                         CHECK (reverse_poll IN (0, 1)),
                     dates_only INTEGER NOT NULL DEFAULT 0
                         CHECK (dates_only IN (0, 1)),
+                    allocation_priority INTEGER NOT NULL DEFAULT 1
+                        CHECK (allocation_priority IN (1, 2)),
                     updated_at TEXT NOT NULL
                 );
 
@@ -1023,6 +1025,8 @@ class ServiceRegistry:
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "dates_only",
                  "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "allocation_priority",
+                 "INTEGER NOT NULL DEFAULT 1 CHECK (allocation_priority IN (1, 2))"),
                 ("service_members", "day_offset", "INTEGER"),
                 ("service_members", "month_min", "INTEGER"),
                 ("service_members", "month_max", "INTEGER"),
@@ -6350,6 +6354,7 @@ class ServiceRegistry:
         "day_to": 0,
         "reverse_poll": False,
         "dates_only": False,
+        "allocation_priority": 1,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -6360,7 +6365,8 @@ class ServiceRegistry:
                 "closed_template, chat_reminder_template, question_template, "
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
-                "people_needed, people_max, day_from, day_to, reverse_poll, dates_only "
+                "people_needed, people_max, day_from, day_to, reverse_poll, dates_only, "
+                "allocation_priority "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
@@ -6403,6 +6409,12 @@ class ServiceRegistry:
             raise ValueError("reverse_poll должен быть логическим значением")
         if not isinstance(new["dates_only"], bool):
             raise ValueError("dates_only должен быть логическим значением")
+        if (
+            isinstance(new["allocation_priority"], bool)
+            or not isinstance(new["allocation_priority"], int)
+            or new["allocation_priority"] not in {1, 2}
+        ):
+            raise ValueError("Приоритет распределения должен быть 1 или 2.")
         for key in ("start_time", "deadline_time"):
             if not isinstance(new[key], str) or not re.fullmatch(
                 r"(?:[01]\d|2[0-3]):[0-5]\d", new[key]
@@ -6494,8 +6506,9 @@ class ServiceRegistry:
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
                 "people_needed, people_max, day_from, day_to, reverse_poll, dates_only, "
+                "allocation_priority, "
                 "updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -6517,6 +6530,7 @@ class ServiceRegistry:
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
                 "reverse_poll = excluded.reverse_poll, "
                 "dates_only = excluded.dates_only, "
+                "allocation_priority = excluded.allocation_priority, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
@@ -6530,7 +6544,8 @@ class ServiceRegistry:
                     new["month_min"], new["month_max"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"],
-                    int(new["reverse_poll"]), int(new["dates_only"]), now,
+                    int(new["reverse_poll"]), int(new["dates_only"]),
+                    new["allocation_priority"], now,
                 ),
             )
             if (new["day_from"], new["day_to"]) != (
