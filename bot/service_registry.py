@@ -374,6 +374,8 @@ class ServiceRegistry:
                         CHECK (reverse_poll IN (0, 1)),
                     dates_only INTEGER NOT NULL DEFAULT 0
                         CHECK (dates_only IN (0, 1)),
+                    allocation_priority INTEGER NOT NULL DEFAULT 1
+                        CHECK (allocation_priority IN (1, 2)),
                     updated_at TEXT NOT NULL
                 );
 
@@ -395,6 +397,8 @@ class ServiceRegistry:
                     options_json TEXT NOT NULL DEFAULT '[]',
                     reverse_poll INTEGER NOT NULL DEFAULT 0
                         CHECK (reverse_poll IN (0, 1)),
+                    all_dates_option INTEGER NOT NULL DEFAULT 0
+                        CHECK (all_dates_option IN (0, 1)),
                     poll_id TEXT UNIQUE,
                     chat_id INTEGER,
                     message_id INTEGER,
@@ -1021,6 +1025,8 @@ class ServiceRegistry:
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_settings", "dates_only",
                  "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_settings", "allocation_priority",
+                 "INTEGER NOT NULL DEFAULT 1 CHECK (allocation_priority IN (1, 2))"),
                 ("service_members", "day_offset", "INTEGER"),
                 ("service_members", "month_min", "INTEGER"),
                 ("service_members", "month_max", "INTEGER"),
@@ -1046,6 +1052,8 @@ class ServiceRegistry:
                 ("readiness_runs", "options_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("readiness_runs", "reverse_poll",
                  "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_runs", "all_dates_option",
+                 "INTEGER NOT NULL DEFAULT 0"),
                 ("event_notes", "revision", "INTEGER NOT NULL DEFAULT 1"),
                 ("event_notes", "draft_send_at", "TEXT"),
                 ("event_notes", "published_send_at", "TEXT"),
@@ -1068,10 +1076,20 @@ class ServiceRegistry:
                             f"UPDATE readiness_runs SET {column} = 1 "
                             "WHERE status != 'open'"
                         )
+                    elif (
+                        table == "readiness_runs"
+                        and column == "all_dates_option"
+                    ):
+                        # Старый обратный опрос уже имел вариант «Смогу в любые
+                        # даты», а прямой — только вариант «Не смогу».
+                        connection.execute(
+                            "UPDATE readiness_runs SET all_dates_option = reverse_poll"
+                        )
             # Ранняя миграция ошибочно записывала флаг завершения и в
             # новые поля вариантов/режима старых закрытых опросов.
             connection.execute(
-                "UPDATE readiness_runs SET options_json = '[]', reverse_poll = 0 "
+                "UPDATE readiness_runs SET options_json = '[]', reverse_poll = 0, "
+                "all_dates_option = 0 "
                 "WHERE status != 'open' AND options_json = '1'"
             )
             # Утверждённые до снимка задач — снимок из рабочей копии, пока
@@ -6336,6 +6354,7 @@ class ServiceRegistry:
         "day_to": 0,
         "reverse_poll": False,
         "dates_only": False,
+        "allocation_priority": 1,
     }
 
     def get_readiness_settings(self, service_id: str) -> dict:
@@ -6346,7 +6365,8 @@ class ServiceRegistry:
                 "closed_template, chat_reminder_template, question_template, "
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
-                "people_needed, people_max, day_from, day_to, reverse_poll, dates_only "
+                "people_needed, people_max, day_from, day_to, reverse_poll, dates_only, "
+                "allocation_priority "
                 "FROM readiness_settings WHERE service_id = ?",
                 (service_id,),
             ).fetchone()
@@ -6389,6 +6409,12 @@ class ServiceRegistry:
             raise ValueError("reverse_poll должен быть логическим значением")
         if not isinstance(new["dates_only"], bool):
             raise ValueError("dates_only должен быть логическим значением")
+        if (
+            isinstance(new["allocation_priority"], bool)
+            or not isinstance(new["allocation_priority"], int)
+            or new["allocation_priority"] not in {1, 2}
+        ):
+            raise ValueError("Приоритет распределения должен быть 1 или 2.")
         for key in ("start_time", "deadline_time"):
             if not isinstance(new[key], str) or not re.fullmatch(
                 r"(?:[01]\d|2[0-3]):[0-5]\d", new[key]
@@ -6480,8 +6506,9 @@ class ServiceRegistry:
                 "plan_title_template, plan_update_template, phrases_json, "
                 "month_min, month_max, "
                 "people_needed, people_max, day_from, day_to, reverse_poll, dates_only, "
+                "allocation_priority, "
                 "updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id) DO UPDATE SET "
                 "enabled = excluded.enabled, start_time = excluded.start_time, "
                 "duration_days = excluded.duration_days, "
@@ -6503,6 +6530,7 @@ class ServiceRegistry:
                 "day_from = excluded.day_from, day_to = excluded.day_to, "
                 "reverse_poll = excluded.reverse_poll, "
                 "dates_only = excluded.dates_only, "
+                "allocation_priority = excluded.allocation_priority, "
                 "updated_at = excluded.updated_at",
                 (
                     service_id, int(new["enabled"]), new["start_time"],
@@ -6516,7 +6544,8 @@ class ServiceRegistry:
                     new["month_min"], new["month_max"],
                     new["people_needed"], new["people_max"],
                     new["day_from"], new["day_to"],
-                    int(new["reverse_poll"]), int(new["dates_only"]), now,
+                    int(new["reverse_poll"]), int(new["dates_only"]),
+                    new["allocation_priority"], now,
                 ),
             )
             if (new["day_from"], new["day_to"]) != (
@@ -6723,6 +6752,7 @@ class ServiceRegistry:
             **dict(row), "dates": json.loads(row["dates_json"]),
             "options": json.loads(row["options_json"] or "[]"),
             "reverse_poll": bool(row["reverse_poll"]),
+            "all_dates_option": bool(row["all_dates_option"]),
         }
         return result
 
@@ -6735,6 +6765,7 @@ class ServiceRegistry:
         dates: list[str] = (),
         options: list[dict] = (),
         reverse_poll: bool = False,
+        all_dates_option: bool | None = None,
         poll_id: str | None = None,
         chat_id: int | None = None,
         message_id: int | None = None,
@@ -6749,14 +6780,18 @@ class ServiceRegistry:
             try:
                 cursor = connection.execute(
                     "INSERT INTO readiness_runs (service_id, month, status, "
-                    "dates_json, options_json, reverse_poll, "
+                    "dates_json, options_json, reverse_poll, all_dates_option, "
                     "poll_id, chat_id, message_id, "
                     "intro_message_id, deadline, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         service_id, month, status, json.dumps(list(dates)),
                         json.dumps(list(options), ensure_ascii=False),
                         int(reverse_poll),
+                        int(
+                            reverse_poll if all_dates_option is None
+                            else all_dates_option
+                        ),
                         poll_id, chat_id, message_id, intro_message_id,
                         deadline, _utc_now(),
                     ),
