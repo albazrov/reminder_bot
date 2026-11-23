@@ -1659,6 +1659,10 @@ class SchedulePlanTest(unittest.TestCase):
         )
 
     def test_plan_text_candidates_and_notes(self):
+        self.registry.set_readiness_settings(
+            1001, "sound",
+            allocation_priority=readiness.ALLOCATION_RESPONDENTS_FIRST,
+        )
         plan = self.draft()
         summary = readiness.summarize(self.registry, self.run, with_plan=False)
         text = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)

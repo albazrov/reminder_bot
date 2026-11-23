@@ -613,8 +613,11 @@ Raspberry Pi specifics:
   empty. Two passes over the month: required seats for all dates (then
   `improve_plan`), then optional seats only for respondents with no
   service within a week either way; improvement never puts a reluctant
-  person beyond `needed`. `summarize` adds non-respondents (incl. no
-  Telegram) as reluctant; `progress_text` lists respondents with dates and
+  person beyond `needed`. `readiness_settings.allocation_priority`: 1 treats
+  silent people as equally eligible to minimize monthly participation per
+  person; 2 marks them reluctant so respondents are preferred and silent
+  people cover required gaps. `summarize(assume_free=True)` always uses 1
+  for no-poll «Авто» plans. `progress_text` lists respondents with dates and
   the plan per Sunday and task («*» = non-respondent).
 - Monthly limit (step 4a): `PlanInput.limits` {key: (min, max|None)} from
   `summarize` (personal `service_members.month_min/max` via
@@ -774,6 +777,15 @@ Raspberry Pi specifics:
   `DEFAULT_READINESS_REMINDER` is deliberately mode-neutral («не ответил(а)
   на опрос по служению на {month}»); keep new default texts neutral or add
   a reverse variant.
+- Every new poll includes both special choices after the date options:
+  fixed `✅ Смогу в любые даты` and the configurable `cant` phrase (default
+  `❌ Не смогу в этом месяце`). In either mode these mean available on all
+  dates / unavailable on all dates; reverse mode changes only date choices.
+  The Telegram 12-option limit always reserves two slots for them.
+  `readiness_runs.all_dates_option` snapshots whether the all-dates choice
+  exists. Legacy direct polls did not have it, while legacy reverse polls did;
+  keep `answer_dates` compatible with both layouts so an already-open poll's
+  option indexes are not reinterpreted after deployment.
 - Linked-task fallback (`schedule_planner._can_serve`): a bundled person who
   only marked the later task may serve the earlier one unless
   `_alternate_covers` says another respondent really covers the seat. It

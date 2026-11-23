@@ -71,7 +71,7 @@ class ServiceRegistryTest(unittest.TestCase):
         )
         columns = (
             "poll_stopped", "result_sent", "closed_announced",
-            "options_json", "reverse_poll",
+            "options_json", "reverse_poll", "all_dates_option",
         )
         with closing(sqlite3.connect(self.path)) as connection, connection:
             for column in columns:
@@ -86,11 +86,73 @@ class ServiceRegistryTest(unittest.TestCase):
                     run = self.registry.get_readiness_run_by_id(original["id"])
                     self.assertEqual(run["options"], [])
                     self.assertFalse(run["reverse_poll"])
+                    self.assertFalse(run["all_dates_option"])
                     self.assertEqual(run["dates"], original["dates"])
                     for column in columns[:3]:
                         self.assertEqual(
                             run[column], int(run["status"] != "open")
                         )
+
+    def test_all_dates_option_migration_preserves_legacy_poll_layout(self):
+        direct = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open",
+        )
+        reverse = self.registry.create_readiness_run(
+            "sound", "2026-12", status="open", reverse_poll=True,
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "ALTER TABLE readiness_runs DROP COLUMN all_dates_option"
+            )
+
+        self.registry.initialize(1001, -10001)
+        self.assertFalse(
+            self.registry.get_readiness_run_by_id(
+                direct["id"]
+            )["all_dates_option"]
+        )
+        self.assertTrue(
+            self.registry.get_readiness_run_by_id(
+                reverse["id"]
+            )["all_dates_option"]
+        )
+
+    def test_readiness_allocation_priority_defaults_and_validates(self):
+        settings = self.registry.get_readiness_settings("sound")
+        self.assertEqual(settings["allocation_priority"], 1)
+
+        updated = self.registry.set_readiness_settings(
+            1001, "sound", allocation_priority=2,
+        )
+        self.assertEqual(updated["allocation_priority"], 2)
+        for invalid in (0, 3, True, 1.0, "1"):
+            with self.subTest(value=invalid), self.assertRaises(ValueError):
+                self.registry.set_readiness_settings(
+                    1001, "sound", allocation_priority=invalid,
+                )
+        self.assertEqual(
+            self.registry.get_readiness_settings("sound")[
+                "allocation_priority"
+            ],
+            2,
+        )
+
+    def test_readiness_allocation_priority_migration_defaults_to_all_people(self):
+        self.registry.set_readiness_settings(
+            1001, "sound", allocation_priority=2,
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "ALTER TABLE readiness_settings DROP COLUMN allocation_priority"
+            )
+
+        self.registry.initialize(1001, -10001)
+        self.assertEqual(
+            self.registry.get_readiness_settings("sound")[
+                "allocation_priority"
+            ],
+            1,
+        )
 
     def test_readiness_migration_repairs_corrupt_options_preserving_valid_runs(self):
         broken = self.registry.create_readiness_run(
@@ -114,10 +176,12 @@ class ServiceRegistryTest(unittest.TestCase):
             repaired = self.registry.get_readiness_run_by_id(broken["id"])
             self.assertEqual(repaired["options"], [])
             self.assertFalse(repaired["reverse_poll"])
+            self.assertFalse(repaired["all_dates_option"])
             self.assertEqual(repaired["dates"], broken["dates"])
             untouched = self.registry.get_readiness_run_by_id(valid["id"])
             self.assertEqual(untouched["options"], options)
             self.assertTrue(untouched["reverse_poll"])
+            self.assertTrue(untouched["all_dates_option"])
 
     def test_bootstrap_seeds_catalog_and_configures_only_assembly(self):
         services = {service["id"]: service for service in self.registry.list_services()}

@@ -5294,6 +5294,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"{people_label(task)}"
                 for task in tasks
             ),
+            "",
+            "⚖️ Приоритет: "
+            + readiness.ALLOCATION_PRIORITY_LABELS[
+                registry.get_readiness_settings(service_id)[
+                    "allocation_priority"
+                ]
+            ],
         ]
         if notice:
             lines = [notice, ""] + lines
@@ -5305,6 +5312,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             for task in tasks
         ]
         rows = layout_buttons(buttons) if buttons else []
+        rows.append([readiness_button(
+            "⚖️ Приоритет распределения", "alloc", service_id, back,
+        )])
         rows.append([
             readiness_button("⬅️ К опросу", "open", service_id)
             if back == "o" else InlineKeyboardButton(
@@ -5318,6 +5328,57 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keyboard_limit=sum(len(row) for row in rows),
             _dialog_keep_rows=True,
+            parse_mode=None,
+        )
+
+    async def show_allocation_priority(
+        message: Message, service_id: str, back: str = "o",
+    ) -> None:
+        registry = service_registry()
+        service = service_by_id(registry, service_id) if registry else None
+        if service is None:
+            await _send_dialog(message, "Служение не найдено.", parse_mode=None)
+            return
+        settings = registry.get_readiness_settings(service_id)
+        choices = (
+            (
+                readiness.ALLOCATION_MINIMUM_LOAD,
+                "Меньше участий у каждого",
+                "Учитывать всю команду, включая тех, кто не ответил. "
+                "Это помогает распределять служения по месяцу равномернее.",
+            ),
+            (
+                readiness.ALLOCATION_RESPONDENTS_FIRST,
+                "Сначала ответившие",
+                "Сначала равномерно распределять ответивших. Не ответивших "
+                "подключать как резерв, когда без них не закрыть обязательные "
+                "места.",
+            ),
+        )
+        rows = [
+            [readiness_button(
+                f"{'✅ ' if value == settings['allocation_priority'] else '⚖️ '}"
+                f"{label}",
+                "allocset", service_id, f"{value}.{back}",
+            )]
+            for value, label, _ in choices
+        ]
+        rows.append([readiness_button(
+            "⬅️ К людям", "people", service_id, back,
+        )])
+        await _send_dialog(
+            message,
+            f"⚖️ {service_label(service)} · приоритет распределения\n\n"
+            + "\n\n".join(
+                f"{value}. {label}\n{description}"
+                for value, label, description in choices
+            )
+            + "\n\nНастройка сразу влияет на предварительный график открытого "
+            "опроса, не меняя ответы. График «Авто» всегда распределяет "
+            "участия по всей команде.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            _dialog_keep_rows=True,
+            _dialog_keyboard_limit=sum(len(row) for row in rows),
             parse_mode=None,
         )
 
@@ -5626,6 +5687,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             + month_limit_label(service_month_limit(registry, service_id))
         )
         lines.append(
+            "⚖️ Приоритет графика: "
+            + readiness.ALLOCATION_PRIORITY_LABELS[
+                settings["allocation_priority"]
+            ]
+        )
+        lines.append(
             "🗳 Наоборот: " + (
                 "включён — отмеченные даты недоступны"
                 if settings["reverse_poll"]
@@ -5756,12 +5823,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         options = readiness.poll_options(
             registry, service_id, year, month,
-            reverse_poll=settings["reverse_poll"],
             validate_limit=False,
         )
         labels = [item["label"] for item in options]
-        if settings["reverse_poll"]:
-            labels.append("✅ Смогу в любые даты")
+        labels.append(readiness.AVAILABLE_ALL_LABEL)
         labels.append(readiness.phrase(settings, "cant"))
         limit_note = (
             f"⚠️ Получилось {len(labels)} вариантов, Telegram допускает не более "
@@ -7933,6 +7998,31 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     return
             elif action == "people" and arg in {"o", "t"}:
                 await show_task_people(callback.message, service_id, arg)
+                await _answer_callback(callback)
+                return
+            elif action == "alloc" and arg in {"o", "t"}:
+                await show_allocation_priority(callback.message, service_id, arg)
+                await _answer_callback(callback)
+                return
+            elif action == "allocset" and arg:
+                value, separator, back = arg.partition(".")
+                if (
+                    not separator or value not in {"1", "2"}
+                    or back not in {"o", "t"}
+                ):
+                    raise ValueError("Неизвестный приоритет распределения.")
+                allocation_priority = int(value)
+                registry.set_readiness_settings(
+                    actor_id, service_id,
+                    allocation_priority=allocation_priority,
+                )
+                await show_task_people(
+                    callback.message, service_id, back,
+                    "✅ Приоритет распределения: "
+                    + readiness.ALLOCATION_PRIORITY_LABELS[
+                        allocation_priority
+                    ],
+                )
                 await _answer_callback(callback)
                 return
             elif action in {"ppick", "pset"} and arg:
@@ -13238,6 +13328,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         poll_answer.option_ids,
                         run.get("options") or run["dates"],
                         reverse_poll=run.get("reverse_poll", False),
+                        all_dates_option=run.get("all_dates_option"),
                     ),
                 )
                 return

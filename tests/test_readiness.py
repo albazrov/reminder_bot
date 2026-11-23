@@ -185,11 +185,22 @@ class ReadinessDatesTest(unittest.TestCase):
     def test_answer_dates(self):
         dates = ["2026-11-01", "2026-11-08"]
         self.assertIsNone(readiness.answer_dates([], dates))
-        self.assertEqual(readiness.answer_dates([2], dates), [])
+        self.assertEqual(
+            readiness.answer_dates([2], dates),
+            [readiness.UNAVAILABLE_ALL],
+        )
         self.assertEqual(
             readiness.answer_dates([1, 0, 2], dates), ["2026-11-01", "2026-11-08"]
         )
         options = [{"date": day} for day in dates]
+        self.assertEqual(
+            readiness.answer_dates([2], options, all_dates_option=True),
+            [readiness.AVAILABLE_ALL],
+        )
+        self.assertEqual(
+            readiness.answer_dates([3], options, all_dates_option=True),
+            [readiness.UNAVAILABLE_ALL],
+        )
         self.assertEqual(
             readiness.answer_dates([1], options, reverse_poll=True),
             ["2026-11-08"],
@@ -283,9 +294,11 @@ class ReadinessFlowTest(unittest.TestCase):
         run = self.launch(bot)
         self.assertEqual(bot.send_poll.await_args.kwargs["options"], [
             "01.11", "08.11", "15.11", "22.11", "29.11",
+            "✅ Смогу в любые даты",
             "❌ Не смогу в этом месяце",
         ])
         self.assertEqual(readiness.run_option_dates(run), run["dates"])
+        self.assertTrue(run["all_dates_option"])
         dates = readiness.answer_dates([0], run["options"])
         self.assertEqual(dates, ["2026-11-01"])
         self.registry.set_readiness_settings(1001, "sound", dates_only=False)
@@ -426,8 +439,10 @@ class ReadinessFlowTest(unittest.TestCase):
         sent_options = bot.send_poll.await_args.kwargs["options"]
         self.assertEqual(sent_options[-2], "✅ Смогу в любые даты")
         self.assertEqual(sent_options[-1], "❌ Не смогу в этом месяце")
+        self.assertTrue(run["all_dates_option"])
         dates = readiness.answer_dates(
-            [len(options)], options, reverse_poll=True
+            [len(options)], options, reverse_poll=True,
+            all_dates_option=run["all_dates_option"],
         )
         self.assertEqual(dates, [readiness.AVAILABLE_ALL])
         self.registry.record_readiness_answer(
@@ -443,6 +458,111 @@ class ReadinessFlowTest(unittest.TestCase):
             },
         )
         self.assertEqual(summary.unavailable, {})
+
+    def test_direct_poll_can_confirm_all_or_no_dates(self):
+        bot = fake_bot()
+        run = self.launch(bot)
+        options = run["options"]
+        sent = bot.send_poll.await_args.kwargs["options"]
+        self.assertEqual(sent[-2:], [
+            readiness.AVAILABLE_ALL_LABEL,
+            "❌ Не смогу в этом месяце",
+        ])
+        self.assertEqual(
+            readiness.answer_dates(
+                [len(options)], options, all_dates_option=True,
+            ),
+            [readiness.AVAILABLE_ALL],
+        )
+        self.assertEqual(
+            readiness.answer_dates(
+                [len(options) + 1], options, all_dates_option=True,
+            ),
+            [readiness.UNAVAILABLE_ALL],
+        )
+        available = readiness.answer_dates(
+            [len(options)], options, all_dates_option=True,
+        )
+        self.registry.record_readiness_answer(
+            run["poll_id"], 501, "alex", "Алексей", available,
+        )
+        summary = readiness.summarize(
+            self.registry, run, with_plan=False,
+        )
+        self.assertEqual(
+            set(summary.available["Алексей"]),
+            {
+                readiness.option_key(item["date"], readiness.option_task(item))
+                for item in options
+            },
+        )
+        unavailable = readiness.answer_dates(
+            [len(options) + 1], options, all_dates_option=True,
+        )
+        self.registry.record_readiness_answer(
+            run["poll_id"], 501, "alex", "Алексей", unavailable,
+        )
+        summary = readiness.summarize(
+            self.registry, run, with_plan=False,
+        )
+        self.assertEqual(summary.available["Алексей"], [])
+
+    def test_allocation_priority_includes_silent_and_auto_uses_minimum_load(self):
+        dates = [day.isoformat() for day in readiness.month_sundays(2026, 11)[:4]]
+        options = [
+            {
+                "date": day, "task": "звук", "tasks": ["звук"],
+                "weeks": [day],
+            }
+            for day in dates
+        ]
+        run = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open", dates=dates, options=options,
+        )
+        people = [
+            {
+                "key": "respondent", "name": "Ответил", "telegram_id": 501,
+                "tasks": frozenset({"звук"}), "day_offset": None,
+                "month_limit": None, "week_tasks": None,
+            },
+            {
+                "key": "silent", "name": "Промолчал", "telegram_id": 502,
+                "tasks": frozenset({"звук"}), "day_offset": None,
+                "month_limit": None, "week_tasks": None,
+            },
+        ]
+        answer = {
+            "telegram_id": 501,
+            "dates": [readiness.option_key(day, "звук") for day in dates],
+        }
+        task = {
+            "name": "звук", "needed": 1, "max": 1, "position": "0",
+            "implicit": False, "day": None,
+        }
+        with (
+            patch.object(self.registry, "readiness_people", return_value=people),
+            patch.object(
+                self.registry, "list_service_tasks",
+                return_value=[{"name": "звук", "same_week": False}],
+            ),
+            patch.object(self.registry, "plan_tasks", return_value=[task]),
+            patch.object(
+                self.registry, "list_readiness_answers", return_value=[answer],
+            ),
+        ):
+            balanced = readiness.summarize(self.registry, run)
+            self.registry.set_readiness_settings(
+                1001, "sound",
+                allocation_priority=readiness.ALLOCATION_RESPONDENTS_FIRST,
+            )
+            respondents_first = readiness.summarize(self.registry, run)
+            automatic = readiness.summarize(
+                self.registry, run, assume_free=True,
+            )
+
+        self.assertEqual(balanced.plan.load(), {"respondent": 2, "silent": 2})
+        self.assertEqual(respondents_first.plan.load(), {"respondent": 4})
+        self.assertEqual(automatic.plan.load(), {"respondent": 2, "silent": 2})
 
     def test_poll_options_refuse_more_than_telegram_limit(self):
         tasks = [
@@ -476,15 +596,22 @@ class ReadinessFlowTest(unittest.TestCase):
             patch.object(
                 self.registry, "readiness_people", return_value=one_person
             ),
-            patch.object(readiness, "month_sundays", return_value=sundays),
+            patch.object(readiness, "month_sundays", return_value=sundays[:10]),
         ):
             self.assertEqual(
                 len(readiness.poll_options(self.registry, "sound", 2026, 11)),
-                11,
+                10,
             )
+        with (
+            patch.object(self.registry, "plan_tasks", return_value=one_task),
+            patch.object(
+                self.registry, "readiness_people", return_value=one_person
+            ),
+            patch.object(readiness, "month_sundays", return_value=sundays),
+        ):
             with self.assertRaisesRegex(ValueError, "не более 12 вариантов"):
                 readiness.poll_options(
-                    self.registry, "sound", 2026, 11, reverse_poll=True
+                    self.registry, "sound", 2026, 11,
                 )
 
     def test_launch_uses_own_phrases(self):
@@ -581,6 +708,9 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertEqual(len(run["dates"]), 5)
         poll = bot.send_poll.await_args
         self.assertEqual(poll.args[1], "Когда можешь служить в ноябре?")
+        self.assertEqual(
+            poll.kwargs["options"][-2], readiness.AVAILABLE_ALL_LABEL
+        )
         self.assertEqual(
             poll.kwargs["options"][-1], "❌ Не смогу в этом месяце"
         )
@@ -970,6 +1100,7 @@ class ReadinessFlowTest(unittest.TestCase):
                 [],
             )
 
+        self.registry.set_readiness_settings(1001, "sound", enabled=False)
         bot.stop_poll.reset_mock()
         bot.send_message.reset_mock()
         self.tick(bot, datetime.now(TZ))
@@ -1046,6 +1177,7 @@ class ReadinessFlowTest(unittest.TestCase):
         ))
         self.assertEqual(len(self.registry.list_unfinished_readiness_runs()), 1)
         send.fail = False
+        self.registry.set_readiness_settings(1001, "sound", enabled=False)
         bot.send_message.reset_mock()
         self.tick(bot, datetime.now(TZ))
         # Повтор — только тому, кому не дошло.
@@ -1123,6 +1255,7 @@ class ReadinessFlowTest(unittest.TestCase):
         )
         created = datetime.fromisoformat(orphan["created_at"])
         bot = fake_bot()
+        self.registry.set_readiness_settings(1001, "sound", enabled=False)
         self.tick(bot, created.astimezone(TZ) + timedelta(minutes=1))
         self.assertIsNotNone(self.registry.get_readiness_run_by_id(orphan["id"]))
         self.tick(bot, created.astimezone(TZ) + timedelta(minutes=6))
