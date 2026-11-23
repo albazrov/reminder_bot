@@ -395,6 +395,8 @@ class ServiceRegistry:
                     options_json TEXT NOT NULL DEFAULT '[]',
                     reverse_poll INTEGER NOT NULL DEFAULT 0
                         CHECK (reverse_poll IN (0, 1)),
+                    all_dates_option INTEGER NOT NULL DEFAULT 0
+                        CHECK (all_dates_option IN (0, 1)),
                     poll_id TEXT UNIQUE,
                     chat_id INTEGER,
                     message_id INTEGER,
@@ -1046,6 +1048,8 @@ class ServiceRegistry:
                 ("readiness_runs", "options_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("readiness_runs", "reverse_poll",
                  "INTEGER NOT NULL DEFAULT 0"),
+                ("readiness_runs", "all_dates_option",
+                 "INTEGER NOT NULL DEFAULT 0"),
                 ("event_notes", "revision", "INTEGER NOT NULL DEFAULT 1"),
                 ("event_notes", "draft_send_at", "TEXT"),
                 ("event_notes", "published_send_at", "TEXT"),
@@ -1068,10 +1072,20 @@ class ServiceRegistry:
                             f"UPDATE readiness_runs SET {column} = 1 "
                             "WHERE status != 'open'"
                         )
+                    elif (
+                        table == "readiness_runs"
+                        and column == "all_dates_option"
+                    ):
+                        # Старый обратный опрос уже имел вариант «Смогу в любые
+                        # даты», а прямой — только вариант «Не смогу».
+                        connection.execute(
+                            "UPDATE readiness_runs SET all_dates_option = reverse_poll"
+                        )
             # Ранняя миграция ошибочно записывала флаг завершения и в
             # новые поля вариантов/режима старых закрытых опросов.
             connection.execute(
-                "UPDATE readiness_runs SET options_json = '[]', reverse_poll = 0 "
+                "UPDATE readiness_runs SET options_json = '[]', reverse_poll = 0, "
+                "all_dates_option = 0 "
                 "WHERE status != 'open' AND options_json = '1'"
             )
             # Утверждённые до снимка задач — снимок из рабочей копии, пока
@@ -6723,6 +6737,7 @@ class ServiceRegistry:
             **dict(row), "dates": json.loads(row["dates_json"]),
             "options": json.loads(row["options_json"] or "[]"),
             "reverse_poll": bool(row["reverse_poll"]),
+            "all_dates_option": bool(row["all_dates_option"]),
         }
         return result
 
@@ -6735,6 +6750,7 @@ class ServiceRegistry:
         dates: list[str] = (),
         options: list[dict] = (),
         reverse_poll: bool = False,
+        all_dates_option: bool | None = None,
         poll_id: str | None = None,
         chat_id: int | None = None,
         message_id: int | None = None,
@@ -6749,14 +6765,18 @@ class ServiceRegistry:
             try:
                 cursor = connection.execute(
                     "INSERT INTO readiness_runs (service_id, month, status, "
-                    "dates_json, options_json, reverse_poll, "
+                    "dates_json, options_json, reverse_poll, all_dates_option, "
                     "poll_id, chat_id, message_id, "
                     "intro_message_id, deadline, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         service_id, month, status, json.dumps(list(dates)),
                         json.dumps(list(options), ensure_ascii=False),
                         int(reverse_poll),
+                        int(
+                            reverse_poll if all_dates_option is None
+                            else all_dates_option
+                        ),
                         poll_id, chat_id, message_id, intro_message_id,
                         deadline, _utc_now(),
                     ),

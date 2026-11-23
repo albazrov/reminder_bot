@@ -5756,12 +5756,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         options = readiness.poll_options(
             registry, service_id, year, month,
-            reverse_poll=settings["reverse_poll"],
             validate_limit=False,
         )
         labels = [item["label"] for item in options]
-        if settings["reverse_poll"]:
-            labels.append("✅ Смогу в любые даты")
+        labels.append(readiness.AVAILABLE_ALL_LABEL)
         labels.append(readiness.phrase(settings, "cant"))
         limit_note = (
             f"⚠️ Получилось {len(labels)} вариантов, Telegram допускает не более "
@@ -13238,6 +13236,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         poll_answer.option_ids,
                         run.get("options") or run["dates"],
                         reverse_poll=run.get("reverse_poll", False),
+                        all_dates_option=run.get("all_dates_option"),
                     ),
                 )
                 return

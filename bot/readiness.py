@@ -167,6 +167,7 @@ def local_text(moment: datetime | str, tz) -> str:
 UNAVAILABLE_ALL = "__no_available_dates__"
 AVAILABLE_ALL = "__all_dates_available__"
 OPTION_SEPARATOR = "\x1f"
+AVAILABLE_ALL_LABEL = "✅ Смогу в любые даты"
 
 
 def option_key(day: str, task: str | None = None) -> str:
@@ -211,8 +212,10 @@ def option_weeks(
     return by_option, by_date
 
 
-def answer_dates(option_ids, options, *, reverse_poll: bool = False
-                 ) -> list[str] | None:
+def answer_dates(
+    option_ids, options, *, reverse_poll: bool = False,
+    all_dates_option: bool | None = None,
+) -> list[str] | None:
     """Варианты опроса → отмеченные даты; None — голос отозван."""
     chosen = list(option_ids or ())
     if not chosen:
@@ -224,11 +227,18 @@ def answer_dates(option_ids, options, *, reverse_poll: bool = False
         ) if isinstance(option, dict) else option
         for option in options
     ]
-    if reverse_poll:
-        if len(dates) + 1 in chosen:
-            return [UNAVAILABLE_ALL]
-        if len(dates) in chosen:
-            return [AVAILABLE_ALL]
+    has_all_dates_option = (
+        reverse_poll if all_dates_option is None else all_dates_option
+    )
+    available_index = len(dates) if has_all_dates_option else None
+    unavailable_index = len(dates) + int(has_all_dates_option)
+    has_date_choice = any(index < len(dates) for index in chosen)
+    if unavailable_index in chosen and (
+        has_all_dates_option or not has_date_choice
+    ):
+        return [UNAVAILABLE_ALL]
+    if available_index is not None and available_index in chosen:
+        return [AVAILABLE_ALL]
     return sorted(dates[index] for index in chosen if index < len(dates))
 
 
@@ -396,10 +406,14 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
                 else sorted(all_dates - unavailable)
             )
         else:
-            available = [
-                day for day in marked
-                if day not in (UNAVAILABLE_ALL, AVAILABLE_ALL)
-            ]
+            available = (
+                [] if UNAVAILABLE_ALL in marked
+                else sorted(all_dates) if AVAILABLE_ALL in marked
+                else [
+                    day for day in marked
+                    if day not in (UNAVAILABLE_ALL, AVAILABLE_ALL)
+                ]
+            )
         summary.available[key] = available
     summary.not_answered = [
         person for person in people
@@ -674,8 +688,7 @@ def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
 
 
 def poll_options(registry, service_id: str, year: int, month: int,
-                 *, reverse_poll: bool = False,
-                 validate_limit: bool = True) -> list[dict]:
+                 *, validate_limit: bool = True) -> list[dict]:
     """Доступность по фактическим датам, с задачами или без них."""
     settings = registry.get_readiness_settings(service_id)
     tasks = registry.plan_tasks(service_id)
@@ -729,7 +742,7 @@ def poll_options(registry, service_id: str, year: int, month: int,
                 f"{actual_day:%d.%m}."
             )
         result.append({**item, "label": label})
-    if validate_limit and len(result) + 1 + int(reverse_poll) > 12:
+    if validate_limit and len(result) + 2 > 12:
         raise ValueError(
             "Опрос не запущен: Telegram допускает не более 12 вариантов, "
             "а для выбранных дат задач их получилось больше."
@@ -891,7 +904,6 @@ async def launch_run(
     settings = registry.get_readiness_settings(service["id"])
     options = poll_options(
         registry, service["id"], year, month,
-        reverse_poll=settings["reverse_poll"],
     )
     # Запись — до отправки: месяц занят (перезапуск, прерванный между
     # отправкой и записью, не вернёт старый опрос поверх нового).
@@ -901,6 +913,7 @@ async def launch_run(
         dates=dates,
         options=options,
         reverse_poll=settings["reverse_poll"],
+        all_dates_option=True,
         deadline=deadline.astimezone(timezone.utc).isoformat(),
     )
     # Вступление может уйти несколькими сообщениями (длинный шаблон,
@@ -940,7 +953,7 @@ async def launch_run(
             service, registry=registry, logger=logger,
             options=[
                 *(option["label"] for option in options),
-                *(["✅ Смогу в любые даты"] if settings["reverse_poll"] else []),
+                AVAILABLE_ALL_LABEL,
                 phrase(settings, "cant"),
             ],
             is_anonymous=False,
@@ -1103,6 +1116,7 @@ async def replay_early_answers(registry, poll_id: str,
                 answer_dates(
                     option_ids, run.get("options") or run["dates"],
                     reverse_poll=run.get("reverse_poll", False),
+                    all_dates_option=run.get("all_dates_option"),
                 ),
             )
         except Exception:  # noqa: BLE001

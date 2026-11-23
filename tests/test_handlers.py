@@ -6942,6 +6942,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("💬 Сообщение перед опросом", text)
             self.assertIn("📊 Опрос в Telegram", text)
             self.assertIn("Когда можешь служить", text)
+            self.assertIn("✅ Смогу в любые даты", text)
+            self.assertIn("❌ Не смогу в этом месяце", text)
             self.assertIn("срок как при", text)
             self.assertIn(
                 "При запуске вручную срок рассчитывается заново от текущего времени.",
