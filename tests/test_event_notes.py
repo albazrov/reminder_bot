@@ -6,7 +6,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -42,7 +42,7 @@ class EventNotesTest(unittest.TestCase):
         )
 
     def plan(self, sunday="2026-11-01", offset=0, task="звук",
-             service_id="sound", person="A"):
+             service_id="sound", person="A", chat_id=None, message_id=None):
         slots = {sunday: {task: [person]}}
         tasks = [{"name": task, "needed": 1, "max": 1, "day": offset}]
         self.registry.save_schedule_draft(
@@ -50,7 +50,8 @@ class EventNotesTest(unittest.TestCase):
             tasks=tasks, slots=slots, last_served={},
         )
         return self.registry.approve_schedule_plan(
-            1001, service_id, sunday[:7], slots, chat_id=None, message_id=None,
+            1001, service_id, sunday[:7], slots,
+            chat_id=chat_id, message_id=message_id,
             approved_slot_days={sunday: {task: {person: offset}}},
         )
 
@@ -523,6 +524,69 @@ class EventNotesTest(unittest.TestCase):
         self.assertEqual(len([
             call for call in bot.send_message.await_args_list if call.args[0] == -10002
         ]), 1)
+
+    def test_group_reminder_ttl_deletes_its_message_not_monthly_graph(self):
+        self.plan(chat_id=-10002, message_id=900)
+        reminder = self.registry.list_group_reminders("sound")[0]
+        self.registry.set_group_reminder_default_ttl(1001, "sound", 1)
+        bot = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(message_id=500)
+            ),
+            delete_message=AsyncMock(),
+        )
+        credentials = SimpleNamespace(
+            admin_tg_id=1001, yandex_public_url="unused"
+        )
+
+        async def send_and_expire():
+            with patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(return_value=({"звук": ["A"]}, True)),
+            ), patch("bot.app.send_admin_reports", new=AsyncMock()):
+                await app._process_service_reminder(
+                    bot,
+                    credentials,
+                    self.path,
+                    ZoneInfo("UTC"),
+                    self.registry,
+                    "sound",
+                    reminder["id"],
+                    LOG,
+                    LOG,
+                    run_date=date(2026, 10, 31),
+                )
+            now = datetime.now(timezone.utc) + timedelta(days=2)
+            await app._expire_group_reminder_messages(
+                bot, self.registry, 1001, now, LOG
+            )
+
+        asyncio.run(send_and_expire())
+        bot.delete_message.assert_awaited_once_with(-10002, 500)
+
+    def test_group_reminder_expiry_retries_when_telegram_returns_false(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        sent_at = datetime(2026, 11, 1, 18, tzinfo=timezone.utc)
+        self.registry.record_group_reminder_messages(
+            "sound",
+            reminder["id"],
+            "2026-11-02",
+            ((-10002, 501),),
+            1,
+            sent_at=sent_at,
+        )
+        bot = SimpleNamespace(delete_message=AsyncMock(return_value=False))
+        now = sent_at + timedelta(hours=1)
+
+        asyncio.run(app._expire_group_reminder_messages(
+            bot, self.registry, 1001, now, LOG
+        ))
+
+        retry = self.registry.list_due_group_reminder_messages(
+            now + timedelta(seconds=3)
+        )
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0]["message_id"], 501)
 
     def test_personal_preview_matches_real_delivery_and_db_failure_is_not_delivered(self):
         self.plan()

@@ -2083,6 +2083,50 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             actor_id,
         )
 
+    def test_group_reminder_ttl_settings_inherit_and_override(self):
+        async def run():
+            reminders = await self._open_sound_reminders()
+            default_menu = await self._click(
+                reminders.message,
+                lambda button: button.text == "🗑 Срок по умолчанию",
+            )
+            reminders = await self._click(
+                default_menu.message,
+                lambda button: button.text == "⏳ 24 ч",
+            )
+            self.assertEqual(
+                self.registry.get_service("sound")[
+                    "group_reminder_ttl_hours"
+                ],
+                24,
+            )
+
+            card = await self._click(
+                reminders.message, lambda button: button.text == "1"
+            )
+            ttl_menu = await self._click(
+                card.message, lambda button: button.text == "🗑 Срок жизни"
+            )
+            card = await self._click(
+                ttl_menu.message, lambda button: button.text == "⏳ 6 ч"
+            )
+            reminder = self.registry.list_group_reminders("sound")[0]
+            self.assertEqual(reminder["ttl_hours"], 6)
+
+            ttl_menu = await self._click(
+                card.message, lambda button: button.text == "🗑 Срок жизни"
+            )
+            card = await self._click(
+                ttl_menu.message,
+                lambda button: button.text == "🏠 Как у служения",
+            )
+            self.assertIsNone(
+                self.registry.list_group_reminders("sound")[0]["ttl_hours"]
+            )
+            self.assertIn("через 24 ч", card.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
     def _sound_slots(self):
         return sorted(
             (
@@ -2220,7 +2264,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 moved.message, lambda button: button.text == "⬅️ К напоминаниям"
             )
             self.assertIn("сборка · напоминания", back.message.answer.await_args.args[0])
-            self.assertEqual(len(self.callback_data_list(back.message)), 4)
+            self.assertEqual(len(self.callback_data_list(back.message)), 5)
             self.assertIn(
                 "group_reminder:summary:",
                 "\n".join(self.callback_data_list(back.message)),
@@ -2796,6 +2840,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 }
             )
             existing_id = self.registry.list_group_reminders("sound")[0]["id"]
+            self.registry.set_group_reminder_ttl(
+                67890, existing_id, 24
+            )
             menu = await self._open_sound_reminders()
             await self._click(
                 menu.message,
@@ -2807,6 +2854,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             screen_text = merge_screen.answer.await_args.args[0]
             self.assertIn("уже есть напоминание", screen_text)
+            self.assertIn("срок жизни основного", screen_text)
+            self.assertIn("24 ч", screen_text)
             self.assertIn("Итоговый текст для группы", screen_text)
             self.assertIn("25.10.2026", screen_text)
             loader_args = self.context.get_group_reminder_preview.await_args
@@ -2822,6 +2871,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             self.assertEqual(
                 self._sound_slots(), [(1, "18:00", merged_body)]
+            )
+            self.assertEqual(
+                self.registry.get_group_reminder(existing_id)["ttl_hours"],
+                24,
             )
 
         asyncio.run(run())
@@ -2866,6 +2919,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             self.assertIn(
                 "с таким же текстом", same.message.answer.await_args.args[0]
+            )
+            self.assertIn(
+                "срок жизни основного",
+                same.message.answer.await_args.args[0],
             )
             await self._click(
                 same.message,
@@ -6878,10 +6935,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn(
                 "Ход опроса", progress.message.answer.await_args.args[0]
             )
-            # Замены — в разделе «📅 График» (решение 17, 5в).
+            # Ручная правка дня открывается из графика.
             section = await press("rdy:month:sound")
             self.assertIn(
-                "rdy:repl:sound",
+                "rdy:pedit:sound:",
                 str(section.message.answer.await_args.kwargs["reply_markup"]),
             )
             # Пока опрос идёт — предварительный график, без утверждения.
@@ -7214,10 +7271,17 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for b in row if "Скатерти" in b.text
             )
             slot = await press(task_button)
-            added = await press(button(slot, "rdy:padd:"))
-            text = "".join(call.args[0] for call in added.message.answer.await_args_list)
-            self.assertIn("Поставлен(а): В", text)
-            self.assertIn("не входит в смену", text)
+            slot = await press(button(slot, "rdy:pbulkkeep:"))
+            self.assertIn("1. В", "".join(
+                call.args[0] for call in slot.message.answer.await_args_list
+            ))
+            input_handler = next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            await input_handler(self.message(67890, "1"))
+            added = await press(button(slot, "rdy:pbulkadd:"))
+            await press(button(added, "rdy:pbulksave:"))
             plan = self.registry.get_schedule_plan("kitchen", key)
             self.assertEqual(plan["slots"][plan["dates"][0]]["Скатерти"], ["В"])
             self.assertIsNone(plan["approved"])
@@ -7455,6 +7519,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             dates = await press(f"rdy:pedit:sound:{month_arg}")
             day = await press(data_of(dates, "rdy:pdate:"))
             slot = await press(data_of(day, "rdy:ptask:"))
+            slot = await press(data_of(slot, "rdy:pbulkkeep:"))
             ask_user = await press(data_of(slot, "rdy:pnew:"))
             markup = ask_user.message.answer.await_args.kwargs["reply_markup"]
             request = markup.keyboard[0][0].request_users
@@ -7475,12 +7540,21 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ]})
             await self.message_handler("on_users_shared")(shared)
             self.assertIn(
-                "Поставлен(а): Сергей Новый (@sergey_new)",
+                "Добавлен(а): Сергей Новый (@sergey_new)",
                 shared.answer.await_args_list[-1].args[0],
             )
+            save = next(
+                button.callback_data
+                for row in shared.answer.await_args_list[-1].kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row if button.text == "✅ Сохранить"
+            )
+            await press(save)
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(
-                plan["slots"][first_day]["звук"], ["Сергей Новый (@sergey_new)"]
+                plan["slots"][first_day]["звук"],
+                ["Алексей", "Сергей Новый (@sergey_new)"],
             )
             namesake = next(
                 item for item in self.registry.list_service_members("sound")
@@ -7925,43 +7999,60 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             dates_screen = await press(f"rdy:pedit:sound:{month_arg}")
             day = await press(data_of(dates_screen, "rdy:pdate:"))
             slot = await press(data_of(day, "rdy:ptask:"))
-            self.assertIn("Сейчас: Алексей", text_of(slot))
-            borys = next(
-                button for button in buttons(slot) if button.text == "👥 Борис"
+            self.assertIn("1. Алексей — звук", text_of(slot))
+            keep = next(
+                (button for button in buttons(slot)
+                 if button.text.endswith("Без удаления")),
+                None,
             )
-            # «Нужно 1» — Борис ставится вместо Алексея.
-            added = await press(borys.callback_data)
-            self.assertIn("Поставлен(а): Борис вместо Алексей", text_of(added))
-            self.assertIn("не отметил(а)", text_of(added))
-            plan = self.registry.get_schedule_plan("sound", key)
-            self.assertEqual(plan["slots"][dates[0]]["звук"], ["Борис"])
-            self.assertEqual(plan["edited"], 1)
-            stale = await press(borys.callback_data)
-            self.assertIn("устарел", stale.answer.await_args.args[0])
-            day_button = next(
-                button for button in buttons(added)
-                if button.text.startswith("📅 Борис —")
+            self.assertIsNotNone(
+                keep, (text_of(slot), [button.text for button in buttons(slot)])
             )
-            day_screen = await press(day_button.callback_data)
-            friday = next(
-                button for button in buttons(day_screen)
-                if button.text == "📅 пт (вс -2)"
+            candidates = await press(keep.callback_data)
+            self.assertIn("1. Борис", text_of(candidates))
+            input_handler = next(
+                item.callback for item in self.admin_router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
             )
-            set_day = await press(friday.callback_data)
-            self.assertIn("✅ День на эту дату: пт", text_of(set_day))
+            number_message = self.message(67890, "1")
+            await input_handler(number_message)
+            add = next(
+                button for button in buttons(candidates)
+                if button.text == "➕ Добавить"
+            )
+            added = await press(add.callback_data)
+            self.assertIn("Назначенные участники не будут заменены", text_of(added))
             self.assertEqual(
-                self.registry.get_schedule_plan("sound", key)["days"],
-                {dates[0]: {"Борис": -2}},
+                self.registry.get_schedule_plan("sound", key)["slots"][dates[0]]["звук"],
+                ["Алексей"],
             )
-            added = set_day
-            remove = next(
+            save = next(
                 button for button in buttons(added)
-                if button.text == "❌ Борис"
+                if button.text == "✅ Сохранить"
             )
-            await press(remove.callback_data)
+            saved = await press(save.callback_data)
+            plan = self.registry.get_schedule_plan("sound", key)
+            self.assertEqual(plan["slots"][dates[0]]["звук"], ["Алексей", "Борис"])
+            self.assertEqual(plan["edited"], 1)
+            stale = await press(data_of(slot, "rdy:pdate:"))
+            self.assertIn("График изменился", text_of(stale))
+
+            # Удаление выполняется отдельно, сразу для всех назначений дня.
+            task_again = await press(data_of(saved, "rdy:ptask:"))
+            number_message = self.message(67890, "1, 2")
+            await input_handler(number_message)
+            delete = next(
+                button for button in buttons(task_again)
+                if button.text == "🗑 Удалить"
+            )
+            after_delete = await press(delete.callback_data)
+            save = next(
+                button for button in buttons(after_delete)
+                if button.text == "✅ Сохранить"
+            )
+            await press(save.callback_data)
             plan = self.registry.get_schedule_plan("sound", key)
             self.assertEqual(plan["slots"][dates[0]]["звук"], [])
-            # Убранному из даты разовый день больше не нужен.
             self.assertEqual(plan["days"], {})
 
             plan_screen = await press(f"rdy:plan:sound:{month_arg}")

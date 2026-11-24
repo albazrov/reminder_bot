@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from bot.service_registry import ServiceRegistry
@@ -43,6 +44,134 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertEqual(
             len(self.registry.list_group_reminders("sound")), len(baseline) + 2
         )
+
+    def test_group_reminder_ttl_inherits_and_validates_service_setting(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        self.assertIsNone(reminder["ttl_hours"])
+        self.assertIsNone(
+            self.registry.get_service("sound")["group_reminder_ttl_hours"]
+        )
+
+        self.registry.set_group_reminder_default_ttl(1001, "sound", 24)
+        self.registry.set_group_reminder_ttl(1001, reminder["id"], 6)
+        self.assertEqual(
+            self.registry.get_group_reminder(reminder["id"])["ttl_hours"], 6
+        )
+        self.registry.set_group_reminder_ttl(1001, reminder["id"], None)
+        self.assertIsNone(
+            self.registry.get_group_reminder(reminder["id"])["ttl_hours"]
+        )
+        self.assertEqual(
+            self.registry.get_service("sound")["group_reminder_ttl_hours"], 24
+        )
+
+        for invalid in (0, 48, True, "24"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.registry.set_group_reminder_default_ttl(
+                    1001, "sound", invalid
+                )
+
+    def test_group_reminder_ttl_columns_migrate_existing_database(self):
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "ALTER TABLE services DROP COLUMN group_reminder_ttl_hours"
+            )
+            connection.execute(
+                "ALTER TABLE group_reminders DROP COLUMN ttl_hours"
+            )
+
+        migrated = ServiceRegistry(self.path)
+        migrated.initialize(1001, -10001)
+        self.assertIsNone(
+            migrated.get_service("sound")["group_reminder_ttl_hours"]
+        )
+        self.assertIsNone(
+            migrated.list_group_reminders("sound")[0]["ttl_hours"]
+        )
+
+    def test_group_reminder_message_expiry_persists_all_chunks_and_retries(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        sent_at = datetime(2026, 11, 1, 18, tzinfo=timezone.utc)
+        self.registry.record_group_reminder_messages(
+            "sound",
+            reminder["id"],
+            "2026-11-02",
+            ((-10001, 200), (-10001, 201)),
+            1,
+            sent_at=sent_at,
+        )
+        self.assertEqual(
+            self.registry.list_due_group_reminder_messages(
+                sent_at + timedelta(minutes=59)
+            ),
+            [],
+        )
+        due = self.registry.list_due_group_reminder_messages(
+            sent_at + timedelta(hours=1)
+        )
+        self.assertEqual(
+            [(item["chat_id"], item["message_id"]) for item in due],
+            [(-10001, 200), (-10001, 201)],
+        )
+        self.registry.record_group_reminder_message_delete_error(
+            due[0]["id"],
+            "temporary error",
+            sent_at + timedelta(hours=1),
+            retry_after=60,
+        )
+        self.assertEqual(
+            len(self.registry.list_due_group_reminder_messages(
+                sent_at + timedelta(hours=1, seconds=59)
+            )),
+            1,
+        )
+        retry = self.registry.list_due_group_reminder_messages(
+            sent_at + timedelta(hours=1, seconds=60)
+        )
+        self.assertEqual(len(retry), 2)
+        failed = retry[0]
+        self.registry.record_group_reminder_message_delete_error(
+            failed["id"],
+            "no permission",
+            sent_at + timedelta(hours=1, seconds=60),
+            final=True,
+        )
+        self.assertEqual(
+            len(self.registry.list_due_group_reminder_messages(
+                sent_at + timedelta(days=2)
+            )),
+            1,
+        )
+        self.registry.complete_group_reminder_message_deletion(retry[1]["id"])
+
+    def test_group_reminder_merge_keeps_surviving_reminder_ttl(self):
+        target_id = self.registry.add_group_reminder(
+            1001, "sound", 5, "12:34", "Основное", task="звук"
+        )
+        source_id = self.registry.add_group_reminder(
+            1001,
+            "sound",
+            5,
+            "12:34",
+            "Дополнительное",
+            allow_duplicate=True,
+            task="звук",
+        )
+        self.registry.set_group_reminder_ttl(1001, target_id, 24)
+        self.registry.set_group_reminder_ttl(1001, source_id, 1)
+
+        self.registry.merge_group_reminder(
+            1001,
+            target_id,
+            expected_slot=(5, "12:34"),
+            source_id=source_id,
+            source_slot=(5, "12:34"),
+        )
+
+        self.assertEqual(
+            self.registry.get_group_reminder(target_id)["ttl_hours"], 24
+        )
+        self.assertIsNone(self.registry.get_group_reminder(source_id))
 
     def test_change_callback_runs_only_for_committed_writes(self):
         changes = []

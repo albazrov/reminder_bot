@@ -311,6 +311,7 @@ class DialogRenderingTest(unittest.TestCase):
             send_message = AsyncMock(
                 return_value=SimpleNamespace(message_id=2)
             )
+            sent_messages = []
             markup = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Next", callback_data="next")
             ]])
@@ -320,10 +321,12 @@ class DialogRenderingTest(unittest.TestCase):
                 42,
                 "Заголовок\n" + "x" * 700,
                 reply_markup=markup,
+                on_message=sent_messages.append,
             )
 
             self.assertEqual(result.message_id, 2)
             self.assertEqual(send_message.await_count, 3)
+            self.assertEqual(len(sent_messages), 3)
             self.assertTrue(
                 all(
                     call.kwargs["reply_markup"] is None

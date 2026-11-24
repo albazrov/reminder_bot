@@ -126,8 +126,12 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertIn("неутверждённые правки", text)
             self.assertEqual(
                 [item.text for item in self.buttons(shown)],
-                ["🔁 Замены", "📥 Загрузить с диска", "🗳 Опрос", "🧮 Авто",
+                ["✏️ Изменить", "📥 Загрузить с диска", "🗳 Опрос", "🧮 Авто",
                  "📊 Сводка", "⬅️ К служению"],
+            )
+            self.assertIn(
+                "rdy:pedit:sound:202611",
+                [item.callback_data for item in self.buttons(shown)],
             )
             self.context.load_upcoming_service_events.assert_not_awaited()
             self.context.load_service_task_assignments.assert_not_awaited()
@@ -163,6 +167,58 @@ class ServiceScreensTest(unittest.TestCase):
         self.assertIn("Утверждённый", text)
         self.assertIn("назначений нет", text)
         self.assertNotIn("Не утверждён", text)
+
+    def test_editing_approved_plan_adds_without_replacing_until_save(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Алексей", ("Микшер",)),
+            RosterMember("Борис", ("Микшер",)),
+        ]})
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        slots = {"2026-11-15": {"Микшер": ["Алексей"]}}
+        self.plan(slots, approved=True, tasks=[{"name": "Микшер", "needed": 1}])
+        approved = self.registry.get_schedule_plan("sound", "2026-11")["approved"]
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                button.callback_data for button in self.buttons(dates)
+                if button.callback_data.startswith("rdy:pdate:")
+            ))
+            task = await self.press(next(
+                button.callback_data for button in self.buttons(day)
+                if button.callback_data.startswith("rdy:ptask:")
+            ))
+            add_stage = await self.press(next(
+                button.callback_data for button in self.buttons(task)
+                if button.text.endswith("Без удаления")
+            ))
+            self.assertIn("1. Борис", self.text(add_stage))
+            input_handler = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            await input_handler(self.message(1001, "1"))
+            added = await self.press(next(
+                button.callback_data for button in self.buttons(add_stage)
+                if button.text == "➕ Добавить"
+            ))
+            before_save = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(before_save["slots"], slots)
+            self.assertEqual(before_save["approved"], approved)
+            saved = await self.press(next(
+                button.callback_data for button in self.buttons(added)
+                if button.text == "✅ Сохранить"
+            ))
+            current = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(current["slots"]["2026-11-15"]["Микшер"],
+                             ["Алексей", "Борис"])
+            self.assertEqual(current["approved"], approved)
+            self.assertTrue(current["dirty"])
+            self.assertIn("участники всего дня", self.text(saved))
+
+        asyncio.run(run())
 
     def test_actual_days_from_adjacent_month_and_year(self):
         self.now = self.now.replace(year=2027, month=1)
@@ -230,7 +286,10 @@ class ServiceScreensTest(unittest.TestCase):
                 buttons = self.buttons(shown)
                 self.assertLessEqual(len(buttons), 8)
                 self.assertTrue(all(len(item.callback_data.encode()) <= 64 for item in buttons))
-                self.assertIn("rdy:repl:sound", [b.callback_data for b in buttons])
+                self.assertIn(
+                    "rdy:pedit:sound:202611",
+                    [b.callback_data for b in buttons],
+                )
                 self.assertIn("rdy:open:sound", [b.callback_data for b in buttons])
                 self.assertIn("service:service_excel:sound", [b.callback_data for b in buttons])
                 self.assertIn("rdy:summary:sound", [b.callback_data for b in buttons])

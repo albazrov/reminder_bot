@@ -4,6 +4,21 @@ from __future__ import annotations
 from aiogram.exceptions import TelegramAPIError
 
 
+def group_message_reference(message, chat_id: int) -> tuple[int, int]:
+    """Return a persisted (group chat, Telegram message) pair."""
+    message_id = getattr(message, "message_id", None)
+    if (
+        isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or chat_id >= 0
+        or isinstance(message_id, bool)
+        or not isinstance(message_id, int)
+        or message_id <= 0
+    ):
+        raise ValueError("Telegram не вернул ID группового сообщения.")
+    return chat_id, message_id
+
+
 def thread_kwargs(service: dict | None) -> dict:
     """message_thread_id темы чата служения, если тема выбрана (/here)."""
     thread_id = (service or {}).get("group_thread_id")

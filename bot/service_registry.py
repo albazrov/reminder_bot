@@ -152,7 +152,7 @@ _UNSET = object()
 _GROUP_REMINDER_COLUMNS = (
     "g.id, g.service_id, g.body, g.reminder_days, g.reminder_time, "
     "g.enabled, g.created_at, g.task, g.active_from, g.active_until, "
-    "t.day_offset AS task_day"
+    "g.ttl_hours, t.day_offset AS task_day"
 )
 _GROUP_REMINDER_SOURCE = (
     "group_reminders g LEFT JOIN service_tasks t "
@@ -260,7 +260,9 @@ class ServiceRegistry:
                         CHECK (reminder_days >= 0),
                     reminder_time TEXT NOT NULL DEFAULT '18:00',
                     group_template TEXT,
-                    personal_templates_json TEXT
+                    personal_templates_json TEXT,
+                    group_reminder_ttl_hours INTEGER
+                        CHECK (group_reminder_ttl_hours BETWEEN 1 AND 47)
                 );
 
                 CREATE TABLE IF NOT EXISTS super_admins (
@@ -551,7 +553,8 @@ class ServiceRegistry:
                     reminder_time TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1
                         CHECK (enabled IN (0, 1)),
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    ttl_hours INTEGER CHECK (ttl_hours BETWEEN 1 AND 47)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_group_reminders_service
@@ -565,6 +568,25 @@ class ServiceRegistry:
                     delivered_at TEXT NOT NULL,
                     PRIMARY KEY (reminder_id, event_date, recipient_key)
                 );
+
+                CREATE TABLE IF NOT EXISTS group_reminder_message_expirations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service_id TEXT NOT NULL,
+                    reminder_id INTEGER NOT NULL,
+                    event_date TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL CHECK (chat_id < 0),
+                    message_id INTEGER NOT NULL CHECK (message_id > 0),
+                    delete_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    next_attempt_at TEXT,
+                    failed_at TEXT,
+                    last_error TEXT,
+                    UNIQUE (chat_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_group_message_expiry_due
+                    ON group_reminder_message_expirations(
+                        delete_at, next_attempt_at
+                    );
 
                 CREATE TABLE IF NOT EXISTS group_reminder_migrations (
                     name TEXT PRIMARY KEY
@@ -1005,6 +1027,14 @@ class ServiceRegistry:
             # Опрос готовности (этап 5): колонки, добавленные после
             # первого развёртывания.
             for table, column, ddl in (
+                (
+                    "services", "group_reminder_ttl_hours",
+                    "INTEGER CHECK (group_reminder_ttl_hours BETWEEN 1 AND 47)",
+                ),
+                (
+                    "group_reminders", "ttl_hours",
+                    "INTEGER CHECK (ttl_hours BETWEEN 1 AND 47)",
+                ),
                 ("service_tasks", "people_max", "INTEGER"),
                 ("service_tasks", "day_offset", "INTEGER"),
                 ("service_tasks", "same_week", "INTEGER NOT NULL DEFAULT 0"),
@@ -1729,12 +1759,12 @@ class ServiceRegistry:
                 "SELECT id, name, aliases_json, assignment_layout, "
                 "group_chat_id, group_thread_id, enabled, reminder_days, "
                 "reminder_time, group_template, personal_templates_json, "
-                "admin_report_template "
+                "group_reminder_ttl_hours, admin_report_template "
                 "FROM services WHERE archived = 0 ORDER BY id"
             ).fetchall()
             reminders = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task, active_from, active_until "
+                "enabled, created_at, task, active_from, active_until, ttl_hours "
                 "FROM group_reminders "
                 "ORDER BY service_id, reminder_days, reminder_time, id"
             ).fetchall()
@@ -1752,6 +1782,7 @@ class ServiceRegistry:
                     "task": reminder["task"],
                     "active_from": reminder["active_from"],
                     "active_until": reminder["active_until"],
+                    "ttl_hours": reminder["ttl_hours"],
                 }
             )
         services = []
@@ -2720,6 +2751,52 @@ class ServiceRegistry:
                 },
             )
         return reminder_id
+
+    def set_group_reminder_default_ttl(
+        self, actor_id: int, service_id: str, ttl_hours: int | None
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            self._require_service_editor(connection, actor_id, service_id)
+            connection.execute(
+                "UPDATE services SET group_reminder_ttl_hours = ? WHERE id = ?",
+                (ttl_hours, service_id),
+            )
+            self._audit(
+                connection,
+                actor_id,
+                "group_reminder_default_ttl_updated",
+                service_id,
+                {"ttl_hours": ttl_hours},
+            )
+
+    def set_group_reminder_ttl(
+        self, actor_id: int, reminder_id: int, ttl_hours: int | None
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT service_id FROM group_reminders WHERE id = ?",
+                (reminder_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Групповое напоминание больше не существует.")
+            self._require_service_editor(connection, actor_id, row["service_id"])
+            connection.execute(
+                "UPDATE group_reminders SET ttl_hours = ? WHERE id = ?",
+                (ttl_hours, reminder_id),
+            )
+            self._audit(
+                connection,
+                actor_id,
+                "group_reminder_ttl_updated",
+                row["service_id"],
+                {"reminder_id": reminder_id, "ttl_hours": ttl_hours},
+            )
 
     def update_group_reminder(
         self,
@@ -4067,6 +4144,15 @@ class ServiceRegistry:
             )
 
     @staticmethod
+    def _validate_group_reminder_ttl(ttl_hours: int | None) -> None:
+        if ttl_hours is not None and (
+            isinstance(ttl_hours, bool)
+            or not isinstance(ttl_hours, int)
+            or not 1 <= ttl_hours <= 47
+        ):
+            raise ValueError("Срок жизни должен быть от 1 до 47 часов.")
+
+    @staticmethod
     def _ensure_group_schedule_unique(
         connection: sqlite3.Connection,
         service_id: str,
@@ -4307,19 +4393,179 @@ class ServiceRegistry:
         reminder_id: int,
         event_date: str,
         recipient_key: str,
+        *,
+        message_refs: tuple[tuple[int, int], ...] = (),
+        ttl_hours: int | None = None,
+        sent_at: datetime | None = None,
     ) -> None:
         _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
         with self._connection() as connection:
-            if connection.execute(
-                "SELECT 1 FROM group_reminders WHERE id = ?",
+            row = connection.execute(
+                "SELECT service_id FROM group_reminders WHERE id = ?",
                 (reminder_id,),
-            ).fetchone() is None:
+            ).fetchone()
+            if row is None:
                 raise ValueError("Групповое напоминание не найдено.")
             connection.execute(
                 "INSERT OR IGNORE INTO group_reminder_deliveries "
                 "(reminder_id, event_date, recipient_key, delivered_at) "
                 "VALUES (?, ?, ?, ?)",
                 (reminder_id, event_date, recipient_key, _utc_now()),
+            )
+            if ttl_hours is not None:
+                self._insert_group_reminder_message_expirations(
+                    connection,
+                    row["service_id"],
+                    reminder_id,
+                    event_date,
+                    message_refs,
+                    ttl_hours,
+                    sent_at or datetime.now(timezone.utc),
+                )
+
+    def record_group_reminder_messages(
+        self,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        message_refs: tuple[tuple[int, int], ...],
+        ttl_hours: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> None:
+        _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            self._insert_group_reminder_message_expirations(
+                connection,
+                service_id,
+                reminder_id,
+                event_date,
+                message_refs,
+                ttl_hours,
+                sent_at or datetime.now(timezone.utc),
+            )
+
+    @staticmethod
+    def _insert_group_reminder_message_expirations(
+        connection: sqlite3.Connection,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        message_refs: tuple[tuple[int, int], ...],
+        ttl_hours: int,
+        sent_at: datetime,
+    ) -> None:
+        if not message_refs:
+            raise ValueError("Нет Telegram-сообщений для планирования удаления.")
+        if sent_at.tzinfo is None or sent_at.utcoffset() is None:
+            raise ValueError("Время отправки должно содержать часовой пояс.")
+        try:
+            date.fromisoformat(event_date)
+        except (TypeError, ValueError):
+            raise ValueError("event_date должен быть датой YYYY-MM-DD.") from None
+        delete_at = (
+            sent_at.astimezone(timezone.utc) + timedelta(hours=ttl_hours)
+        ).isoformat(timespec="seconds")
+        for chat_id, message_id in message_refs:
+            if (
+                isinstance(chat_id, bool)
+                or not isinstance(chat_id, int)
+                or chat_id >= 0
+                or isinstance(message_id, bool)
+                or not isinstance(message_id, int)
+                or message_id <= 0
+            ):
+                raise ValueError("Некорректный ID группового сообщения.")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO group_reminder_message_expirations (
+                    service_id, reminder_id, event_date, chat_id, message_id,
+                    delete_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    service_id,
+                    reminder_id,
+                    event_date,
+                    chat_id,
+                    message_id,
+                    delete_at,
+                ),
+            )
+
+    def list_due_group_reminder_messages(
+        self, now: datetime, *, limit: int = 100
+    ) -> list[dict]:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Время проверки должно содержать часовой пояс.")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit должен быть положительным целым числом.")
+        now_text = now.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, service_id, reminder_id, event_date, chat_id,
+                       message_id, delete_at, attempts
+                FROM group_reminder_message_expirations
+                WHERE failed_at IS NULL AND delete_at <= ?
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY delete_at, id
+                LIMIT ?
+                """,
+                (now_text, now_text, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete_group_reminder_message_deletion(self, expiration_id: int) -> None:
+        _validate_positive_id(expiration_id, "expiration_id")
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "DELETE FROM group_reminder_message_expirations WHERE id = ?",
+                (expiration_id,),
+            )
+
+    def record_group_reminder_message_delete_error(
+        self,
+        expiration_id: int,
+        error: str,
+        now: datetime,
+        *,
+        retry_after: int | None = None,
+        final: bool = False,
+    ) -> None:
+        _validate_positive_id(expiration_id, "expiration_id")
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Время ошибки должно содержать часовой пояс.")
+        now_utc = now.astimezone(timezone.utc)
+        with self._connection(notify=False) as connection:
+            row = connection.execute(
+                "SELECT attempts FROM group_reminder_message_expirations "
+                "WHERE id = ?",
+                (expiration_id,),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = row["attempts"] + 1
+            next_attempt = None
+            failed_at = None
+            if final:
+                failed_at = now_utc.isoformat(timespec="seconds")
+            else:
+                delay = retry_after or min(60, 2 ** min(attempts, 6))
+                next_attempt = (
+                    now_utc + timedelta(seconds=delay)
+                ).isoformat(timespec="seconds")
+            connection.execute(
+                """
+                UPDATE group_reminder_message_expirations
+                SET attempts = ?, next_attempt_at = ?, failed_at = ?,
+                    last_error = ?
+                WHERE id = ?
+                """,
+                (attempts, next_attempt, failed_at, error[:500], expiration_id),
             )
 
     # Deprecated aliases retained for older integrations.

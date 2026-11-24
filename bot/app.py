@@ -22,6 +22,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import (
     TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
     TelegramNetworkError,
     TelegramRetryAfter,
     TelegramServerError,
@@ -60,6 +62,7 @@ if __package__:
     )
     from .admin_report import report_text, send_admin_reports
     from .event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes
+    from .group_send import group_message_reference
     from .handlers import register, send_to_service_group
     from .logger import setup_loggers
     from .notifier import (
@@ -131,6 +134,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     )
     from bot.admin_report import report_text, send_admin_reports
     from bot.event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes
+    from bot.group_send import group_message_reference
     from bot.assignment_fields import (
         AssignmentFields, AssignmentFieldResolutionError, resolve_assignment_fields,
     )
@@ -1887,11 +1891,23 @@ async def _process_service_reminder(
                     service_id, event_date,
                 )
                 return
+            ttl_hours = reminder.get("ttl_hours")
+            if ttl_hours is None:
+                ttl_hours = service.get("group_reminder_ttl_hours")
+            message_refs: list[tuple[int, int]] = []
+
+            def capture_message(message, chat_id: int) -> None:
+                message_refs.append(group_message_reference(message, chat_id))
+
             try:
                 await send_to_service_group(
                     lambda chat_id, text, **kwargs: send_telegram_screen(
                         bot.send_message, chat_id, text,
-                        limit=TELEGRAM_TEXT_LIMIT, **kwargs,
+                        limit=TELEGRAM_TEXT_LIMIT,
+                        on_message=(
+                            lambda message: capture_message(message, chat_id)
+                        ) if ttl_hours is not None else None,
+                        **kwargs,
                     ),
                     group_chat_id,
                     group_text,
@@ -1900,6 +1916,21 @@ async def _process_service_reminder(
                     logger=debug_logger,
                 )
             except Exception as exc:
+                if ttl_hours is not None and message_refs:
+                    try:
+                        registry.record_group_reminder_messages(
+                            service_id,
+                            reminder["id"],
+                            event_date.isoformat(),
+                            tuple(message_refs),
+                            ttl_hours,
+                        )
+                    except Exception:
+                        debug_logger.exception(
+                            "Не удалось запланировать удаление частично "
+                            "отправленного напоминания %s",
+                            reminder["id"],
+                        )
                 debug_logger.exception(
                     "Не удалось отправить групповое уведомление %s на %s",
                     service_id,
@@ -1919,6 +1950,16 @@ async def _process_service_reminder(
                         reminder["id"],
                         event_date.isoformat(),
                         group_recipient,
+                        message_refs=tuple(message_refs),
+                        ttl_hours=ttl_hours,
+                    )
+                elif ttl_hours is not None and message_refs:
+                    registry.record_group_reminder_messages(
+                        service_id,
+                        reminder["id"],
+                        event_date.isoformat(),
+                        tuple(message_refs),
+                        ttl_hours,
                     )
                 interaction_logger.info(
                     "Групповое уведомление служения %s отправлено на %s",
@@ -1941,6 +1982,94 @@ async def _process_service_reminder(
                 "Не удалось подготовить отчёт админам служения %s",
                 service_id,
             )
+
+
+async def _expire_group_reminder_messages(
+    bot: Bot,
+    registry: ServiceRegistry,
+    admin_id: int,
+    now: datetime,
+    debug_logger,
+) -> None:
+    for item in registry.list_due_group_reminder_messages(now):
+        try:
+            deleted = await bot.delete_message(
+                item["chat_id"], item["message_id"]
+            )
+            if deleted is not True:
+                registry.record_group_reminder_message_delete_error(
+                    item["id"],
+                    "Telegram не подтвердил удаление сообщения.",
+                    now,
+                )
+                debug_logger.warning(
+                    "Telegram не подтвердил удаление группового "
+                    "напоминания %s в чате %s",
+                    item["reminder_id"], item["chat_id"],
+                )
+                continue
+        except TelegramBadRequest as exc:
+            if "message to delete not found" in str(exc).lower():
+                registry.complete_group_reminder_message_deletion(item["id"])
+                continue
+            registry.record_group_reminder_message_delete_error(
+                item["id"], str(exc), now, final=True
+            )
+            debug_logger.error(
+                "Не удалось удалить групповое напоминание %s в чате %s: %s",
+                item["reminder_id"], item["chat_id"], exc,
+            )
+            await _notify_admin(
+                bot,
+                admin_id,
+                f"Не удалось удалить групповое напоминание служения "
+                f"«{item['service_id']}» на {item['event_date']}. "
+                "Проверьте права бота и удалите сообщение вручную.",
+                debug_logger,
+            )
+        except TelegramForbiddenError as exc:
+            registry.record_group_reminder_message_delete_error(
+                item["id"], str(exc), now, final=True
+            )
+            debug_logger.error(
+                "Нет прав удалить групповое напоминание %s в чате %s: %s",
+                item["reminder_id"], item["chat_id"], exc,
+            )
+            await _notify_admin(
+                bot,
+                admin_id,
+                f"Бот не может удалить групповое напоминание служения "
+                f"«{item['service_id']}» на {item['event_date']}. "
+                "Проверьте права бота в групповом чате.",
+                debug_logger,
+            )
+        except TelegramRetryAfter as exc:
+            delay = max(1, int(exc.retry_after))
+            registry.record_group_reminder_message_delete_error(
+                item["id"], str(exc), now, retry_after=delay
+            )
+            debug_logger.warning(
+                "Telegram ограничил удаление напоминания %s; повтор через %s с",
+                item["reminder_id"], delay,
+            )
+        except TelegramAPIError as exc:
+            registry.record_group_reminder_message_delete_error(
+                item["id"], str(exc), now
+            )
+            debug_logger.warning(
+                "Временная ошибка удаления группового напоминания %s: %s",
+                item["reminder_id"], exc,
+            )
+        except OSError as exc:
+            registry.record_group_reminder_message_delete_error(
+                item["id"], str(exc), now
+            )
+            debug_logger.warning(
+                "Сетевая ошибка удаления группового напоминания %s: %s",
+                item["reminder_id"], exc,
+            )
+        else:
+            registry.complete_group_reminder_message_deletion(item["id"])
 
 
 async def _process_user_reminder_schedule(
@@ -2955,6 +3084,38 @@ async def _run_locked(args: CliArgs) -> None:
                 )
 
             context.refresh_service_reminder_jobs = refresh_service_reminders
+
+            async def scheduled_group_message_expiry() -> None:
+                try:
+                    await _expire_group_reminder_messages(
+                        bot,
+                        service_registry,
+                        credentials.admin_tg_id,
+                        datetime.now(tz),
+                        debug_logger,
+                    )
+                except Exception:
+                    debug_logger.exception(
+                        "Ошибка очистки групповых сообщений напоминаний"
+                    )
+                    await _notify_admin(
+                        bot,
+                        credentials.admin_tg_id,
+                        "Не удалось выполнить очистку старых групповых "
+                        "напоминаний. Подробности записаны в журнал.",
+                        debug_logger,
+                    )
+
+            scheduler.add_job(
+                scheduled_group_message_expiry,
+                "cron",
+                minute="*",
+                id="reminder-message-expiry",
+                replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
+                max_instances=1,
+            )
 
             async def scheduled_user_reminder(schedule_id: int) -> None:
                 schedule = service_registry.get_user_reminder_schedule(
