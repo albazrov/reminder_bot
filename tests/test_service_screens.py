@@ -126,7 +126,8 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertIn("неутверждённые правки", text)
             self.assertEqual(
                 [item.text for item in self.buttons(shown)],
-                ["✏️ Изменить", "📥 Загрузить с диска", "🗳 Опрос", "🧮 Авто",
+                ["✏️ Изменить", "🔁 Замены", "📥 Загрузить с диска",
+                 "🗳 Опрос", "🧮 Авто",
                  "📊 Сводка", "⬅️ К служению"],
             )
             self.assertIn(

@@ -173,6 +173,36 @@ class ServiceRegistryTest(unittest.TestCase):
         )
         self.assertIsNone(self.registry.get_group_reminder(source_id))
 
+    def test_group_reminder_merge_rejects_changed_effective_ttl(self):
+        target_id = self.registry.add_group_reminder(
+            1001, "sound", 5, "12:34", "Основное", task="звук"
+        )
+        self.registry.set_group_reminder_default_ttl(1001, "sound", 1)
+        self.registry.set_group_reminder_default_ttl(1001, "sound", 6)
+        with self.assertRaisesRegex(ValueError, "изменились"):
+            self.registry.merge_group_reminder(
+                1001,
+                target_id,
+                expected_slot=(5, "12:34"),
+                expected_ttl=1,
+            )
+        self.registry.set_group_reminder_ttl(1001, target_id, 24)
+        self.registry.set_group_reminder_default_ttl(1001, "sound", 1)
+        self.registry.merge_group_reminder(
+            1001,
+            target_id,
+            expected_slot=(5, "12:34"),
+            expected_ttl=24,
+        )
+        self.registry.set_group_reminder_ttl(1001, target_id, 6)
+        with self.assertRaisesRegex(ValueError, "изменились"):
+            self.registry.merge_group_reminder(
+                1001,
+                target_id,
+                expected_slot=(5, "12:34"),
+                expected_ttl=24,
+            )
+
     def test_change_callback_runs_only_for_committed_writes(self):
         changes = []
         registry = ServiceRegistry(

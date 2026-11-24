@@ -4,8 +4,8 @@ from __future__ import annotations
 from aiogram.exceptions import TelegramAPIError
 
 
-def group_message_reference(message, chat_id: int) -> tuple[int, int]:
-    """Return a persisted (group chat, Telegram message) pair."""
+def group_message_reference(message, chat_id: int) -> tuple[int, int] | None:
+    """Return a persistable group-message reference, if Telegram returned one."""
     message_id = getattr(message, "message_id", None)
     if (
         isinstance(chat_id, bool)
@@ -15,7 +15,7 @@ def group_message_reference(message, chat_id: int) -> tuple[int, int]:
         or not isinstance(message_id, int)
         or message_id <= 0
     ):
-        raise ValueError("Telegram не вернул ID группового сообщения.")
+        return None
     return chat_id, message_id
 
 

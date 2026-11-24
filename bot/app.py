@@ -12,7 +12,7 @@ import tempfile
 import time
 from contextlib import suppress
 from dataclasses import replace as dataclass_replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1897,7 +1897,9 @@ async def _process_service_reminder(
             message_refs: list[tuple[int, int]] = []
 
             def capture_message(message, chat_id: int) -> None:
-                message_refs.append(group_message_reference(message, chat_id))
+                reference = group_message_reference(message, chat_id)
+                if reference is not None:
+                    message_refs.append(reference)
 
             try:
                 await send_to_service_group(
@@ -1946,21 +1948,63 @@ async def _process_service_reminder(
                 )
             else:
                 if _same_reminder_slot(registry, reminder):
+                    sent_at = datetime.now(timezone.utc)
                     registry.mark_group_reminder_delivered(
                         reminder["id"],
                         event_date.isoformat(),
                         group_recipient,
                         message_refs=tuple(message_refs),
                         ttl_hours=ttl_hours,
+                        sent_at=sent_at,
                     )
+                    if ttl_hours is not None and message_refs:
+                        try:
+                            registry.record_group_reminder_messages(
+                                service_id,
+                                reminder["id"],
+                                event_date.isoformat(),
+                                tuple(message_refs),
+                                ttl_hours,
+                                sent_at=sent_at,
+                            )
+                        except Exception:
+                            debug_logger.exception(
+                                "Не удалось запланировать удаление "
+                                "отправленного напоминания %s",
+                                reminder["id"],
+                            )
+                            await _notify_admin(
+                                bot,
+                                credentials.admin_tg_id,
+                                "Групповое напоминание отправлено, но не "
+                                "удалось запланировать его удаление. "
+                                "Проверьте срок жизни и удалите сообщение "
+                                "вручную.",
+                                debug_logger,
+                            )
                 elif ttl_hours is not None and message_refs:
-                    registry.record_group_reminder_messages(
-                        service_id,
-                        reminder["id"],
-                        event_date.isoformat(),
-                        tuple(message_refs),
-                        ttl_hours,
-                    )
+                    try:
+                        registry.record_group_reminder_messages(
+                            service_id,
+                            reminder["id"],
+                            event_date.isoformat(),
+                            tuple(message_refs),
+                            ttl_hours,
+                        )
+                    except Exception:
+                        debug_logger.exception(
+                            "Не удалось запланировать удаление частично "
+                            "отправленного напоминания %s",
+                            reminder["id"],
+                        )
+                        await _notify_admin(
+                            bot,
+                            credentials.admin_tg_id,
+                            "Часть группового напоминания отправлена, но "
+                            "не удалось запланировать её удаление. "
+                            "Проверьте чат и удалите сообщения вручную.",
+                            debug_logger,
+                        )
                 interaction_logger.info(
                     "Групповое уведомление служения %s отправлено на %s",
                     service_id,
@@ -1991,6 +2035,21 @@ async def _expire_group_reminder_messages(
     now: datetime,
     debug_logger,
 ) -> None:
+    for capture in registry.list_group_reminder_expiry_captures():
+        try:
+            registry.record_group_reminder_messages(
+                capture["service_id"],
+                capture["reminder_id"],
+                capture["event_date"],
+                capture["message_refs"],
+                capture["ttl_hours"],
+                sent_at=capture["sent_at"],
+            )
+        except Exception:
+            debug_logger.exception(
+                "Не удалось повторно запланировать удаление напоминания %s",
+                capture["reminder_id"],
+            )
     for item in registry.list_due_group_reminder_messages(now):
         try:
             deleted = await bot.delete_message(
@@ -2046,7 +2105,10 @@ async def _expire_group_reminder_messages(
         except TelegramRetryAfter as exc:
             delay = max(1, int(exc.retry_after))
             registry.record_group_reminder_message_delete_error(
-                item["id"], str(exc), now, retry_after=delay
+                item["id"],
+                str(exc),
+                datetime.now(now.tzinfo) if now.tzinfo else datetime.now(timezone.utc),
+                retry_after=delay,
             )
             debug_logger.warning(
                 "Telegram ограничил удаление напоминания %s; повтор через %s с",

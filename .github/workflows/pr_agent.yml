@@ -6,7 +6,11 @@ on:
 
 jobs:
   pr_agent_job:
-    if: ${{ github.event.sender.type != 'Bot' && (github.event_name != 'issue_comment' || github.event.issue.pull_request) }}
+    if: >-
+      ${{ github.event.sender.type != 'Bot' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request) }}
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -15,8 +19,8 @@ jobs:
     name: Run pr agent on every pull request
     steps:
       - name: PR Agent action step
-        id: pragent
         uses: the-pr-agent/pr-agent@bfde80e14fe255653060517c26ef9b906a60336c
         env:
-          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          config.model: "gemini/gemini-3.8-flash"
+          GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

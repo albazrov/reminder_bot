@@ -569,6 +569,19 @@ class ServiceRegistry:
                     PRIMARY KEY (reminder_id, event_date, recipient_key)
                 );
 
+                CREATE TABLE IF NOT EXISTS group_reminder_expiry_captures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service_id TEXT NOT NULL,
+                    reminder_id INTEGER NOT NULL,
+                    event_date TEXT NOT NULL,
+                    message_refs_json TEXT NOT NULL,
+                    ttl_hours INTEGER NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    UNIQUE (
+                        service_id, reminder_id, event_date, message_refs_json
+                    )
+                );
+
                 CREATE TABLE IF NOT EXISTS group_reminder_message_expirations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     service_id TEXT NOT NULL,
@@ -2930,6 +2943,7 @@ class ServiceRegistry:
         body=_UNSET,
         *,
         expected_slot: tuple[int, str],
+        expected_ttl=_UNSET,
         source_id: int | None = None,
         source_slot: tuple[int, str] | None = None,
     ) -> None:
@@ -2967,6 +2981,20 @@ class ServiceRegistry:
                 or not target["enabled"]
             ):
                 raise stale
+            if expected_ttl is not _UNSET:
+                service = connection.execute(
+                    "SELECT group_reminder_ttl_hours FROM services WHERE id = ?",
+                    (target["service_id"],),
+                ).fetchone()
+                if service is None:
+                    raise ValueError("Служение больше не существует.")
+                current_ttl = (
+                    target["ttl_hours"]
+                    if target["ttl_hours"] is not None
+                    else service["group_reminder_ttl_hours"]
+                )
+                if current_ttl != expected_ttl:
+                    raise stale
             if source_id is not None:
                 source = connection.execute(
                     "SELECT service_id, reminder_days, reminder_time, task, "
@@ -4400,6 +4428,14 @@ class ServiceRegistry:
     ) -> None:
         _validate_positive_id(reminder_id, "reminder_id")
         self._validate_group_reminder_ttl(ttl_hours)
+        if ttl_hours is not None and message_refs:
+            captured_at = sent_at or datetime.now(timezone.utc)
+            if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+                raise ValueError("Время отправки должно содержать часовой пояс.")
+            message_refs_json = json.dumps(message_refs, separators=(",", ":"))
+        else:
+            captured_at = None
+            message_refs_json = None
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT service_id FROM group_reminders WHERE id = ?",
@@ -4413,15 +4449,24 @@ class ServiceRegistry:
                 "VALUES (?, ?, ?, ?)",
                 (reminder_id, event_date, recipient_key, _utc_now()),
             )
-            if ttl_hours is not None:
-                self._insert_group_reminder_message_expirations(
-                    connection,
-                    row["service_id"],
-                    reminder_id,
-                    event_date,
-                    message_refs,
-                    ttl_hours,
-                    sent_at or datetime.now(timezone.utc),
+            if message_refs_json is not None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO group_reminder_expiry_captures (
+                        service_id, reminder_id, event_date, message_refs_json,
+                        ttl_hours, sent_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["service_id"],
+                        reminder_id,
+                        event_date,
+                        message_refs_json,
+                        ttl_hours,
+                        captured_at.astimezone(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                    ),
                 )
 
     def record_group_reminder_messages(
@@ -4447,6 +4492,43 @@ class ServiceRegistry:
                 ttl_hours,
                 sent_at or datetime.now(timezone.utc),
             )
+            connection.execute(
+                """
+                DELETE FROM group_reminder_expiry_captures
+                WHERE service_id = ? AND reminder_id = ? AND event_date = ?
+                  AND message_refs_json = ?
+                """,
+                (
+                    service_id,
+                    reminder_id,
+                    event_date,
+                    json.dumps(message_refs, separators=(",", ":")),
+                ),
+            )
+
+    def list_group_reminder_expiry_captures(self) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, service_id, reminder_id, event_date,
+                       message_refs_json, ttl_hours, sent_at
+                FROM group_reminder_expiry_captures
+                ORDER BY id
+                """
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "message_refs": tuple(
+                    (int(chat_id), int(message_id))
+                    for chat_id, message_id in json.loads(
+                        row["message_refs_json"]
+                    )
+                ),
+                "sent_at": datetime.fromisoformat(row["sent_at"]),
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _insert_group_reminder_message_expirations(

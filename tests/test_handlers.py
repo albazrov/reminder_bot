@@ -15,7 +15,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeybo
 
 from bot import readiness
 from bot.excel_parser import RosterMember, ServiceAssignment, ServiceEvent
-from bot.handlers import register, router
+from bot.handlers import CONTACT_BACK_TEXT, register, router
 from bot.month_summary import month_title, next_month
 from bot.navigation import NAV_CANCEL_TEXT, NAV_HINT, NAV_HOME_TEXT
 from bot.service_registry import ServiceRegistry
@@ -2085,6 +2085,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
     def test_group_reminder_ttl_settings_inherit_and_override(self):
         async def run():
+            other_id = self.registry.add_group_reminder(
+                67890, "sound", 2, "09:00", "Другой текст",
+                allow_duplicate=True,
+            )
             reminders = await self._open_sound_reminders()
             default_menu = await self._click(
                 reminders.message,
@@ -2107,6 +2111,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ttl_menu = await self._click(
                 card.message, lambda button: button.text == "🗑 Срок жизни"
             )
+            stale_pick = next(
+                button.callback_data
+                for row in ttl_menu.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.text == "⏳ 1 ч"
+            )
             card = await self._click(
                 ttl_menu.message, lambda button: button.text == "⏳ 6 ч"
             )
@@ -2124,6 +2136,34 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.list_group_reminders("sound")[0]["ttl_hours"]
             )
             self.assertIn("через 24 ч", card.message.answer.await_args.args[0])
+
+            reminders = await self._click(
+                card.message,
+                lambda button: button.text == "⬅️ К напоминаниям",
+            )
+            other_card = await self._click(
+                reminders.message, lambda button: button.text == "2"
+            )
+            other_ttl = await self._click(
+                other_card.message,
+                lambda button: button.text == "🗑 Срок жизни",
+            )
+            stale_callback = SimpleNamespace(
+                data=stale_pick,
+                from_user=SimpleNamespace(id=12345),
+                message=self.message(12345, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                stale_callback
+            )
+            self.assertIsNone(
+                self.registry.get_group_reminder(other_id)["ttl_hours"]
+            )
+            stale_callback.answer.assert_awaited_once()
+            self.assertIn(
+                "устарел", stale_callback.answer.await_args.args[0].lower()
+            )
 
         asyncio.run(run())
 
@@ -7263,8 +7303,34 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             plan = self.registry.get_schedule_plan("kitchen", key)
             self.assertTrue(all(not values.get("Скатерти")
                                 for values in plan["slots"].values()))
+            first_day = plan["dates"][0]
+            assigned_task = next(
+                task["name"] for task in plan["tasks"]
+                if task["name"] != "Скатерти"
+            )
+            slots = {
+                day_key: {
+                    task_name: list(people)
+                    for task_name, people in assignments.items()
+                }
+                for day_key, assignments in plan["slots"].items()
+            }
+            for people in slots[first_day].values():
+                people[:] = [person for person in people if person != "А"]
+            slots[first_day][assigned_task] = ["А"]
+            self.registry.set_schedule_slots(
+                67890, "kitchen", key, slots
+            )
             dates = await press(f"rdy:pedit:kitchen:{month}")
             day = await press(button(dates, "rdy:pdate:"))
+            day_override = await press(button(day, "rdy:pslot:"))
+            self.assertTrue(any(
+                item.startswith("rdy:pday:")
+                for item in self.callback_data_list(day_override.message)
+            ), (
+                day_override.message.answer.await_args.args[0],
+                self.callback_data_list(day_override.message),
+            ))
             task_button = next(
                 b.callback_data
                 for row in day.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
@@ -7281,7 +7347,17 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             await input_handler(self.message(67890, "1"))
             added = await press(button(slot, "rdy:pbulkadd:"))
-            await press(button(added, "rdy:pbulksave:"))
+            stale_save = button(added, "rdy:pbulksave:")
+            current = await press(task_button)
+            current = await press(button(current, "rdy:pbulkkeep:"))
+            await input_handler(self.message(67890, "1"))
+            current = await press(button(current, "rdy:pbulkadd:"))
+            stale_callback = await press(stale_save)
+            self.assertIn(
+                "устарел",
+                stale_callback.answer.await_args.args[0].lower(),
+            )
+            await press(button(current, "rdy:pbulksave:"))
             plan = self.registry.get_schedule_plan("kitchen", key)
             self.assertEqual(plan["slots"][plan["dates"][0]]["Скатерти"], ["В"])
             self.assertIsNone(plan["approved"])
@@ -7521,6 +7597,29 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             slot = await press(data_of(day, "rdy:ptask:"))
             slot = await press(data_of(slot, "rdy:pbulkkeep:"))
             ask_user = await press(data_of(slot, "rdy:pnew:"))
+            parameter_handler = self.message_handler("on_service_parameter")
+            back = self.message(67890, CONTACT_BACK_TEXT)
+            await parameter_handler(back)
+            self.assertIn(
+                "Участники, которые не назначены на этот день",
+                back.answer.await_args.args[0],
+            )
+            self.assertTrue(any(
+                button.callback_data.startswith("rdy:pbulksave:")
+                for row in back.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ))
+            back_pnew = next(
+                button.callback_data
+                for row in back.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith("rdy:pnew:")
+            )
+            ask_user = await press(back_pnew)
             markup = ask_user.message.answer.await_args.kwargs["reply_markup"]
             request = markup.keyboard[0][0].request_users
             shared = self.message(67890, "")
