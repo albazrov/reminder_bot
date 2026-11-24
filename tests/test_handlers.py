@@ -7337,19 +7337,76 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for b in row if "Скатерти" in b.text
             )
             slot = await press(task_button)
-            slot = await press(button(slot, "rdy:pbulkkeep:"))
-            self.assertIn("1. В", "".join(
-                call.args[0] for call in slot.message.answer.await_args_list
-            ))
             input_handler = next(
                 item.callback for item in self.admin_router.message.handlers
                 if item.callback.__name__ == "on_service_parameter"
             )
-            await input_handler(self.message(67890, "1"))
-            added = await press(button(slot, "rdy:pbulkadd:"))
-            stale_save = button(added, "rdy:pbulksave:")
+            removal_selection = self.message(67890, "1")
+            await input_handler(removal_selection)
+            self.assertIn(
+                "Выбраны номера: 1",
+                removal_selection.answer.await_args.args[0],
+            )
+            removed = await press(button(slot, "rdy:pbulkdel:"))
+            self.assertIn(
+                "Участники, которые не назначены на этот день",
+                removed.message.answer.await_args.args[0],
+            )
+            stale_save = button(removed, "rdy:pbulksave:")
+            cancel_handler = self.message_handler("on_cancel_service_command")
+            cancel_message = self.message(67890, "/cancel")
+            service_lock = readiness.service_lock
+            lock_entries = 0
+
+            class CancelOnLock:
+                async def __aenter__(self):
+                    await cancel_handler(cancel_message)
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return False
+
+            def cancel_after_load(service_id):
+                nonlocal lock_entries
+                lock_entries += 1
+                if lock_entries == 2:
+                    return CancelOnLock()
+                return service_lock(service_id)
+
+            with patch.object(
+                readiness, "service_lock", side_effect=cancel_after_load
+            ), patch.object(
+                self.registry, "set_schedule_slots",
+                wraps=self.registry.set_schedule_slots,
+            ) as save_slots:
+                cancelled = await press(stale_save)
+            self.assertTrue(cancelled.answer.await_count)
+            self.assertTrue(cancel_message.answer.await_count)
+            self.assertTrue(
+                cancelled.message.answer.await_args_list,
+                cancelled.answer.await_args_list,
+            )
+            self.assertIn(
+                "отмен", cancelled.message.answer.await_args.args[0].lower()
+            )
+            save_slots.assert_not_called()
+            plan = self.registry.get_schedule_plan("kitchen", key)
+            self.assertEqual(plan["slots"][first_day]["Скатерти"], [])
+            self.assertEqual(plan["slots"][first_day][assigned_task], ["А"])
+
+            dates = await press(f"rdy:pedit:kitchen:{month}")
+            day = await press(button(dates, "rdy:pdate:"))
+            task_button = next(
+                b.callback_data
+                for row in day.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for b in row if "Скатерти" in b.text
+            )
             current = await press(task_button)
             current = await press(button(current, "rdy:pbulkkeep:"))
+            self.assertIn("1. В", "".join(
+                call.args[0] for call in current.message.answer.await_args_list
+            ))
             await input_handler(self.message(67890, "1"))
             current = await press(button(current, "rdy:pbulkadd:"))
             stale_callback = await press(stale_save)

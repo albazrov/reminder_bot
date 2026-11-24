@@ -7570,6 +7570,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         pending["selected_keys"] = []
             elif action == "pbulksave":
                 async with readiness.service_lock(service_id):
+                    if pending_inputs.get(actor_id) is not pending:
+                        fresh_run = registry.get_readiness_run(service_id, key)
+                        fresh_plan = registry.get_schedule_plan(service_id, key)
+                        await show_plan(
+                            callback.message, service, fresh_run, fresh_plan,
+                            "⚠️ Этот черновик отменён или заменён — "
+                            "изменения не сохранены.",
+                        )
+                        await _answer_callback(callback)
+                        return
                     fresh_run = registry.get_readiness_run(service_id, key)
                     fresh_plan = registry.get_schedule_plan(service_id, key)
                     if not plan_current(fresh_run, fresh_plan) or (
@@ -7580,6 +7590,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             callback.message, service, fresh_run, fresh_plan,
                             "⚠️ График изменился — изменения не сохранены.",
                         )
+                        await _answer_callback(callback)
                         return
                     if pending["working_slots"] != fresh_plan["slots"]:
                         plan = registry.set_schedule_slots(
