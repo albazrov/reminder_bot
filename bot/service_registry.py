@@ -589,6 +589,8 @@ class ServiceRegistry:
                     -- берёт вместе (звук + спевка).
                     same_week INTEGER NOT NULL DEFAULT 0
                         CHECK (same_week IN (0, 1)),
+                    difficulty INTEGER NOT NULL DEFAULT 1
+                        CHECK (difficulty BETWEEN 1 AND 3),
                     PRIMARY KEY (service_id, name)
                 );
 
@@ -1006,6 +1008,11 @@ class ServiceRegistry:
                 ("service_tasks", "people_max", "INTEGER"),
                 ("service_tasks", "day_offset", "INTEGER"),
                 ("service_tasks", "same_week", "INTEGER NOT NULL DEFAULT 0"),
+                (
+                    "service_tasks", "difficulty",
+                    "INTEGER NOT NULL DEFAULT 1 "
+                    "CHECK (difficulty BETWEEN 1 AND 3)",
+                ),
                 ("service_members", "week_tasks_json", "TEXT"),
                 ("readiness_settings", "enabled_at", "TEXT"),
                 ("readiness_settings", "intro_template", "TEXT"),
@@ -1099,6 +1106,23 @@ class ServiceRegistry:
                 "WHERE approved_json IS NOT NULL AND approved_tasks_json IS NULL"
             )
             self._sync_service_catalog(connection, assembly_group_chat_id)
+            if connection.execute(
+                "SELECT 1 FROM catalog_migrations "
+                "WHERE name = 'task-difficulty-defaults-v1'"
+            ).fetchone() is None:
+                for task, difficulty in (
+                    ("Пульт", 1), ("Камера", 1), ("Слайды", 2),
+                    ("Компьютер", 3),
+                ):
+                    connection.execute(
+                        "UPDATE service_tasks SET difficulty = ? "
+                        "WHERE service_id = 'broadcast' AND name = ?",
+                        (difficulty, task),
+                    )
+                connection.execute(
+                    "INSERT INTO catalog_migrations (name) "
+                    "VALUES ('task-difficulty-defaults-v1')"
+                )
             has_super_admin = connection.execute(
                 "SELECT 1 FROM super_admins LIMIT 1"
             ).fetchone()
@@ -1763,7 +1787,7 @@ class ServiceRegistry:
         with nullcontext(connection) if connection is not None else self._connection() as connection:
             rows = connection.execute(
                 "SELECT name, position, enabled, aliases_json, source, "
-                "people_needed, people_max, day_offset, same_week "
+                "people_needed, people_max, day_offset, same_week, difficulty "
                 "FROM service_tasks WHERE service_id = ? "
                 "ORDER BY position, name",
                 (service_id,),
@@ -1791,6 +1815,7 @@ class ServiceRegistry:
                 # Свой день задачи; None — дни служения раздела «📅 График».
                 "day_offset": row["day_offset"],
                 "same_week": bool(row["same_week"]),
+                "difficulty": row["difficulty"],
                 "requires_any": dependencies.get(row["name"], []),
             }
             for row in rows
@@ -1809,6 +1834,7 @@ class ServiceRegistry:
                     "name": task["name"], "needed": task["people_needed"],
                     "max": task["people_max"], "position": str(task["position"]),
                     "implicit": False, "day": task["day_offset"],
+                    "difficulty": task["difficulty"],
                     **({"requires_any": task["requires_any"]}
                        if task["requires_any"] else {}),
                 }
@@ -1822,6 +1848,7 @@ class ServiceRegistry:
             "name": service["name"], "needed": settings["people_needed"],
             "max": settings["people_max"] or settings["people_needed"],
             "position": "s", "implicit": True, "day": None,
+            "difficulty": 1,
         }]
 
     def service_catalog(self) -> tuple[ServiceDefinition, ...]:
@@ -1922,6 +1949,39 @@ class ServiceRegistry:
             self._audit(
                 connection, actor_id, "service_task_updated", service_id,
                 {"task": task, "people_needed": count, "people_max": maximum},
+            )
+
+    def set_service_task_difficulty(
+        self, actor_id: int, service_id: str, task: str, difficulty: int,
+    ) -> None:
+        """Настраивает вес повторных назначений задачи (1–3)."""
+        _validate_positive_id(actor_id, "actor_id")
+        if (
+            isinstance(difficulty, bool)
+            or not isinstance(difficulty, int)
+            or difficulty not in {1, 2, 3}
+        ):
+            raise ValueError("Сложность задачи должна быть от 1 до 3.")
+        with self._connection() as connection:
+            self._require_service_editor(connection, actor_id, service_id)
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE service_tasks SET difficulty = ? "
+                "WHERE service_id = ? AND name = ? AND difficulty != ?",
+                (difficulty, service_id, task, difficulty),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM service_tasks "
+                    "WHERE service_id = ? AND name = ?",
+                    (service_id, task),
+                ).fetchone()
+                if exists is None:
+                    raise ValueError(f"Задача «{task}» не найдена.")
+                return
+            self._audit(
+                connection, actor_id, "service_task_updated", service_id,
+                {"task": task, "difficulty": difficulty},
             )
 
     def set_service_task_day(

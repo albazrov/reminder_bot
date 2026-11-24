@@ -164,6 +164,7 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
         {
             "name": task["name"], "needed": task["needed"], "max": task["max"],
             "implicit": task["implicit"], "day": task.get("day"),
+            "difficulty": task.get("difficulty", 1),
             **({"requires_any": task["requires_any"]}
                if task.get("requires_any") else {}),
         }

@@ -516,6 +516,9 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             extra={
                 task["name"]: task["max"] - task["needed"] for task in catalog
             },
+            task_difficulty={
+                task["name"]: task.get("difficulty", 1) for task in catalog
+            },
             free=free,
             tasks={name: frozenset(tasks[name]) for name in free},
             availability=availability,
@@ -528,6 +531,10 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             ),
             last_served=dict(last_served or {}),
             limits=limits,
+            personal_limits=frozenset(
+                person["key"] for person in people
+                if person.get("month_limit") is not None
+            ),
             bundles=summary.bundles,
             dependencies=dependencies,
             last_duty=last_duty,

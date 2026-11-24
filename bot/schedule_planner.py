@@ -21,7 +21,8 @@
 Общая стоимость плана: Σ LOAD_WEIGHT × нагрузка² по людям + штрафы за
 близкие служения (неделя, две) подряд у одного человека + RELUCTANT_WEIGHT
 за каждое служение не ответившего (его ставят, только если ответивших не
-хватает). Штраф за неделю подряд (BACK_TO_BACK_WEIGHT) больше
+хватает) + вес сложности за каждое повторное назначение одной задачи в
+месяце. Штраф за неделю подряд (BACK_TO_BACK_WEIGHT) больше
 RELUCTANT_WEIGHT: лучше не ответивший, чем служение подряд.
 
 У задачи — минимум людей (`needed`, недобор — ⚠️) и сверх него до
@@ -69,6 +70,7 @@ ROTATION_WEEKS = 5
 BELOW_MIN_WEIGHT = 50
 # Предел проходов улучшения: план маленький, улучшения быстро кончаются.
 MAX_IMPROVE_ROUNDS = 50
+TASK_DIFFICULTY_WEIGHT = LOAD_WEIGHT
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,10 @@ class PlanInput:
     answer_order: Mapping[str, int] = field(default_factory=dict)
     # Фактический день задачи в неделе графика, с учётом личного дня.
     slot_dates: Mapping[tuple[date, str, str], date] = field(default_factory=dict)
+    # Задача → сложность (1–3); 1 оставляет прежний вес нагрузки.
+    task_difficulty: Mapping[str, int] = field(default_factory=dict)
+    # У этих людей личный месячный предел; для них вес задачи не применяется.
+    personal_limits: frozenset[str] = frozenset()
     # Результаты дорогих проверок (вход неизменяем, значения стабильны);
     # replace() даёт новому входу пустой кэш.
     _cache: dict = field(
@@ -171,6 +177,37 @@ def _limit(data: PlanInput, person: str) -> tuple[int, int | None]:
     return data.limits.get(person, (0, None))
 
 
+def _task_difficulty_increment(
+    data: PlanInput, person: str, task: str,
+    task_counts: Mapping[str, int], load: int,
+) -> int:
+    if person in data.personal_limits:
+        return 0
+    weighted_counts = sum(
+        max(0, data.task_difficulty.get(name, 1) - 1) * count
+        for name, count in task_counts.items()
+    )
+    task_weight = max(0, data.task_difficulty.get(task, 1) - 1)
+    return (
+        TASK_DIFFICULTY_WEIGHT
+        * (weighted_counts + task_weight * (load + 1))
+    )
+
+
+def _task_difficulty_cost(
+    data: PlanInput, person: str, task_counts: Mapping[str, int] | None,
+    load: int,
+) -> int:
+    if person in data.personal_limits or not task_counts:
+        return 0
+    return sum(
+        TASK_DIFFICULTY_WEIGHT
+        * max(0, data.task_difficulty.get(task, 1) - 1)
+        * count * load
+        for task, count in task_counts.items()
+    )
+
+
 def _rotation_penalty(data: PlanInput, person: str) -> int:
     """Штраф первого служения месяца: кто дольше не служил, тот первый."""
     previous = data.last_served.get(person)
@@ -233,14 +270,19 @@ def open_dates(data: PlanInput) -> list[date]:
 def plan_cost(plan: Plan, data: PlanInput) -> int:
     served: dict[str, list[date]] = {}
     anchors: dict[str, set[date]] = {}
+    task_counts: dict[str, dict[str, int]] = {}
     for (event_date, task), people in plan.slots.items():
         for person in people:
             served.setdefault(person, []).append(
                 plan.slot_dates.get((event_date, task, person), event_date)
             )
             anchors.setdefault(person, set()).add(event_date)
+            counts = task_counts.setdefault(person, {})
+            counts[task] = counts.get(task, 0) + 1
     return sum(
-        _person_cost(data, person, dates, anchors[person])
+        _person_cost(
+            data, person, dates, anchors[person], task_counts[person]
+        )
         for person, dates in served.items()
     )
 
@@ -769,6 +811,11 @@ def _bundled_plan(data: PlanInput) -> Plan:
         for person, own in tasks.items():
             if own & bundle:
                 own.add(name)
+    task_difficulty = dict(data.task_difficulty)
+    task_difficulty.update({
+        name: max(data.task_difficulty.get(task, 1) for task in members)
+        for name, members in virtual.items()
+    })
     inner = _build_plan(replace(
         data,
         needed={
@@ -776,6 +823,7 @@ def _bundled_plan(data: PlanInput) -> Plan:
             if count > 0 or data.extra.get(task, 0) > 0
         },
         tasks={person: frozenset(items) for person, items in tasks.items()},
+        task_difficulty=task_difficulty,
         # Места сверх минимума — после обязательных мест связок: иначе
         # лишнее место могло бы вынудить служить две недели подряд.
         extra={},
@@ -863,10 +911,13 @@ def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
     этой задачей, с меньшей нагрузкой."""
     served: dict[str, set[date]] = {}
     on_date: dict[tuple[str, date], set[str]] = {}
+    task_counts: dict[str, dict[str, int]] = {}
     for (event_date, task), people in plan.slots.items():
         for person in people:
             served.setdefault(person, set()).add(event_date)
             on_date.setdefault((person, event_date), set()).add(task)
+            counts = task_counts.setdefault(person, {})
+            counts[task] = counts.get(task, 0) + 1
     queue = _priority(data)
     for event_date in sorted(set(data.dates)):
         for task, count in data.needed.items():
@@ -899,6 +950,11 @@ def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
                     # Связавший задачи — по отдельности в последнюю очередь.
                     bound = task in data.bundles.get(person, ())
                     return (
+                        _task_difficulty_increment(
+                            data, person, task,
+                            task_counts.get(person, {}),
+                            len(days),
+                        ),
                         not extends(person), close, person in data.reluctant,
                         bound, len(days), queue[person],
                     )
@@ -907,6 +963,8 @@ def _fill_bundle_gaps(plan: Plan, data: PlanInput) -> None:
                 people.append(chosen)
                 served.setdefault(chosen, set()).add(event_date)
                 on_date.setdefault((chosen, event_date), set()).add(task)
+                counts = task_counts.setdefault(chosen, {})
+                counts[task] = counts.get(task, 0) + 1
 
 
 def _fill_optional(plan: Plan, data: PlanInput) -> None:
@@ -917,9 +975,12 @@ def _fill_optional(plan: Plan, data: PlanInput) -> None:
     стоимости плана человека (недобравший минимум — дешевле)."""
     rank = _priority(data)
     served: dict[str, set[date]] = {}
-    for (event_date, _), people in plan.slots.items():
+    task_counts: dict[str, dict[str, int]] = {}
+    for (event_date, task), people in plan.slots.items():
         for person in people:
             served.setdefault(person, set()).add(event_date)
+            counts = task_counts.setdefault(person, {})
+            counts[task] = counts.get(task, 0) + 1
     for event_date in sorted(set(data.dates)):
         seats = [
             task
@@ -961,6 +1022,15 @@ def _fill_optional(plan: Plan, data: PlanInput) -> None:
             for person in people
         }
         loads = plan.load()
+        seat_cost = {
+            (person, index): _task_difficulty_increment(
+                data, person, task,
+                task_counts.get(person, {}),
+                loads.get(person, 0),
+            ) * scale
+            for person in people
+            for index, task in enumerate(seats)
+        }
         capacities = {
             person: (
                 len(people) if (high := _limit(data, person)[1]) is None
@@ -970,11 +1040,15 @@ def _fill_optional(plan: Plan, data: PlanInput) -> None:
         }
         for seat, person in sorted(_min_cost_matching(
             people, seats, allowed, cost,
+            seat_cost=seat_cost,
             person_groups={person: person for person in people},
             group_capacity=capacities,
         ).items()):
             plan.slots[(event_date, seats[seat])].append(person)
             served.setdefault(person, set()).add(event_date)
+            counts = task_counts.setdefault(person, {})
+            task = seats[seat]
+            counts[task] = counts.get(task, 0) + 1
 
 
 def _build_plan(data: PlanInput) -> Plan:
@@ -994,6 +1068,7 @@ def _build_plan(data: PlanInput) -> Plan:
     used_days: dict[str, set[date]] = {}
     served_weeks: dict[str, set[date]] = {}
     duty_counts: dict[str, int] = {}
+    task_counts: dict[str, dict[str, int]] = {}
     duty_choices: dict[date, str] = {}
 
     def assign_week(event_date: date, seats: list[str], *, required_pass: bool):
@@ -1073,6 +1148,15 @@ def _build_plan(data: PlanInput) -> Plan:
             if person in data.reluctant:
                 price += RELUCTANT_WEIGHT
             costs[token] = price * scale + rank[person]
+        seat_cost = {
+            (token, seat): _task_difficulty_increment(
+                data, token_person[token], task,
+                task_counts.get(token_person[token], {}),
+                load.get(token_person[token], 0),
+            ) * scale
+            for token in tokens
+            for seat, task in enumerate(seats)
+        }
         group_capacity = {}
         for token in tokens:
             person = token_person[token]
@@ -1083,10 +1167,11 @@ def _build_plan(data: PlanInput) -> Plan:
             )
         matching = _min_cost_matching(
             tokens, seats, allowed, costs,
+            seat_cost=seat_cost,
             person_groups={token: token_person[token] for token in tokens},
             group_capacity=group_capacity,
         ) if not required_pass else _min_cost_matching(
-            tokens, seats, allowed, costs
+            tokens, seats, allowed, costs, seat_cost=seat_cost
         )
         if required_pass and data.dependencies:
             duty, anchors = next(iter(data.dependencies.items()))
@@ -1110,15 +1195,19 @@ def _build_plan(data: PlanInput) -> Plan:
                     candidate = _min_cost_matching(
                         remaining, seats,
                         {other: allowed[other] - {seat} for other in remaining},
-                        costs,
+                        costs, seat_cost=seat_cost,
                     )
                     candidate[seat] = token
+                    match_costs = [
+                        costs[value] + seat_cost.get((value, index), 0)
+                        for index, value in candidate.items()
+                    ]
                     score = (
                         -len(candidate),
-                        sum(costs[value] // scale for value in candidate.values()),
+                        sum(value // scale for value in match_costs),
                         duty_counts.get(person, 0),
                         data.last_duty.get(person, date.min),
-                        sum(costs[value] for value in candidate.values()),
+                        sum(match_costs),
                         person, seats[seat],
                     )
                     choices.append((score, candidate, person))
@@ -1137,6 +1226,8 @@ def _build_plan(data: PlanInput) -> Plan:
             served_weeks.setdefault(person, set()).add(event_date)
             load[person] = load.get(person, 0) + 1
             last[person] = event_date
+            counts = task_counts.setdefault(person, {})
+            counts[task] = counts.get(task, 0) + 1
 
     # Обязательные места покрываются первыми; несколько задач одной недели
     # могут назначаться одному человеку, только если это разные фактические дни.
@@ -1152,6 +1243,7 @@ def _build_plan(data: PlanInput) -> Plan:
         repair_gaps(plan, data, fixed=fixed)
         used_days.clear()
         served_weeks.clear()
+        task_counts.clear()
         last = dict(data.last_served)
         for (event_date, task), people in sorted(plan.slots.items()):
             for person in people:
@@ -1160,6 +1252,8 @@ def _build_plan(data: PlanInput) -> Plan:
                 )
                 served_weeks.setdefault(person, set()).add(event_date)
                 last[person] = event_date
+                counts = task_counts.setdefault(person, {})
+                counts[task] = counts.get(task, 0) + 1
         load = plan.load()
     for event_date in sorted(set(data.dates)):
         optional_seats = [
@@ -1180,9 +1274,12 @@ def _build_plan(data: PlanInput) -> Plan:
     return plan
 
 
-def _person_cost(data: PlanInput, person: str, dates: Iterable[date],
-                 event_dates: Iterable[date] | None = None) -> int:
-    """Вклад человека в стоимость плана: нагрузка² и штрафы интервала."""
+def _person_cost(
+    data: PlanInput, person: str, dates: Iterable[date],
+    event_dates: Iterable[date] | None = None,
+    task_counts: Mapping[str, int] | None = None,
+) -> int:
+    """Вклад человека: нагрузка², интервалы и повторы сложных задач."""
     ordered = sorted(set(dates))
     weeks = sorted(set(event_dates if event_dates is not None else dates))
     total = LOAD_WEIGHT * len(ordered) ** 2
@@ -1190,6 +1287,7 @@ def _person_cost(data: PlanInput, person: str, dates: Iterable[date],
     high = _limit(data, person)[1]
     if high is not None:
         total += ABOVE_MAX_WEIGHT * max(0, len(ordered) - high)
+    total += _task_difficulty_cost(data, person, task_counts, len(ordered))
     if weeks:
         total += _rotation_penalty(data, person)
     if person in data.reluctant:
@@ -1332,10 +1430,14 @@ def improve_plan(plan: Plan, data: PlanInput) -> None:
     def cost_of(person, positions):
         cache_key = (person, frozenset(positions))
         if cache_key not in costs:
+            task_counts: dict[str, int] = {}
+            for _, task in positions:
+                task_counts[task] = task_counts.get(task, 0) + 1
             costs[cache_key] = _person_cost(
                 data, person,
                 {actual_day(person, key) for key in positions},
                 {key[0] for key in positions},
+                task_counts,
             )
         return costs[cache_key]
 

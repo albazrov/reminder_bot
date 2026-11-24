@@ -6433,7 +6433,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             opened.message.delete.assert_awaited_once()
             screen = opened.message.answer.await_args.args[0]
             self.assertIn("ЗВУК · задачи", screen)
-            self.assertIn("🔴 🎶 спевка · выключена", screen)
+            self.assertIn("🔴 🎶 спевка · ⚖️ 1 · выключена", screen)
 
             task_card = await self._click(
                 opened.message,
@@ -6568,6 +6568,40 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_service_task_difficulty_can_be_set_from_task_card(self):
+        async def run():
+            opened = SimpleNamespace(
+                data="svc_tasks:open:broadcast",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_tasks")(opened)
+            task = await self._click(
+                opened.message,
+                lambda button: button.text.startswith("🟢 Компьютер"),
+                actor_id=67890,
+            )
+            difficulty = await self._click(
+                task.message,
+                lambda button: button.text.startswith("⚖️ Сложность"),
+                actor_id=67890,
+            )
+            selected = await self._click(
+                difficulty.message,
+                lambda button: button.text.endswith("3 · высокая"),
+                actor_id=67890,
+            )
+            text = selected.message.answer.await_args.args[0]
+            self.assertIn("Сложность для повторных назначений: 3 из 3", text)
+            saved = next(
+                item for item in self.registry.list_service_tasks("broadcast")
+                if item["name"] == "Компьютер"
+            )
+            self.assertEqual(saved["difficulty"], 3)
+
+        asyncio.run(run())
+
     def test_allocation_priority_can_be_changed_from_people_settings(self):
         async def press(data):
             callback = SimpleNamespace(
@@ -6614,6 +6648,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
     def test_readiness_screen_settings_skip_start_and_votes(self):
         self.registry.set_group_chat(67890, "sound", -1005555, enabled=True)
+        self.registry.set_responsible_contact(
+            67890, "sound", "звук", "Участник опроса", 54321,
+        )
         self.context.bot.send_poll = AsyncMock(return_value=SimpleNamespace(
             message_id=12, poll=SimpleNamespace(id="ready-poll"),
         ))
@@ -6660,10 +6697,6 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertTrue(
                 self.registry.get_readiness_settings("sound")["reverse_poll"]
             )
-            await press("rdy:rev:sound")
-            self.assertFalse(
-                self.registry.get_readiness_settings("sound")["reverse_poll"]
-            )
             denied = await press("rdy:open:sound", actor_id=24680)
             self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
 
@@ -6673,6 +6706,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             await press("rdy:dur:sound:2")
             await press("rdy:time:sound:0900")
+            self.registry.set_readiness_settings(
+                67890, "sound", dates_only=True,
+            )
             settings = self.registry.get_readiness_settings("sound")
             self.assertEqual(
                 (settings["duration_days"], settings["start_time"]), (2, "09:00")
@@ -6686,6 +6722,29 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("✅ Опрос отправлен",
                           started.message.answer.await_args.args[0])
             self.context.bot.send_poll.assert_awaited_once()
+            run = self.registry.get_readiness_run(
+                "sound", f"{year:04d}-{month:02d}",
+            )
+            self.assertTrue(any(
+                option.get("date_only") for option in run["options"]
+            ))
+            await press("rdy:rev:sound")
+            await press("rdy:fmt:sound:tasks")
+            active = await press("rdy:open:sound")
+            active_text = active.message.answer.await_args.args[0]
+            self.assertIn(
+                "Наоборот в текущем опросе: включён — отмеченные даты "
+                "недоступны",
+                active_text,
+            )
+            self.assertIn("Варианты текущего опроса: только даты", active_text)
+            self.assertIn(
+                "Следующий опрос: «Наоборот» выключен, варианты — даты и задачи",
+                active_text,
+            )
+            active_buttons = [button.text for button in buttons(active)]
+            self.assertIn("↔️ След. «Наоборот» выкл", active_buttons)
+            self.assertIn("📋 След. варианты", active_buttons)
             again = await press(f"rdy:start:sound:{month_arg}")
             self.assertIn("⏹ Завершить", str(
                 again.message.answer.await_args.kwargs["reply_markup"]
