@@ -25,6 +25,42 @@ def plan_input(free, tasks, needed=None, last_served=None, dates=SUNDAYS,
 
 
 class SchedulePlannerTest(unittest.TestCase):
+    def test_task_difficulty_prioritizes_less_loaded_people(self):
+        first, second = SUNDAYS[:2]
+        dates = (first, second)
+        tasks = frozenset({"Компьютер", "Пульт"})
+        availability = {
+            person: frozenset({
+                (first, "Компьютер"), (first, "Пульт"),
+                (second, "Компьютер"),
+            })
+            for person in ("A", "B")
+        }
+
+        def make_plan(difficulty, personal_limits=frozenset()):
+            return build_plan(PlanInput(
+                dates=dates,
+                needed={"Компьютер": 1, "Пульт": 1},
+                free={person: frozenset(dates) for person in ("A", "B")},
+                tasks={"A": tasks, "B": tasks},
+                availability=availability,
+                answer_order={"A": 0, "B": 1},
+                task_difficulty={"Компьютер": difficulty, "Пульт": 1},
+                personal_limits=personal_limits,
+            ))
+
+        normal = make_plan(1)
+        complex_task = make_plan(3)
+        personal_override = make_plan(3, frozenset({"A", "B"}))
+
+        self.assertEqual(normal.slots[(first, "Компьютер")], ["A"])
+        self.assertEqual(normal.slots[(second, "Компьютер")], ["A"])
+        self.assertEqual(complex_task.slots[(first, "Компьютер")], ["B"])
+        self.assertEqual(complex_task.slots[(second, "Компьютер")], ["A"])
+        self.assertEqual(
+            personal_override.slots[(second, "Компьютер")], ["A"]
+        )
+
     def test_full_coverage_when_possible(self):
         # Жадный выбор «Алексей → звук» оставил бы сборку пустой.
         day = SUNDAYS[0]

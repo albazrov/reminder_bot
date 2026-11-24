@@ -290,6 +290,52 @@ class ServiceRegistryTest(unittest.TestCase):
             for task in self.registry.list_service_tasks("sound")
         ))
 
+    def test_task_difficulty_defaults_validates_and_persists(self):
+        expected = {
+            "Пульт": 1, "Камера": 1, "Слайды": 2, "Компьютер": 3,
+        }
+        tasks = {
+            task["name"]: task["difficulty"]
+            for task in self.registry.list_service_tasks("broadcast")
+        }
+        self.assertEqual(
+            {name: tasks[name] for name in expected}, expected
+        )
+        self.registry.set_service_task_difficulty(
+            1001, "broadcast", "Компьютер", 2
+        )
+        self.registry.initialize(1001, -10001)
+        tasks = {
+            task["name"]: task["difficulty"]
+            for task in self.registry.list_service_tasks("broadcast")
+        }
+        self.assertEqual(tasks["Компьютер"], 2)
+        for bad in (0, 4, True, "2"):
+            with self.subTest(difficulty=bad), self.assertRaises(ValueError):
+                self.registry.set_service_task_difficulty(
+                    1001, "broadcast", "Компьютер", bad
+                )
+        with self.assertRaises(ValueError):
+            self.registry.set_service_task_difficulty(
+                1001, "broadcast", "нет", 2
+            )
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("ALTER TABLE service_tasks DROP COLUMN difficulty")
+            connection.execute(
+                "DELETE FROM catalog_migrations "
+                "WHERE name = 'task-difficulty-defaults-v1'"
+            )
+            connection.commit()
+        self.registry.initialize(1001, -10001)
+        tasks = {
+            task["name"]: task["difficulty"]
+            for task in self.registry.list_service_tasks("broadcast")
+        }
+        self.assertEqual(
+            {name: tasks[name] for name in expected}, expected
+        )
+
     def test_services_missing_from_catalog_are_archived_not_deleted(self):
         with sqlite3.connect(self.path) as connection:
             connection.execute(
