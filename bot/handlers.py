@@ -808,6 +808,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         "📤", "🔁", "🗓", "🧵", "🚫", "📆", "♾", "▶️", "⏸",
                         "🗳", "⏹", "⏭", "↩️", "🏁", "💬", "⬜", "☑️",
                         "🔢", "🔤", "⛔", "↔️", "📥", "🌐", "🧮", "❓",
+                        "⚖️",
                     )
                 ):
                     button.text = f"📋 {label}"
@@ -4459,9 +4460,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if task["day_offset"] is not None else ""
                 )
                 linked = " · 🔗" if task["same_week"] else ""
+                difficulty = f" · ⚖️ {task['difficulty']}"
                 lines.append(
                     f"{status} {task_emoji(task['name'])} {task['name']}"
-                    f"{people}{own_day}{linked}{off}{aliases}"
+                    f"{people}{own_day}{linked}{difficulty}{off}{aliases}"
                 )
             lines += [
                 "",
@@ -4543,9 +4545,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 + ", ".join(task["requires_any"]) + ".\n"
                 if task.get("requires_any") else "Основная задача.\n"
             ) +
+            f"Сложность для повторных назначений: {task['difficulty']} из 3.\n"
             "Выключенные задачи не читаются из графика. "
             "Для настройки напоминаний сначала включите задачу.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"⚖️ Сложность: {task['difficulty']} из 3",
+                    callback_data=(
+                        f"svc_tasks:level:{service_id}:{task['position']}:"
+                        f"{session_id}"
+                    ),
+                )],
                 [InlineKeyboardButton(
                     text="⏰ Напоминания и шаблоны",
                     callback_data=(
@@ -4570,6 +4580,43 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     callback_data=f"svc_tasks:open:{service_id}",
                 )],
             ]),
+            parse_mode=None,
+        )
+
+    async def show_task_difficulty(
+        message: Message, actor_id: int, service_id: str, task: dict,
+    ) -> None:
+        pending = pending_inputs[actor_id]
+        pending["step"] = "task_difficulty"
+        pending["task_position"] = task["position"]
+        session_id = pending["session_id"]
+        labels = {1: "обычная", 2: "повышенная", 3: "высокая"}
+        rows = [[InlineKeyboardButton(
+            text=(
+                f"{'✅' if task['difficulty'] == level else '⚖️'} "
+                f"{level} · {labels[level]}"
+            ),
+            callback_data=(
+                f"svc_tasks:lset:{service_id}:{task['position']}:"
+                f"{level}:{session_id}"
+            ),
+        )] for level in (1, 2, 3)]
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К задаче",
+            callback_data=(
+                f"svc_tasks:card:{service_id}:{task['position']}:"
+                f"{session_id}"
+            ),
+        )])
+        await _send_dialog(
+            message,
+            f"⚖️ Сложность · {task['name']}\n\n"
+            "Чем выше значение, тем сильнее график избегает повторно "
+            "назначать человека на эту задачу в одном месяце. Это предпочтение, "
+            "а не запрет: если обязательное место иначе останется пустым, "
+            "повтор возможен. Личный месячный лимит участника важнее.\n\n"
+            "У людей с личным месячным лимитом эта настройка не применяется.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode=None,
         )
 
@@ -5692,17 +5739,40 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 settings["allocation_priority"]
             ]
         )
-        lines.append(
-            "🗳 Наоборот: " + (
-                "включён — отмеченные даты недоступны"
-                if settings["reverse_poll"]
-                else "выключен — отмеченные даты доступны"
+        if run is not None and run["status"] == "open":
+            current_options = run.get("options") or []
+            current_dates_only = any(
+                option.get("date_only") for option in current_options
             )
-        )
-        lines.append(
-            "📋 Варианты: "
-            + ("только даты" if settings["dates_only"] else "даты и задачи")
-        )
+            lines.append(
+                "🗳 Наоборот в текущем опросе: " + (
+                    "включён — отмеченные даты недоступны"
+                    if run["reverse_poll"]
+                    else "выключен — отмеченные даты доступны"
+                )
+            )
+            lines.append(
+                "📋 Варианты текущего опроса: "
+                + ("только даты" if current_dates_only else "даты и задачи")
+            )
+            lines.append(
+                "⚙️ Следующий опрос: «Наоборот» "
+                + ("включён" if settings["reverse_poll"] else "выключен")
+                + ", варианты — "
+                + ("только даты" if settings["dates_only"] else "даты и задачи")
+            )
+        else:
+            lines.append(
+                "🗳 Наоборот: " + (
+                    "включён — отмеченные даты недоступны"
+                    if settings["reverse_poll"]
+                    else "выключен — отмеченные даты доступны"
+                )
+            )
+            lines.append(
+                "📋 Варианты: "
+                + ("только даты" if settings["dates_only"] else "даты и задачи")
+            )
         current_key = f"{now.year:04d}-{now.month:02d}"
         current_plan = registry.get_schedule_plan(service_id, current_key)
         current_run = registry.get_readiness_run(service_id, current_key)
@@ -5735,12 +5805,25 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             *rows,
             [
                 readiness_button(
-                    "↔️ «Наоборот» вкл" if settings["reverse_poll"]
-                    else "↔️ «Наоборот» выкл",
+                    (
+                        "↔️ След. «Наоборот» вкл"
+                        if settings["reverse_poll"] else
+                        "↔️ След. «Наоборот» выкл"
+                    )
+                    if run is not None and run["status"] == "open"
+                    else (
+                        "↔️ «Наоборот» вкл" if settings["reverse_poll"]
+                        else "↔️ «Наоборот» выкл"
+                    ),
                     "rev", service_id,
                 ),
                 readiness_button("📝 Тексты", "texts", service_id),
-                readiness_button("📋 Варианты", "format", service_id),
+                readiness_button(
+                    "📋 След. варианты"
+                    if run is not None and run["status"] == "open"
+                    else "📋 Варианты",
+                    "format", service_id,
+                ),
             ],
             [
                 readiness_button("⏳ Срок", "dur", service_id),
@@ -8571,6 +8654,45 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     await show_task_dependency(callback.message, actor_id, service_id)
                 await _answer_callback(callback)
                 return
+            if action in {"level", "lset"}:
+                if len(parts) != (5 if action == "level" else 6):
+                    raise ValueError("Некорректная кнопка — откройте задачу заново.")
+                position = int(parts[3])
+                task = next(
+                    (
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["position"] == position
+                    ),
+                    None,
+                )
+                expected_step = (
+                    "task_card" if action == "level" else "task_difficulty"
+                )
+                if (
+                    task is None
+                    or pending.get("step") != expected_step
+                    or pending.get("task_position") != position
+                ):
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                if action == "level":
+                    await show_task_difficulty(
+                        callback.message, actor_id, service_id, task
+                    )
+                else:
+                    difficulty = int(parts[4])
+                    registry.set_service_task_difficulty(
+                        actor_id, service_id, task["name"], difficulty
+                    )
+                    task = next(
+                        item for item in registry.list_service_tasks(service_id)
+                        if item["name"] == task["name"]
+                    )
+                    await show_service_task_card(
+                        callback.message, actor_id, service_id, task
+                    )
+                await _answer_callback(callback)
+                return
             if action in {
                 "card", "notify", "pick_notify", "tog"
             } and len(parts) == 5:
@@ -8587,7 +8709,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     if task is None:
                         raise ValueError("Задача больше не существует.")
                 if action == "card":
-                    if task is None or pending.get("step") != "tasks":
+                    if (
+                        pending.get("step") not in {"tasks", "task_difficulty"}
+                        or pending.get("step") == "task_difficulty"
+                        and pending.get("task_position") != task["position"]
+                    ):
                         await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                         return
                     await show_service_task_card(
