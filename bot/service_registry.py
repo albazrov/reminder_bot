@@ -4652,7 +4652,7 @@ class ServiceRegistry:
                 FROM group_reminder_message_expirations
                 WHERE failed_at IS NULL AND delete_at <= ?
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY delete_at, id
+                ORDER BY attempts, delete_at, id
                 LIMIT ?
                 """,
                 (now_text, now_text, limit),

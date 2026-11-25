@@ -6542,7 +6542,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertNotIn("@some_admin", setup.message.answer.await_args.args[0])
             forbidden = callback("admin_name:list:sound", 3003)
             await self.callback_handler("on_admin_name")(forbidden)
-            forbidden.answer.assert_awaited()
+            forbidden.answer.assert_awaited_once_with("Недостаточно прав.")
+            forbidden.message.answer.assert_not_awaited()
             # Проверка доставки — в «📡 Групповой чат», когда чат назначен.
             chat = callback("service:service_chat:sound")
             await self.callback_handler("on_service_selected")(chat)

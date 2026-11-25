@@ -148,6 +148,34 @@ class SchedulePlanTest(unittest.TestCase):
             plan["slots"],
         )
 
+    def test_outside_poll_answers_render_in_progress_and_plan(self):
+        with closing(sqlite3.connect(self.registry.path)) as connection, connection:
+            connection.execute(
+                "UPDATE readiness_runs SET status = 'open' WHERE id = ?", (self.run["id"],),
+            )
+        record = self.registry.record_readiness_answer
+        record("poll-1", 7001, "", "Вне состава 1", [
+            readiness.option_key("2026-11-01", "звук"),
+        ])
+        record("poll-1", 7002, "", "Вне состава 2", [readiness.AVAILABLE_ALL])
+        record("poll-1", 7003, "", "Вне состава 3", [readiness.UNAVAILABLE_ALL])
+        record("poll-1", 7004, "", "Вне состава 4", [])
+        self.registry.close_readiness_run(self.run["id"])
+        plan = self.draft()
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                run = {**self.run, "reverse_poll": reverse}
+                summary = readiness.summarize(self.registry, run, with_plan=False)
+                progress = readiness.progress_text("ЗВУК", run, summary, TZ)
+                forecast = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+                for text in (progress, forecast):
+                    self.assertIn(
+                        ("недоступен: " if reverse else "") + "01 — звук", text,
+                    )
+                    self.assertIn("Вне состава 2 (в любые даты)", text)
+                    self.assertIn("Вне состава 3 (не сможет)", text)
+                    self.assertIn("Вне состава 4 (не сможет)", text)
+
     def test_import_checks_content_revision_inside_transaction(self):
         plan = self.draft()
         version = self.registry.schedule_plan_version(plan)

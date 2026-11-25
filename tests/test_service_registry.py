@@ -129,7 +129,7 @@ class ServiceRegistryTest(unittest.TestCase):
             sent_at + timedelta(hours=1, seconds=60)
         )
         self.assertEqual(
-            [item["message_id"] for item in retry], [200, 201]
+            [item["message_id"] for item in retry], [201, 200]
         )
         failed = next(item for item in retry if item["message_id"] == 200)
         self.registry.record_group_reminder_message_delete_error(
@@ -144,13 +144,37 @@ class ServiceRegistryTest(unittest.TestCase):
             )),
             1,
         )
-        self.registry.complete_group_reminder_message_deletion(retry[1]["id"])
+        self.registry.complete_group_reminder_message_deletion(retry[0]["id"])
         self.assertEqual(
             self.registry.list_due_group_reminder_messages(
                 sent_at + timedelta(days=2)
             ),
             [],
         )
+
+    def test_expiry_retry_batch_does_not_block_new_deletions(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        sent_at = datetime(2026, 11, 1, 18, tzinfo=timezone.utc)
+        self.registry.record_group_reminder_messages(
+            "sound", reminder["id"], "2026-11-02",
+            tuple((-10001, 1000 + index) for index in range(100)), 1,
+            sent_at=sent_at,
+        )
+        due_at = sent_at + timedelta(hours=1)
+        for item in self.registry.list_due_group_reminder_messages(due_at):
+            self.registry.record_group_reminder_message_delete_error(
+                item["id"], "temporary error", due_at,
+            )
+        self.registry.record_group_reminder_messages(
+            "sound", reminder["id"], "2026-11-02", ((-10001, 2000),), 1,
+            sent_at=sent_at + timedelta(seconds=1),
+        )
+        due = self.registry.list_due_group_reminder_messages(
+            due_at + timedelta(seconds=3), limit=100,
+        )
+        self.assertEqual(len(due), 100)
+        self.assertEqual(due[0]["message_id"], 2000)
+        self.assertEqual(sum(item["attempts"] == 0 for item in due), 1)
 
     def test_expiry_capture_can_be_promoted_after_service_archival(self):
         reminder = self.registry.list_group_reminders("sound")[0]

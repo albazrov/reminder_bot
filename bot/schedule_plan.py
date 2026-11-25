@@ -36,6 +36,7 @@ from .readiness import (
     local_text,
     month_of,
     option_key,
+    outside_answer_text,
     outside_name,
     phrase,
     render_template,
@@ -770,9 +771,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
             "(поставлен(а) вместо не ответившего) или поставлен(а) вручную"
         )
     for answer in summary.outside:
-        days = ", ".join(
-            date.fromisoformat(day).strftime("%d") for day in answer["dates"]
-        ) or "не сможет"
+        days = outside_answer_text(answer["dates"], summary.reverse_poll)
         lines.append(
             f"⚪ Вне состава отметились: {outside_name(answer)} ({days}) — "
             "нет задач"

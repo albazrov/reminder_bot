@@ -560,6 +560,18 @@ def outside_name(answer: dict) -> str:
     )
 
 
+def outside_answer_text(dates: list[str], reverse_poll: bool) -> str:
+    if UNAVAILABLE_ALL in dates or not dates:
+        return "не сможет"
+    if AVAILABLE_ALL in dates:
+        return "в любые даты"
+    labels = []
+    for value in dates:
+        day, task = option_parts(value)
+        labels.append(_short(day) + (f" — {task}" if task else ""))
+    return ("недоступен: " if reverse_poll else "") + ", ".join(labels)
+
+
 def progress_text(service_label: str, run: dict, summary: Summary, tz,
                   reminder: str | None = None,
                   forecast_text: str | None = None) -> str:
@@ -605,7 +617,7 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
             for key, dates in summary.answered.items()
         )]
     for answer in summary.outside:
-        days = ", ".join(_short(day) for day in answer["dates"]) or "не сможет"
+        days = outside_answer_text(answer["dates"], summary.reverse_poll)
         lines.append(
             f"⚪ Вне состава: {outside_name(answer)} ({days}) — нет задач, "
             "не распределяется"

@@ -6930,9 +6930,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending["quick"] = True
                 pending["stage"] = "remove" if quick_stage == "remove" else "task"
         pending_inputs[actor_id] = pending
+        render_token = secrets.token_urlsafe(8)
+        pending["render_token"] = render_token
+        old_screen = (nav_state.get(actor_id) or {}).get("screen")
         summary = await asyncio.to_thread(
             schedule_plan.plan_summary, registry, plan, run
         )
+        if (
+            pending_inputs.get(actor_id) is not pending
+            or pending.get("render_token") != render_token
+            or (nav_state.get(actor_id) or {}).get("screen") != old_screen
+        ):
+            return
         names = {person["key"]: person["name"] for person in summary.people}
         day = pending["day"]
         staged = {**plan, "slots": pending["working_slots"]}

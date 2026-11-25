@@ -175,12 +175,18 @@ class ServiceScreensTest(unittest.TestCase):
             self.registry.set_responsible_contact(1001, "sound", "Микшер", name, user_id)
         tasks = [{"name": "Микшер", "needed": 1}]
         self.plan({"2026-10-04": {"Микшер": ["Мария"]}}, month="2026-10", tasks=tasks)
-        self.plan({"2026-11-15": {"Микшер": ["Алексей"]}}, tasks=tasks)
+        self.plan({
+            "2026-11-15": {"Микшер": ["Алексей"]},
+            "2026-11-22": {"Микшер": []},
+        }, tasks=tasks)
         self.registry.set_replacement(
             "sound", "2026-11-15", "Микшер", "Алексей", "Мария", 3002, "", "admin", 1001,
         )
         self.registry.set_schedule_slots(
-            1001, "sound", "2026-11", {"2026-11-15": {"Микшер": ["Алексей"]}},
+            1001, "sound", "2026-11", {
+                "2026-11-15": {"Микшер": []},
+                "2026-11-22": {"Микшер": ["Алексей"]},
+            },
         )
         people = self.registry.readiness_people("sound")
         selected, dates, previous = schedule_plan.member_month_assignments(
@@ -252,6 +258,63 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertEqual(current["approved"], approved)
             self.assertTrue(current["dirty"])
             self.assertIn("Микшер", saved.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_bulk_editor_does_not_replace_newer_editor_after_async_load(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.plan(
+            {"2026-11-15": {"Микшер": ["Алексей"]}},
+            tasks=[{"name": "Микшер", "needed": 1}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            remove = next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:pquick:") and b.callback_data.endswith(".remove")
+            )
+            add = next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:pquick:") and b.callback_data.endswith(".add")
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+            original_to_thread = asyncio.to_thread
+            calls = 0
+
+            async def delay_first(func, *args, **kwargs):
+                nonlocal calls
+                if func is schedule_plan.plan_summary:
+                    calls += 1
+                    if calls == 1:
+                        started.set()
+                        await release.wait()
+                return await original_to_thread(func, *args, **kwargs)
+
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delay_first):
+                old_task = asyncio.create_task(self.press(remove))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                newer = await self.press(add)
+                release.set()
+                old = await old_task
+            self.assertIn("Выберите задачу", self.text(newer))
+            old.message.answer.assert_not_awaited()
+
+            started.clear()
+            release.clear()
+            calls = 0
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delay_first):
+                old_task = asyncio.create_task(self.press(remove))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                newer = await self.press("rdy:pedit:sound:202611")
+                release.set()
+                old = await old_task
+            self.assertIn("выберите дату", self.text(newer))
+            old.message.answer.assert_not_awaited()
 
         asyncio.run(run())
 
