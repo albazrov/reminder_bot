@@ -25,6 +25,7 @@ from .services import (
     normalized_name,
     sort_tasks_for_display,
     split_day_key,
+    task_day_key,
 )
 from .task_rules import AssignmentWarnings, assignment_issues, dependent_tasks
 
@@ -152,7 +153,7 @@ _UNSET = object()
 _GROUP_REMINDER_COLUMNS = (
     "g.id, g.service_id, g.body, g.reminder_days, g.reminder_time, "
     "g.enabled, g.created_at, g.task, g.active_from, g.active_until, "
-    "t.day_offset AS task_day"
+    "g.ttl_hours, t.day_offset AS task_day"
 )
 _GROUP_REMINDER_SOURCE = (
     "group_reminders g LEFT JOIN service_tasks t "
@@ -260,7 +261,9 @@ class ServiceRegistry:
                         CHECK (reminder_days >= 0),
                     reminder_time TEXT NOT NULL DEFAULT '18:00',
                     group_template TEXT,
-                    personal_templates_json TEXT
+                    personal_templates_json TEXT,
+                    group_reminder_ttl_hours INTEGER
+                        CHECK (group_reminder_ttl_hours BETWEEN 1 AND 47)
                 );
 
                 CREATE TABLE IF NOT EXISTS super_admins (
@@ -272,6 +275,7 @@ class ServiceRegistry:
                     service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
                     telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
                     username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
                     created_by INTEGER NOT NULL CHECK (created_by > 0),
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, telegram_id)
@@ -551,7 +555,8 @@ class ServiceRegistry:
                     reminder_time TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1
                         CHECK (enabled IN (0, 1)),
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    ttl_hours INTEGER CHECK (ttl_hours BETWEEN 1 AND 47)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_group_reminders_service
@@ -564,6 +569,43 @@ class ServiceRegistry:
                     recipient_key TEXT NOT NULL,
                     delivered_at TEXT NOT NULL,
                     PRIMARY KEY (reminder_id, event_date, recipient_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS group_reminder_expiry_captures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service_id TEXT NOT NULL,
+                    reminder_id INTEGER NOT NULL,
+                    event_date TEXT NOT NULL,
+                    message_refs_json TEXT NOT NULL,
+                    ttl_hours INTEGER NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    UNIQUE (
+                        service_id, reminder_id, event_date, message_refs_json
+                    )
+                );
+
+                CREATE TABLE IF NOT EXISTS group_reminder_message_expirations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service_id TEXT NOT NULL,
+                    reminder_id INTEGER NOT NULL,
+                    event_date TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL CHECK (chat_id < 0),
+                    message_id INTEGER NOT NULL CHECK (message_id > 0),
+                    delete_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    next_attempt_at TEXT,
+                    failed_at TEXT,
+                    last_error TEXT,
+                    UNIQUE (chat_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_group_message_expiry_due
+                    ON group_reminder_message_expirations(
+                        delete_at, next_attempt_at
+                    );
+
+                CREATE TABLE IF NOT EXISTS group_reminder_expiry_warnings (
+                    expiration_id INTEGER PRIMARY KEY,
+                    message TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS group_reminder_migrations (
@@ -1005,7 +1047,16 @@ class ServiceRegistry:
             # Опрос готовности (этап 5): колонки, добавленные после
             # первого развёртывания.
             for table, column, ddl in (
+                (
+                    "services", "group_reminder_ttl_hours",
+                    "INTEGER CHECK (group_reminder_ttl_hours BETWEEN 1 AND 47)",
+                ),
+                (
+                    "group_reminders", "ttl_hours",
+                    "INTEGER CHECK (ttl_hours BETWEEN 1 AND 47)",
+                ),
                 ("service_tasks", "people_max", "INTEGER"),
+                ("service_admins", "display_name", "TEXT NOT NULL DEFAULT ''"),
                 ("service_tasks", "day_offset", "INTEGER"),
                 ("service_tasks", "same_week", "INTEGER NOT NULL DEFAULT 0"),
                 (
@@ -1473,9 +1524,9 @@ class ServiceRegistry:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO service_admins (
-                    service_id, telegram_id, username, created_by, created_at
+                    service_id, telegram_id, username, display_name, created_by, created_at
                 )
-                SELECT ?, telegram_id, username, created_by, created_at
+                SELECT ?, telegram_id, username, display_name, created_by, created_at
                 FROM service_admins WHERE service_id = ?
                 """,
                 (new_id, old_id),
@@ -1729,12 +1780,12 @@ class ServiceRegistry:
                 "SELECT id, name, aliases_json, assignment_layout, "
                 "group_chat_id, group_thread_id, enabled, reminder_days, "
                 "reminder_time, group_template, personal_templates_json, "
-                "admin_report_template "
+                "group_reminder_ttl_hours, admin_report_template "
                 "FROM services WHERE archived = 0 ORDER BY id"
             ).fetchall()
             reminders = connection.execute(
                 "SELECT id, service_id, body, reminder_days, reminder_time, "
-                "enabled, created_at, task, active_from, active_until "
+                "enabled, created_at, task, active_from, active_until, ttl_hours "
                 "FROM group_reminders "
                 "ORDER BY service_id, reminder_days, reminder_time, id"
             ).fetchall()
@@ -1752,6 +1803,7 @@ class ServiceRegistry:
                     "task": reminder["task"],
                     "active_from": reminder["active_from"],
                     "active_until": reminder["active_until"],
+                    "ttl_hours": reminder["ttl_hours"],
                 }
             )
         services = []
@@ -2424,6 +2476,7 @@ class ServiceRegistry:
         service_id: str,
         telegram_id: int,
         username: str = "",
+        display_name: str = "",
     ) -> None:
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
@@ -2434,6 +2487,9 @@ class ServiceRegistry:
             r"[A-Za-z][A-Za-z0-9_]{4,31}", normalized_username
         ):
             raise ValueError("Некорректный Telegram username.")
+        display_name = " ".join(display_name.split())
+        if len(display_name) > 100 or "\x00" in display_name:
+            raise ValueError("Имя администратора не должно превышать 100 символов.")
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
@@ -2444,13 +2500,15 @@ class ServiceRegistry:
             ).fetchone()
             connection.execute(
                 "INSERT INTO service_admins "
-                "(service_id, telegram_id, username, created_by, created_at) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "(service_id, telegram_id, username, display_name, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id, telegram_id) DO UPDATE SET "
                 "username = CASE WHEN excluded.username != '' "
-                "THEN excluded.username ELSE service_admins.username END",
+                "THEN excluded.username ELSE service_admins.username END, "
+                "display_name = CASE WHEN service_admins.display_name = '' "
+                "THEN excluded.display_name ELSE service_admins.display_name END",
                 (
-                    service_id, telegram_id, normalized_username,
+                    service_id, telegram_id, normalized_username, display_name,
                     actor_id, _utc_now(),
                 ),
             )
@@ -2721,6 +2779,52 @@ class ServiceRegistry:
             )
         return reminder_id
 
+    def set_group_reminder_default_ttl(
+        self, actor_id: int, service_id: str, ttl_hours: int | None
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            self._require_service_editor(connection, actor_id, service_id)
+            connection.execute(
+                "UPDATE services SET group_reminder_ttl_hours = ? WHERE id = ?",
+                (ttl_hours, service_id),
+            )
+            self._audit(
+                connection,
+                actor_id,
+                "group_reminder_default_ttl_updated",
+                service_id,
+                {"ttl_hours": ttl_hours},
+            )
+
+    def set_group_reminder_ttl(
+        self, actor_id: int, reminder_id: int, ttl_hours: int | None
+    ) -> None:
+        _validate_positive_id(actor_id, "actor_id")
+        _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT service_id FROM group_reminders WHERE id = ?",
+                (reminder_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Групповое напоминание больше не существует.")
+            self._require_service_editor(connection, actor_id, row["service_id"])
+            connection.execute(
+                "UPDATE group_reminders SET ttl_hours = ? WHERE id = ?",
+                (ttl_hours, reminder_id),
+            )
+            self._audit(
+                connection,
+                actor_id,
+                "group_reminder_ttl_updated",
+                row["service_id"],
+                {"reminder_id": reminder_id, "ttl_hours": ttl_hours},
+            )
+
     def update_group_reminder(
         self,
         actor_id: int,
@@ -2853,6 +2957,7 @@ class ServiceRegistry:
         body=_UNSET,
         *,
         expected_slot: tuple[int, str],
+        expected_ttl=_UNSET,
         source_id: int | None = None,
         source_slot: tuple[int, str] | None = None,
     ) -> None:
@@ -2890,6 +2995,20 @@ class ServiceRegistry:
                 or not target["enabled"]
             ):
                 raise stale
+            if expected_ttl is not _UNSET:
+                service = connection.execute(
+                    "SELECT group_reminder_ttl_hours FROM services WHERE id = ?",
+                    (target["service_id"],),
+                ).fetchone()
+                if service is None:
+                    raise ValueError("Служение больше не существует.")
+                current_ttl = (
+                    target["ttl_hours"]
+                    if target["ttl_hours"] is not None
+                    else service["group_reminder_ttl_hours"]
+                )
+                if current_ttl != expected_ttl:
+                    raise stale
             if source_id is not None:
                 source = connection.execute(
                     "SELECT service_id, reminder_days, reminder_time, task, "
@@ -4067,6 +4186,15 @@ class ServiceRegistry:
             )
 
     @staticmethod
+    def _validate_group_reminder_ttl(ttl_hours: int | None) -> None:
+        if ttl_hours is not None and (
+            isinstance(ttl_hours, bool)
+            or not isinstance(ttl_hours, int)
+            or not 1 <= ttl_hours <= 47
+        ):
+            raise ValueError("Срок жизни должен быть от 1 до 47 часов.")
+
+    @staticmethod
     def _ensure_group_schedule_unique(
         connection: sqlite3.Connection,
         service_id: str,
@@ -4307,19 +4435,301 @@ class ServiceRegistry:
         reminder_id: int,
         event_date: str,
         recipient_key: str,
+        *,
+        message_refs: tuple[tuple[int, int], ...] = (),
+        ttl_hours: int | None = None,
+        sent_at: datetime | None = None,
     ) -> None:
         _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        if ttl_hours is not None and message_refs:
+            captured_at = sent_at or datetime.now(timezone.utc)
+            if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+                raise ValueError("Время отправки должно содержать часовой пояс.")
+            message_refs_json = json.dumps(message_refs, separators=(",", ":"))
+        else:
+            captured_at = None
+            message_refs_json = None
         with self._connection() as connection:
-            if connection.execute(
-                "SELECT 1 FROM group_reminders WHERE id = ?",
+            row = connection.execute(
+                "SELECT service_id FROM group_reminders WHERE id = ?",
                 (reminder_id,),
-            ).fetchone() is None:
+            ).fetchone()
+            if row is None:
                 raise ValueError("Групповое напоминание не найдено.")
             connection.execute(
                 "INSERT OR IGNORE INTO group_reminder_deliveries "
                 "(reminder_id, event_date, recipient_key, delivered_at) "
                 "VALUES (?, ?, ?, ?)",
                 (reminder_id, event_date, recipient_key, _utc_now()),
+            )
+            if message_refs_json is not None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO group_reminder_expiry_captures (
+                        service_id, reminder_id, event_date, message_refs_json,
+                        ttl_hours, sent_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["service_id"],
+                        reminder_id,
+                        event_date,
+                        message_refs_json,
+                        ttl_hours,
+                        captured_at.astimezone(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                    ),
+                )
+
+    def record_group_reminder_messages(
+        self,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        message_refs: tuple[tuple[int, int], ...],
+        ttl_hours: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> None:
+        _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        with self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM services WHERE id = ?", (service_id,)
+            ).fetchone() is None:
+                raise ValueError("Служение не найдено.")
+            self._insert_group_reminder_message_expirations(
+                connection,
+                service_id,
+                reminder_id,
+                event_date,
+                message_refs,
+                ttl_hours,
+                sent_at or datetime.now(timezone.utc),
+            )
+            connection.execute(
+                """
+                DELETE FROM group_reminder_expiry_captures
+                WHERE service_id = ? AND reminder_id = ? AND event_date = ?
+                  AND message_refs_json = ?
+                """,
+                (
+                    service_id,
+                    reminder_id,
+                    event_date,
+                    json.dumps(message_refs, separators=(",", ":")),
+                ),
+            )
+
+    def capture_group_reminder_messages(
+        self,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        message_refs: tuple[tuple[int, int], ...],
+        ttl_hours: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> None:
+        _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        if not message_refs:
+            raise ValueError("Нет Telegram-сообщений для планирования удаления.")
+        captured_at = sent_at or datetime.now(timezone.utc)
+        if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+            raise ValueError("Время отправки должно содержать часовой пояс.")
+        refs_json = json.dumps(message_refs, separators=(",", ":"))
+        with self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM services WHERE id = ?", (service_id,)
+            ).fetchone() is None:
+                raise ValueError("Служение не найдено.")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO group_reminder_expiry_captures (
+                    service_id, reminder_id, event_date, message_refs_json,
+                    ttl_hours, sent_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    service_id,
+                    reminder_id,
+                    event_date,
+                    refs_json,
+                    ttl_hours,
+                    captured_at.astimezone(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                ),
+            )
+
+    def list_group_reminder_expiry_captures(self) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, service_id, reminder_id, event_date,
+                       message_refs_json, ttl_hours, sent_at
+                FROM group_reminder_expiry_captures
+                ORDER BY id
+                """
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "message_refs": tuple(
+                    (int(chat_id), int(message_id))
+                    for chat_id, message_id in json.loads(
+                        row["message_refs_json"]
+                    )
+                ),
+                "sent_at": datetime.fromisoformat(row["sent_at"]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _insert_group_reminder_message_expirations(
+        connection: sqlite3.Connection,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        message_refs: tuple[tuple[int, int], ...],
+        ttl_hours: int,
+        sent_at: datetime,
+    ) -> None:
+        if not message_refs:
+            raise ValueError("Нет Telegram-сообщений для планирования удаления.")
+        if sent_at.tzinfo is None or sent_at.utcoffset() is None:
+            raise ValueError("Время отправки должно содержать часовой пояс.")
+        try:
+            date.fromisoformat(event_date)
+        except (TypeError, ValueError):
+            raise ValueError("event_date должен быть датой YYYY-MM-DD.") from None
+        delete_at = (
+            sent_at.astimezone(timezone.utc) + timedelta(hours=ttl_hours)
+        ).isoformat(timespec="seconds")
+        for chat_id, message_id in message_refs:
+            if (
+                isinstance(chat_id, bool)
+                or not isinstance(chat_id, int)
+                or chat_id >= 0
+                or isinstance(message_id, bool)
+                or not isinstance(message_id, int)
+                or message_id <= 0
+            ):
+                raise ValueError("Некорректный ID группового сообщения.")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO group_reminder_message_expirations (
+                    service_id, reminder_id, event_date, chat_id, message_id,
+                    delete_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    service_id,
+                    reminder_id,
+                    event_date,
+                    chat_id,
+                    message_id,
+                    delete_at,
+                ),
+            )
+
+    def list_due_group_reminder_messages(
+        self, now: datetime, *, limit: int = 100
+    ) -> list[dict]:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Время проверки должно содержать часовой пояс.")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit должен быть положительным целым числом.")
+        now_text = now.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, service_id, reminder_id, event_date, chat_id,
+                       message_id, delete_at, attempts
+                FROM group_reminder_message_expirations
+                WHERE failed_at IS NULL AND delete_at <= ?
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY attempts, delete_at, id
+                LIMIT ?
+                """,
+                (now_text, now_text, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete_group_reminder_message_deletion(self, expiration_id: int) -> None:
+        _validate_positive_id(expiration_id, "expiration_id")
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "DELETE FROM group_reminder_message_expirations WHERE id = ?",
+                (expiration_id,),
+            )
+
+    def record_group_reminder_message_delete_error(
+        self,
+        expiration_id: int,
+        error: str,
+        now: datetime,
+        *,
+        retry_after: int | None = None,
+        final: bool = False,
+        warning: str | None = None,
+    ) -> None:
+        _validate_positive_id(expiration_id, "expiration_id")
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Время ошибки должно содержать часовой пояс.")
+        now_utc = now.astimezone(timezone.utc)
+        with self._connection(notify=False) as connection:
+            row = connection.execute(
+                "SELECT attempts FROM group_reminder_message_expirations "
+                "WHERE id = ?",
+                (expiration_id,),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = row["attempts"] + 1
+            next_attempt = None
+            failed_at = None
+            if final:
+                failed_at = now_utc.isoformat(timespec="seconds")
+            else:
+                delay = retry_after or min(60, 2 ** min(attempts, 6))
+                next_attempt = (
+                    now_utc + timedelta(seconds=delay)
+                ).isoformat(timespec="seconds")
+            connection.execute(
+                """
+                UPDATE group_reminder_message_expirations
+                SET attempts = ?, next_attempt_at = ?, failed_at = ?,
+                    last_error = ?
+                WHERE id = ?
+                """,
+                (attempts, next_attempt, failed_at, error[:500], expiration_id),
+            )
+            if final and warning is not None:
+                connection.execute(
+                    "INSERT OR IGNORE INTO group_reminder_expiry_warnings "
+                    "(expiration_id, message) VALUES (?, ?)",
+                    (expiration_id, warning),
+                )
+
+    def list_group_reminder_expiry_warnings(self) -> list[dict]:
+        with self._connection(notify=False) as connection:
+            rows = connection.execute(
+                "SELECT expiration_id, message FROM group_reminder_expiry_warnings "
+                "ORDER BY expiration_id LIMIT 100"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete_group_reminder_expiry_warning(self, expiration_id: int) -> None:
+        _validate_positive_id(expiration_id, "expiration_id")
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "DELETE FROM group_reminder_expiry_warnings WHERE expiration_id = ?",
+                (expiration_id,),
             )
 
     # Deprecated aliases retained for older integrations.
@@ -6390,6 +6800,38 @@ class ServiceRegistry:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def service_admin_display_names(self, service_id: str) -> dict[int, str]:
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT telegram_id, display_name FROM service_admins "
+                "WHERE service_id = ?",
+                (service_id,),
+            ).fetchall()
+        return {row["telegram_id"]: row["display_name"] for row in rows}
+
+    def set_service_admin_display_name(
+        self, actor_id: int, service_id: str, telegram_id: int, name: str,
+    ) -> None:
+        _validate_positive_id(telegram_id, "telegram_id")
+        name = " ".join(name.split())
+        if not name or len(name) > 100 or "\x00" in name:
+            raise ValueError("Введите имя длиной от 1 до 100 символов.")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE service_admins SET display_name = ? "
+                "WHERE service_id = ? AND telegram_id = ?",
+                (name, service_id, telegram_id),
+            )
+            if not cursor.rowcount:
+                raise ValueError("Администратор больше не назначен.")
+            self._audit(
+                connection, actor_id, "service_admin_name_changed", service_id,
+                {"telegram_id": telegram_id},
+            )
+
     # --- Опрос готовности (этап 5) ---
 
     READINESS_DEFAULTS = {
@@ -7093,7 +7535,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT tasks_json, slots_json FROM schedule_plans "
+                "SELECT tasks_json, slots_json, days_json FROM schedule_plans "
                 "WHERE service_id = ? AND month = ?",
                 (service_id, month),
             ).fetchone()
@@ -7104,12 +7546,19 @@ class ServiceRegistry:
                 if task["name"] == old else task
                 for task in json.loads(row["tasks_json"])
             ]
+            days = {}
+            for day, entries in json.loads(row["days_json"] or "{}").items():
+                days[day] = {}
+                for key, offset in entries.items():
+                    person, task = split_day_key(key)
+                    days[day][task_day_key(person, new) if task == old else key] = offset
             connection.execute(
-                "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, "
+                "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, days_json = ?, "
                 "updated_at = ? WHERE service_id = ? AND month = ?",
                 (
                     json.dumps(tasks, ensure_ascii=False),
-                    renamed(json.loads(row["slots_json"])), _utc_now(),
+                    renamed(json.loads(row["slots_json"])),
+                    json.dumps(days, ensure_ascii=False), _utc_now(),
                     service_id, month,
                 ),
             )
@@ -7117,10 +7566,9 @@ class ServiceRegistry:
 
     def set_schedule_day(
         self, actor_id: int, service_id: str, month: str, day: str, key: str,
-        offset: int | None,
+        offset: int | None, *, task: str | None = None,
     ) -> dict:
-        """День служения человека только на эту дату графика (сдвиг от
-        воскресенья; None — как обычно)."""
+        """Разовый день человека или одного назначения; None — как обычно."""
         _validate_positive_id(actor_id, "actor_id")
         if offset is not None and (
             isinstance(offset, bool) or not isinstance(offset, int)
@@ -7138,17 +7586,26 @@ class ServiceRegistry:
             if row is None:
                 raise ValueError("График не найден — откройте его заново.")
             days = json.loads(row["days_json"] or "{}")
-            # День на дату — для всех задач человека: разовые дни задач
-            # (из Excel) он заменяет.
-            for other in list(days.get(day, {})):
-                if split_day_key(other)[0] == key and other != key:
-                    days[day].pop(other)
-            if offset is None:
-                days.get(day, {}).pop(key, None)
-                if not days.get(day):
-                    days.pop(day, None)
+            if task is not None:
+                slots = json.loads(row["slots_json"])
+                if key not in slots.get(day, {}).get(task, []):
+                    raise ValueError("Участник больше не назначен на эту задачу.")
+                task_key = task_day_key(key, task)
+                if offset is None and key not in days.get(day, {}):
+                    days.get(day, {}).pop(task_key, None)
+                else:
+                    days.setdefault(day, {})[task_key] = offset
             else:
-                days.setdefault(day, {})[key] = offset
+                # Прежний общий перенос заменяет отдельные дни задач.
+                for other in list(days.get(day, {})):
+                    if split_day_key(other)[0] == key and other != key:
+                        days[day].pop(other)
+                if offset is None:
+                    days.get(day, {}).pop(key, None)
+                else:
+                    days.setdefault(day, {})[key] = offset
+            if not days.get(day):
+                days.pop(day, None)
             self.task_assignment_warnings(
                 service_id, json.loads(row["slots_json"]), days=days,
                 connection=connection,
@@ -7165,6 +7622,7 @@ class ServiceRegistry:
 
     def set_schedule_slots(
         self, actor_id: int, service_id: str, month: str, slots: dict,
+        *, validate_new_people: bool = False,
     ) -> dict:
         """Ручная правка графика админом служения («✏️ Изменить»). Разовые
         дни убранных из даты людей отбрасываются."""
@@ -7173,12 +7631,31 @@ class ServiceRegistry:
             connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
             row = connection.execute(
-                "SELECT days_json FROM schedule_plans "
+                "SELECT days_json, slots_json FROM schedule_plans "
                 "WHERE service_id = ? AND month = ?",
                 (service_id, month),
             ).fetchone()
             if row is None:
                 raise ValueError("График не найден — откройте его заново.")
+            if validate_new_people:
+                old_slots = json.loads(row["slots_json"])
+                eligible = {
+                    person["key"]: set(person["tasks"])
+                    for person in self.readiness_people(
+                        service_id, connection=connection
+                    )
+                }
+                for day, tasks in slots.items():
+                    for task, people in tasks.items():
+                        existing = set(old_slots.get(day, {}).get(task, ()))
+                        if any(
+                            task not in eligible.get(person, set())
+                            for person in people if person not in existing
+                        ):
+                            raise ValueError(
+                                "Состав или задачи участников изменились — "
+                                "откройте график и выберите участников заново."
+                            )
             days = {}
             for day, people_days in json.loads(row["days_json"] or "{}").items():
                 serving = {

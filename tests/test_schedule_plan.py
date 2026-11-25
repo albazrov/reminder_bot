@@ -98,6 +98,84 @@ class SchedulePlanTest(unittest.TestCase):
             schedule_plan.build_draft(self.registry, self.run, loader, LOG)
         )
 
+    def test_prepare_draft_keeps_task_day_snapshot_during_calculation(self):
+        real_summarize = readiness.summarize
+        seen = {}
+
+        def summarize_after_change(registry, run, **kwargs):
+            self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+            seen["catalog"] = kwargs["catalog"]
+            return real_summarize(registry, run, **kwargs)
+
+        with unittest.mock.patch(
+            "bot.schedule_plan.summarize", side_effect=summarize_after_change
+        ):
+            plan = asyncio.run(schedule_plan.build_draft(
+                self.registry, self.run, None, LOG
+            ))
+
+        original = next(t for t in seen["catalog"] if t["name"] == "сборка")
+        saved = next(t for t in plan["tasks"] if t["name"] == "сборка")
+        current = next(
+            t for t in self.registry.plan_tasks("sound") if t["name"] == "сборка"
+        )
+        self.assertIsNone(original["day"])
+        self.assertIsNone(saved["day"])
+        self.assertEqual(current["day"], -4)
+
+    def test_bulk_save_rejects_removed_candidate_but_keeps_existing_slots(self):
+        plan = self.draft()
+        slots = {
+            day: {task: list(people) for task, people in tasks.items()}
+            for day, tasks in plan["slots"].items()
+        }
+        for tasks in slots.values():
+            for people in tasks.values():
+                people[:] = [person for person in people if person != "Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        self.registry.remove_service_member(1001, "sound", "Борис")
+        proposed = {
+            day: {task: list(people) for task, people in tasks.items()}
+            for day, tasks in plan["slots"].items()
+        }
+        proposed[plan["dates"][0]]["звук"].append("Борис")
+        with self.assertRaisesRegex(ValueError, "Состав или задачи участников"):
+            self.registry.set_schedule_slots(
+                1001, "sound", "2026-11", proposed, validate_new_people=True
+            )
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["slots"],
+            plan["slots"],
+        )
+
+    def test_outside_poll_answers_render_in_progress_and_plan(self):
+        with closing(sqlite3.connect(self.registry.path)) as connection, connection:
+            connection.execute(
+                "UPDATE readiness_runs SET status = 'open' WHERE id = ?", (self.run["id"],),
+            )
+        record = self.registry.record_readiness_answer
+        record("poll-1", 7001, "", "Вне состава 1", [
+            readiness.option_key("2026-11-01", "звук"),
+        ])
+        record("poll-1", 7002, "", "Вне состава 2", [readiness.AVAILABLE_ALL])
+        record("poll-1", 7003, "", "Вне состава 3", [readiness.UNAVAILABLE_ALL])
+        record("poll-1", 7004, "", "Вне состава 4", [])
+        self.registry.close_readiness_run(self.run["id"])
+        plan = self.draft()
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                run = {**self.run, "reverse_poll": reverse}
+                summary = readiness.summarize(self.registry, run, with_plan=False)
+                progress = readiness.progress_text("ЗВУК", run, summary, TZ)
+                forecast = schedule_plan.plan_text("ЗВУК", plan, summary, TZ)
+                for text in (progress, forecast):
+                    self.assertIn(
+                        ("недоступен: " if reverse else "") + "01 — звук", text,
+                    )
+                    self.assertIn("Вне состава 2 (в любые даты)", text)
+                    self.assertIn("Вне состава 3 (не сможет)", text)
+                    self.assertIn("Вне состава 4 (не сможет)", text)
+
     def test_import_checks_content_revision_inside_transaction(self):
         plan = self.draft()
         version = self.registry.schedule_plan_version(plan)
@@ -727,6 +805,12 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertEqual(plan["source"], "excel")
         self.assertFalse(plan["dirty"])
+        rendered = schedule_plan.plan_text(
+            "ЗВУК", plan,
+            schedule_plan.plan_summary(self.registry, plan, None), TZ,
+        )
+        self.assertIn("📋 ЗВУК › График › Excel › ноябрь 2026", rendered)
+        self.assertNotIn("Ответили", rendered)
         # Обратно — события для напоминаний: среда — своей датой.
         back = {
             item.event_date: sorted((a.task, a.name) for a in item.assignments)
@@ -781,6 +865,19 @@ class SchedulePlanTest(unittest.TestCase):
         }
         self.assertEqual(back[date(2026, 11, 18)], [("звук", "Алексей")])
         self.assertEqual(back[date(2026, 11, 22)], [("сборка", "Алексей")])
+        changed = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-22", "Алексей", -2,
+            task="сборка",
+        )
+        self.assertEqual(
+            changed["days"]["2026-11-22"][schedule_plan.task_day_key("Алексей", "звук")],
+            -4,
+        )
+        self.assertEqual(changed["approved_days"], imported["approved_days"])
+        self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-22", "Алексей", 0,
+            task="сборка",
+        )
         # Правка графика день задачи сохраняет; день на дату его заменяет.
         key = schedule_plan.task_day_key("Алексей", "сборка")
         edited = self.registry.set_schedule_slots(
@@ -1033,6 +1130,7 @@ class SchedulePlanTest(unittest.TestCase):
         # Служение без задач: люди сразу под датой, без названия служения.
         summary = schedule_plan.plan_summary(self.registry, plan, None)
         text = schedule_plan.plan_text("УБОРКА", plan, summary, TZ)
+        self.assertIn("📋 УБОРКА › График › Авто › ноябрь 2026", text)
         self.assertNotIn(f"   {task_emoji(name)} {name}", text)
         self.assertIn("🗓 01.11\n   • ", text)
         published = schedule_plan.publication_text(
@@ -1069,6 +1167,20 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertEqual(galya["tasks"], [name])
         # Переименование служения — задача графика вслед, правки целы.
+        first_day, second_day = plan["dates"][:2]
+        first_person = plan["slots"][first_day][name][0]
+        second_person = plan["slots"][second_day][name][0]
+        self.registry.set_schedule_day(
+            1001, "office_cleaning", plan["month"], first_day, first_person,
+            -2, task=name,
+        )
+        self.registry.set_schedule_day(
+            1001, "office_cleaning", plan["month"], second_day, second_person, -1,
+        )
+        plan = self.registry.set_schedule_day(
+            1001, "office_cleaning", plan["month"], second_day, second_person,
+            None, task=name,
+        )
         with closing(sqlite3.connect(self.registry.path)) as connection:
             connection.execute(
                 "UPDATE services SET name = 'Уборка' WHERE id = 'office_cleaning'"
@@ -1076,10 +1188,22 @@ class SchedulePlanTest(unittest.TestCase):
             connection.commit()
         self.registry.approve_schedule_plan(
             1001, "office_cleaning", plan["month"], plan["slots"],
-            chat_id=None, message_id=None,
+            chat_id=None, message_id=None, days=plan["days"],
         )
         renamed = schedule_plan.sync_implicit_task(self.registry, plan)
         self.assertEqual(renamed["tasks"][0]["name"], "Уборка")
+        self.assertEqual(
+            renamed["days"][first_day][schedule_plan.task_day_key(first_person, "Уборка")],
+            -2,
+        )
+        self.assertIsNone(
+            renamed["days"][second_day][schedule_plan.task_day_key(second_person, "Уборка")]
+        )
+        self.assertEqual(renamed["days"][second_day][second_person], -1)
+        self.assertIn(
+            schedule_plan.task_day_key(first_person, name),
+            renamed["approved_days"][first_day],
+        )
         # Опубликован со старым названием — смена названия публикуется
         # одной строкой.
         self.assertTrue(renamed["dirty"])
@@ -1621,6 +1745,67 @@ class SchedulePlanTest(unittest.TestCase):
             1001, "sound", "2026-11", "2026-11-15", "Борис", -2
         )
         self.assertEqual(self.draft()["days"], {})
+
+    def test_task_day_reset_bypasses_legacy_day_without_changing_other_tasks(self):
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        self.registry.add_service_task(1001, "sound", "Новая задача")
+        plan = self.draft()
+        day = "2026-11-15"
+        slots = plan["slots"]
+        slots[day]["звук"] = ["Алексей"]
+        slots[day]["сборка"] = ["Алексей"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        plan = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", day, "Алексей", -1,
+        )
+        person = next(p for p in self.people() if p["key"] == "Алексей")
+        plan = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", day, "Алексей", -2, task="звук",
+        )
+        self.assertEqual(schedule_plan.slot_offset(plan, person, day, "звук"), -2)
+        self.assertEqual(schedule_plan.slot_offset(plan, person, day, "сборка"), -1)
+        plan = self.registry.set_schedule_day(
+            1001, "sound", "2026-11", day, "Алексей", None, task="звук",
+        )
+        self.assertIsNone(plan["days"][day][schedule_plan.task_day_key("Алексей", "звук")])
+        self.assertEqual(schedule_plan.slot_offset(plan, person, day, "звук"), -3)
+        self.assertEqual(schedule_plan.slot_offset(plan, person, day, "сборка"), -1)
+        text = schedule_plan.publication_text(self.service(), plan, self.people())
+        self.assertIn("чт 12.11", text)
+        self.assertIn("сб 14.11", text)
+        self.assertIn(
+            "обычно", "\n".join(schedule_plan.change_lines(
+                plan, self.people(), plan["slots"], {day: {"Алексей": -1}},
+            )).lower(),
+        )
+        snapshots = schedule_plan.approved_slot_days(plan, self.people())
+        self.assertEqual(snapshots[day]["звук"]["Алексей"], -3)
+        self.assertEqual(snapshots[day]["сборка"]["Алексей"], -1)
+        approved = asyncio.run(schedule_plan.publish(
+            self.bot, self.registry, self.service(), plan, 1001, LOG, 4096,
+        ))
+        self.assertEqual(
+            approved["approved_days"][day][schedule_plan.task_day_key("Алексей", "звук")],
+            None,
+        )
+        event_dates = {
+            (event.event_date, assignment.task)
+            for event in schedule_plan.plan_events(approved, self.people())
+            for assignment in event.assignments if assignment.name == "Алексей"
+        }
+        self.assertIn((date(2026, 11, 12), "звук"), event_dates)
+        self.assertIn((date(2026, 11, 14), "сборка"), event_dates)
+        slots[day]["Новая задача"] = ["Алексей"]
+        added = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        self.assertEqual(schedule_plan.slot_offset(added, person, day, "Новая задача"), -1)
+        with self.assertRaisesRegex(ValueError, "не назначен"):
+            self.registry.set_schedule_day(
+                1001, "sound", "2026-11", day, "Борис", -2, task="сборка",
+            )
+        slots[day]["звук"] = []
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        self.assertNotIn(schedule_plan.task_day_key("Алексей", "звук"), plan["days"][day])
+        self.assertEqual(plan["days"][day]["Алексей"], -1)
 
     def test_order_only_change_is_not_dirty(self):
         plan = self.draft()

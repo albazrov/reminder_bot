@@ -2374,7 +2374,9 @@ class ReminderBotEntrypointTest(unittest.TestCase):
                     stack.enter_context(patch.object(
                         app,
                         "build_scheduler",
-                        return_value=SimpleNamespace(running=False),
+                        return_value=SimpleNamespace(
+                            running=False, add_job=MagicMock()
+                        ),
                     ))
                     with self.assertRaisesRegex(FileExistsError, "PID-файл уже существует"):
                         await app.run(

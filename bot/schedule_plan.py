@@ -36,6 +36,7 @@ from .readiness import (
     local_text,
     month_of,
     option_key,
+    outside_answer_text,
     outside_name,
     phrase,
     render_template,
@@ -157,7 +158,7 @@ async def last_served(
     return result, None
 
 
-def plan_tasks(registry, service_id: str) -> list[dict]:
+def plan_tasks(registry, service_id: str, *, catalog: list[dict] | None = None) -> list[dict]:
     """Распределяемые задачи в порядке каталога: минимум и максимум
     (служение без задач — одна задача с его названием)."""
     return [
@@ -168,7 +169,9 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
             **({"requires_any": task["requires_any"]}
                if task.get("requires_any") else {}),
         }
-        for task in registry.plan_tasks(service_id)
+        for task in (
+            catalog if catalog is not None else registry.plan_tasks(service_id)
+        )
     ]
 
 
@@ -211,29 +214,29 @@ def plan_summary(registry, plan: dict, run: dict | None) -> Summary:
     )
 
 
-async def build_draft(
+async def prepare_draft(
     registry, run: dict, events_loader, logger: logging.Logger,
-    *, save: bool = True,
-) -> dict:
-    """Предложенный график по ответам опроса (run["id"] is None — без
-    опроса, все свободны); ручные правки сбрасываются. save=False —
-    предварительный, пока опрос идёт: по текущим ответам, в базу не
-    пишется (утверждать его нельзя)."""
+) -> tuple[dict, Summary]:
+    """Рассчитать график и вернуть тот же снимок ответов для его отображения.
+
+    run["id"] is None — режим без опроса, все участники свободны.
+    """
     year, month = month_of(run)
     people = registry.readiness_people(run["service_id"])
     served, note = await last_served(
         registry, run["service_id"], year, month, people, events_loader,
         logger,
     )
-    summary = summarize(
-        registry, run,
+    catalog = registry.plan_tasks(run["service_id"])
+    settings = registry.get_readiness_settings(run["service_id"])
+    summary = await asyncio.to_thread(
+        summarize, registry, run,
         last_served={key: date.fromisoformat(day) for key, day in served.items()},
         assume_free=run["id"] is None,
+        catalog=catalog, settings=settings,
     )
-    tasks = plan_tasks(registry, run["service_id"])
-    default_day = registry.get_readiness_settings(
-        run["service_id"]
-    )["day_from"]
+    tasks = plan_tasks(registry, run["service_id"], catalog=catalog)
+    default_day = settings["day_from"]
     if default_day:
         tasks = [{**task, "default_day": default_day} for task in tasks]
     slots = {
@@ -245,22 +248,33 @@ async def build_draft(
         }
         for day in run["dates"]
     }
+    plan = {
+        "service_id": run["service_id"], "month": month_key(year, month),
+        "run_id": run["id"], "source": "poll",
+        "dates": list(run["dates"]), "tasks": tasks, "slots": slots,
+        "last_served": served, "note": note, "edited": 0,
+        "approved": None, "approved_at": None, "approved_days": {},
+        "approved_tasks": None, "days": {}, "republish": 0,
+        "dirty": True, "message_ids": [], "baseline": None,
+        "chat_id": None, "message_id": None, "updated_at": None,
+        "served_offsets": {}, "served_snapshot": False,
+    }
+    return plan, summary
+
+
+async def build_draft(
+    registry, run: dict, events_loader, logger: logging.Logger,
+    *, save: bool = True,
+) -> dict:
+    """Подготовить черновик; save=False возвращает только временный прогноз."""
+    plan, _ = await prepare_draft(registry, run, events_loader, logger)
     if not save:
-        return {
-            "service_id": run["service_id"], "month": month_key(year, month),
-            "run_id": run["id"], "source": "poll",
-            "dates": list(run["dates"]), "tasks": tasks, "slots": slots,
-            "last_served": served, "note": note, "edited": 0,
-            "approved": None, "approved_at": None, "approved_days": {},
-            "approved_tasks": None, "days": {}, "republish": 0,
-            "dirty": True, "message_ids": [], "baseline": None,
-            "chat_id": None, "message_id": None, "updated_at": None,
-            "served_offsets": {}, "served_snapshot": False,
-        }
+        return plan
     return registry.save_schedule_draft(
-        run["service_id"], month_key(year, month),
-        run_id=run["id"], dates=list(run["dates"]), tasks=tasks, slots=slots,
-        last_served=served, note=note,
+        plan["service_id"], plan["month"],
+        run_id=plan["run_id"], dates=plan["dates"], tasks=plan["tasks"],
+        slots=plan["slots"], last_served=plan["last_served"],
+        note=plan["note"],
     )
 
 
@@ -364,8 +378,11 @@ def slot_offset(plan: dict, person: dict | None, day: str,
     графике, иначе день задачи, иначе личный."""
     key = (person or {}).get("key")
     overrides = plan.get("days", {}).get(day, {})
-    override = overrides.get(task_day_key(str(key), task))
-    if override is None:
+    task_key = task_day_key(str(key), task)
+    if task_key in overrides:
+        # None отменяет общий разовый день только для этой задачи.
+        override = overrides[task_key]
+    else:
         override = overrides.get(key)
     if override is not None:
         return override
@@ -571,10 +588,15 @@ def week_person_day(plan: dict, person: dict | None, day: str, task: str,
     )
 
 
-def person_day(person: dict | None, day: str, plan: dict | None = None) -> str:
+def person_day(person: dict | None, day: str, plan: dict | None = None,
+               task: str | None = None) -> str:
     """« (чт 29.10)» для человека с личным (или разовым) днём служения —
     в скобках, как окно у даты."""
-    offset = day_offset(plan, person, day)
+    offset = (
+        slot_offset(plan, person, day, task)
+        if plan is not None and task is not None
+        else day_offset(plan, person, day)
+    )
     if offset is None:
         return ""
     return (
@@ -589,15 +611,15 @@ def date_header(plan: dict, by_key: dict, day: str,
     и тот же свой день — он в скобках у даты («29.11 (чт 26.11)»), у имён
     не повторяется; у всех свои, но разные — дата без периода; иначе —
     дата с окном служения."""
-    people = [
-        key for keys in plan["slots"].get(day, {}).values() for key in keys
-    ]
-    offsets = {day_offset(plan, by_key.get(key), day) for key in people}
-    if people and None not in offsets and len(offsets) == 1:
+    offsets = {
+        slot_offset(plan, by_key.get(key) or {"key": key}, day, task)
+        for task, keys in plan["slots"].get(day, {}).items() for key in keys
+    }
+    if offsets and None not in offsets and len(offsets) == 1:
         (offset,) = offsets
         moment = date.fromisoformat(day) + timedelta(days=offset)
         return f"{_short(day)} ({_weekday_date(moment)})", True
-    if people and None not in offsets:
+    if offsets and None not in offsets:
         return _short(day), False
     return day_label(day, window), False
 
@@ -607,8 +629,68 @@ def window_of(registry, service_id: str) -> tuple[int, int]:
     return settings["day_from"], settings["day_to"]
 
 
+def plan_day_lines(plan: dict, day: str, by_key: dict, names: dict,
+                   window: tuple[int, int], mark) -> list[str]:
+    weekly = bool(task_days(plan)) or any(
+        task.get("default_day") is not None for task in plan["tasks"]
+    )
+    if weekly:
+        title, groups = week_groups(plan, day, window)
+        lines = [f"🗓 {title}"]
+        for label, offset, tasks in groups:
+            lines.append(f"   {label}")
+            for task in tasks:
+                people = plan["slots"].get(day, {}).get(task["name"], [])
+                lines += [
+                    "  " + line for line in task_lines(
+                        task["name"], task["needed"],
+                        [
+                            names.get(person, person) + mark(person, day, task["name"])
+                            + week_person_day(
+                                plan, by_key.get(person) or {"key": person},
+                                day, task["name"], offset,
+                            )
+                            for person in people
+                        ],
+                    )
+                ]
+        return lines
+    header, shared_day = date_header(plan, by_key, day, window)
+    lines = [f"🗓 {header}"]
+    for task in display_tasks(plan):
+        people = plan["slots"].get(day, {}).get(task["name"], [])
+        lines += task_lines(
+            task["name"], task["needed"],
+            [
+                names.get(person, person) + mark(person, day, task["name"])
+                + ("" if shared_day else person_day(
+                    by_key.get(person) or {"key": person}, day, plan, task["name"],
+                ))
+                for person in people
+            ],
+            bare=implicit_plan(plan),
+        )
+    return lines
+
+
+def plan_person_mark(plan: dict, summary: Summary, by_key: dict,
+                     person: str, day: str, task: str) -> str:
+    if person in {item["key"] for item in summary.not_answered}:
+        return "*"
+    service_day = date.fromisoformat(day) + timedelta(
+        days=slot_offset(plan, by_key.get(person), day, task) or 0
+    )
+    if (
+        plan["run_id"] is not None and person in summary.answered
+        and not _selected_slot(summary, person, day, task, service_day)
+    ):
+        return "°"
+    return ""
+
+
 def plan_text(service_label: str, plan: dict, summary: Summary, tz,
-              window: tuple[int, int] = (0, 0)) -> str:
+              window: tuple[int, int] = (0, 0), *,
+              status_override: str | None = None) -> str:
     """window — окно дней служения от воскресенья (Уборка: −1, +1)."""
     year, month = map(int, plan["month"].split("-"))
     names = {person["key"]: display_name(person) for person in summary.people}
@@ -621,18 +703,13 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         """* — не ответил; ° — ответил, но эту дату не отмечал (решение 16:
         его даты заняли другие — вместо не ответившего; или вручную)."""
         nonlocal used_unpicked
-        if person in silent:
-            return "*"
-        service_day = date.fromisoformat(day) + timedelta(
-            days=slot_offset(plan, by_key.get(person), day, task) or 0
-        )
-        selected = _selected_slot(summary, person, day, task, service_day)
-        if plan["run_id"] is not None and person in summary.answered and not selected:
+        result = plan_person_mark(plan, summary, by_key, person, day, task)
+        if result == "°":
             used_unpicked = True
-            return "°"
-        return ""
+        return result
 
     done, total = covered(plan)
+    source_mode = plan_source_mode(plan)
     if plan["approved"] is None:
         status = "📝 Черновик — ещё не утверждён"
     elif plan.get("moved") and not plan.get("republish") and (
@@ -649,63 +726,30 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         )
     else:
         status = f"✅ Утверждён {local_text(plan['approved_at'], tz)}"
-    source_label = "Авто" if plan["run_id"] is None else "Опрос"
+    if status_override is not None:
+        status = status_override
+    source_label = {
+        "poll": "Опрос", "auto": "Авто", "excel": "Excel",
+    }[source_mode]
+    if source_mode == "excel":
+        overview = "📥 Источник — Excel, напоминания и замены по графику бота"
+    elif source_mode == "auto":
+        overview = "🧮 Без опроса: все из состава считаются свободными"
+    else:
+        overview = f"Ответили {len(summary.answered)} из {len(polled)}"
     lines = [
         f"📋 {service_label} › График › {source_label} › {month_title(year, month)}",
         status,
         "",
-        (
-            "📥 Загружен из Excel — напоминания и замены по нему"
-            if plan.get("source") == "excel"
-            else "🧮 Без опроса: все из состава считаются свободными"
-            if plan["run_id"] is None
-            else f"Ответили {len(summary.answered)} из {len(polled)}"
-        ) + f" · закрыто мест {done} из {total}",
+        overview + f" · закрыто мест {done} из {total}",
     ]
     used_silent = False
-    weekly = bool(task_days(plan)) or any(
-        task.get("default_day") is not None for task in plan["tasks"]
-    )
     for day in plan["dates"]:
-        if weekly:
-            title, groups = week_groups(plan, day, window)
-            lines += ["", f"🗓 {title}"]
-            for label, offset, tasks in groups:
-                lines.append(f"   {label}")
-                for task in tasks:
-                    people = plan["slots"].get(day, {}).get(task["name"], [])
-                    used_silent |= any(person in silent for person in people)
-                    lines += [
-                        "  " + line for line in task_lines(
-                            task["name"], task["needed"],
-                            [
-                                names.get(person, person)
-                                + mark(person, day, task["name"])
-                                + week_person_day(
-                                    plan, by_key.get(person), day,
-                                    task["name"], offset,
-                                )
-                                for person in people
-                            ],
-                        )
-                    ]
-            continue
-        header, shared_day = date_header(plan, by_key, day, window)
-        lines += ["", f"🗓 {header}"]
-        for task in display_tasks(plan):
-            people = plan["slots"].get(day, {}).get(task["name"], [])
-            used_silent |= any(person in silent for person in people)
-            lines += task_lines(
-                task["name"], task["needed"],
-                [
-                    names.get(person, person) + mark(person, day, task["name"])
-                    + ("" if shared_day else person_day(
-                        by_key.get(person), day, plan
-                    ))
-                    for person in people
-                ],
-                bare=implicit_plan(plan),
-            )
+        used_silent |= any(
+            person in silent for people in plan["slots"].get(day, {}).values()
+            for person in people
+        )
+        lines += ["", *plan_day_lines(plan, day, by_key, names, window, mark)]
     # Нагрузка — фактические дни служения, а не недели графика.
     load = served_days(plan, polled)
     lines += workload_lines(load, polled, plan.get("last_served") or {})
@@ -738,9 +782,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
             "(поставлен(а) вместо не ответившего) или поставлен(а) вручную"
         )
     for answer in summary.outside:
-        days = ", ".join(
-            date.fromisoformat(day).strftime("%d") for day in answer["dates"]
-        ) or "не сможет"
+        days = outside_answer_text(answer["dates"], summary.reverse_poll)
         lines.append(
             f"⚪ Вне состава отметились: {outside_name(answer)} ({days}) — "
             "нет задач"
@@ -748,6 +790,13 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     if plan.get("note"):
         lines.append(f"ℹ️ Интервалы: {plan['note']}")
     return "\n".join(lines)
+
+
+def plan_source_mode(plan: dict) -> str:
+    """Источник плана: Excel имеет приоритет, иначе различаем опрос и авто."""
+    if plan.get("source") == "excel":
+        return "excel"
+    return "auto" if plan.get("run_id") is None else "poll"
 
 
 def slot_people(plan: dict, day: str, task: str) -> list[str]:
@@ -937,7 +986,10 @@ def change_lines(plan: dict, people: list[dict], old_slots: dict,
         }
         for key in sorted(set(before) | set(after)):
             person, task = split_day_key(key)
-            if before.get(key) == after.get(key) or person not in serving:
+            if (
+                (key in before) == (key in after)
+                and before.get(key) == after.get(key)
+            ) or person not in serving:
                 continue
             offset = after.get(key)
             changes.append(
@@ -1001,31 +1053,31 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                         "      ", empty,
                         lambda key, name=name, offset=offset: link(key) + (
                             week_person_day(
-                                plan, by_key[key], day, name, offset
-                            ) if key in by_key else ""
+                                plan, by_key.get(key) or {"key": key}, day, name, offset
+                            )
                         ),
                     )
             continue
         label, shared_day = date_header(plan, by_key, day, window)
         lines += ["", f"🗓 {label}"]
 
-        def mention(key: str) -> str:
+        def mention(key: str, task: str) -> str:
             person = by_key.get(key)
             return link(key) + (
-                "" if shared_day or person is None
-                else person_day(person, day, plan)
+                "" if shared_day
+                else person_day(person or {"key": key}, day, plan, task)
             )
 
         for task in display_tasks(plan):
             keys = plan["slots"].get(day, {}).get(task["name"], [])
             if implicit_plan(plan):
                 lines += (
-                    [f"  • {mention(key)}" for key in keys] or [f"  {empty}"]
+                    [f"  • {mention(key, task['name'])}" for key in keys] or [f"  {empty}"]
                 )
                 continue
             lines += _people_lines(
                 f"  {task_emoji(task['name'])} {task['name']}", keys,
-                "    ", empty, mention,
+                "    ", empty, lambda key, name=task["name"]: mention(key, name),
             )
     if plan.get("approval_warnings"):
         lines += ["", "⚠️ Утверждено с предупреждениями:"] + plan["approval_warnings"]
@@ -1478,6 +1530,45 @@ def month_overview(
             previous,
         )
     return "\n".join(lines)
+
+
+def member_month_assignments(registry, service_id: str, month: date, people: list[dict]):
+    """Фактические дни и последнее утверждённое служение до месяца."""
+    first = month.replace(day=1)
+    last = month_end(first.year, first.month)
+    selected = registry.get_schedule_plan(service_id, first.strftime("%Y-%m"))
+    history = registry.list_approved_schedule_plans(
+        service_id, (last + timedelta(days=7)).strftime("%Y-%m"),
+    )
+    plans = [(plan, False) for plan in history]
+    if selected is not None and selected["approved"] is None:
+        plans.append((selected, True))
+    dates: dict[str, set[date]] = {}
+    previous: dict[str, date] = {}
+    for plan, draft in plans:
+        slots = plan["slots"] if draft else plan["approved"]
+        for sunday in slots:
+            for moment, tasks in _effective_plan_assignments(
+                registry, plan, people, draft=draft, keyed=True,
+                source_sunday=sunday,
+            ).items():
+                for keys in tasks.values():
+                    for key in keys:
+                        if first <= moment <= last:
+                            dates.setdefault(key, set()).add(moment)
+                        elif not draft and moment < first:
+                            previous[key] = max(previous.get(key, moment), moment)
+    prior_year, prior_month = previous_month(first.year, first.month)
+    has_previous_plan = any(
+        plan["month"] == f"{prior_year:04d}-{prior_month:02d}"
+        for plan in history
+    )
+    if selected and not has_previous_plan:
+        for key, value in (selected.get("last_served") or {}).items():
+            moment = date.fromisoformat(value)
+            if moment < first:
+                previous[key] = max(previous.get(key, moment), moment)
+    return selected, dates, previous
 
 
 def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
