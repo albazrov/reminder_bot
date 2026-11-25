@@ -5895,7 +5895,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             readiness_button(
                 "🧮 Авто", "pfree", service_id, month.strftime("%Y%m"),
             ),
-        ], [readiness_button("📊 Сводка", "summary", service_id)]]
+            readiness_button("📊 Сводка", "summary", service_id),
+        ]]
         if summary:
             following = month_end(current_month.year, current_month.month) + timedelta(days=1)
             rows = [[
@@ -5926,10 +5927,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 [readiness_button("⬅️ К графику", "month", service_id)],
             ]
         else:
-            rows.append([InlineKeyboardButton(
-                text="⬅️ К служению",
-                callback_data=f"service:service_settings:{service_id}",
-            )])
+            rows.append([
+                InlineKeyboardButton(
+                    text="⬅️ К служению",
+                    callback_data=f"service:service_settings:{service_id}",
+                ),
+                readiness_button("❓ Справка", "graphhelp", service_id, str(page)),
+            ])
         await _send_dialog(
             message,
             f"📅 {service_label(service)} › График"
@@ -6647,7 +6651,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         "plan", "precalc", "precalcok", "pedit", "pdate", "ptask", "pslot",
         "padd",
         "prem", "pclear", "pok", "pokok", "pfree", "pnew", "pday", "pdset",
-        "pprev", "phelp", "pbulkinit", "pquick", "pbulkdel", "pbulkkeep", "pbulktask",
+        "pprev", "phelp", "pdayhelp", "pslotother", "pslotmain", "pslothelp",
+        "pslotreturn", "pslotpage", "pbulkinit", "pquick", "pbulkdel", "pbulkkeep", "pbulktask",
         "pbulkback", "pbulkadd", "pbulksave",
     }
 
@@ -6821,7 +6826,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             readiness_button("➕ Добавить", "pquick", service_id,
                              plan_arg(plan, day_index, "add")),
         ])
-        rows.append([readiness_button("⬅️ К датам", "pedit", service_id, month_arg)])
+        rows.append([
+            readiness_button("⬅️ К датам", "pedit", service_id, month_arg),
+            readiness_button("❓ Справка", "pdayhelp", service_id,
+                             plan_arg(plan, day_index)),
+        ])
         registry = service_registry()
         old_pending = pending_inputs.get(actor_id)
         old_screen = (nav_state.get(actor_id) or {}).get("screen")
@@ -6861,7 +6870,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             lines += ["", "* — не ответил; ° — дата не отмечена в опросе."]
         await _send_dialog(
             message,
-            "\n".join(lines) + "\n\nВыберите задачу или действие для всего дня.",
+            "\n".join(lines) + "\n\nВыберите задачу или нажмите «Удалить» "
+            "либо «Добавить».",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             _dialog_keep_rows=True,
             _dialog_keyboard_limit=sum(len(row) for row in rows),
@@ -6947,30 +6957,29 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         staged = {**plan, "slots": pending["working_slots"]}
         token_arg = plan_arg(plan, pending["token"])
         if pending["stage"] == "remove":
-            day_assignments = _day_participants(staged, day)
-            assignments = dict(day_assignments)
-            day_people = [person for person, _ in day_assignments]
+            day_people = [person for person, _ in _day_participants(staged, day)]
             if pending["day_people"] != day_people:
                 pending["day_people"] = day_people
                 pending["selected"] = []
                 pending["selected_keys"] = []
-            lines = [
-                f"✏️ {date.fromisoformat(day):%d.%m} — участники всего дня:",
-            ]
-            lines.extend(
-                f"{index}. {names.get(person, person)} — "
-                + ", ".join(assignments.get(person, ()))
-                for index, person in enumerate(pending["day_people"], 1)
+            by_key = {person["key"]: person for person in summary.people}
+            numbered_names = {}
+            for index, key in enumerate(day_people, 1):
+                person = by_key.get(key)
+                name = (
+                    user_link(person.get("telegram_id"), display_name(person))
+                    if person else names.get(key, key)
+                )
+                numbered_names[key] = f"{index}. {name}"
+            lines = schedule_plan.plan_day_lines(
+                staged, day, by_key, numbered_names,
+                schedule_plan.window_of(registry, service["id"]),
+                lambda person, day, task: schedule_plan.plan_person_mark(
+                    staged, summary, by_key, person, day, task,
+                ),
             )
-            lines += [
-                "",
-                "Чтобы заменить участника, введите его номер или номера "
-                "через запятую (например, 1, 3), затем нажмите "
-                "«Удалить выбранных». Удаление убирает человека со всех "
-                "задач этого дня.",
-                "Если удалять не нужно, нажмите кнопку перехода к добавлению. "
-                "Задачу выберете на следующем шаге.",
-            ]
+            if any("*" in line or "°" in line for line in lines):
+                lines += ["", "* — не ответил; ° — дата не отмечена в опросе."]
             rows = [[
                 readiness_button(
                     "🗑 Удалить выбранных", "pbulkdel", service["id"], token_arg
@@ -6981,11 +6990,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ),
             ]]
             if pending.get("quick"):
-                lines = lines[:len(pending["day_people"]) + 1] + [
+                lines += [
                     "", "Введите номера через запятую, например 1, 3. "
-                    "Человек будет удалён со всех задач этого дня.",
+                    "Один номер относится ко всем задачам человека в этот день. "
+                    "Удаление снимет его со всех этих задач.",
                 ]
                 rows = []
+            else:
+                lines += [
+                    "",
+                    "Чтобы заменить участника, введите его номер или номера "
+                    "через запятую (например, 1, 3), затем нажмите "
+                    "«Удалить выбранных». Один номер относится ко всем "
+                    "задачам человека в этот день; удаление снимет его со всех задач.",
+                    "Если удалять не нужно, нажмите кнопку перехода к добавлению. "
+                    "Задачу выберете на следующем шаге.",
+                ]
             pending["step"] = "plan_remove_numbers"
             back_text = "⬅️ К дате"
             back_action = "pdate"
@@ -6995,17 +7015,18 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"➕ {date.fromisoformat(day):%d.%m}",
                 "Выберите задачу, к которой добавить участников:",
             ]
-            rows = [
-                [readiness_button(
+            buttons = [
+                readiness_button(
                     f"{task_emoji(task['name'])} {task['name']}"[:60],
                     "pbulktask", service["id"],
                     plan_arg(plan, pending["token"], index),
-                )]
+                )
                 for index, task in sort_tasks_for_display(
                     enumerate(plan["tasks"]), service["id"],
                     name=lambda pair: pair[1]["name"],
                 )
             ]
+            rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
             rows.append([readiness_button(
                 "✅ Сохранить без добавления",
                 "pbulksave", service["id"], token_arg,
@@ -7133,115 +7154,150 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def show_plan_slot(
         message: Message, actor_id: int, service: dict, run: dict,
         plan: dict, day_index: int, task_index: int,
-        notice: str | None = None,
+        notice: str | None = None, *, view: str = "main", page: int = 0,
     ) -> None:
-        """Кто стоит на задаче в дату: ❌ — убрать, имя — поставить."""
+        """Редактор назначений одной задачи с отдельным списком остальных."""
         registry = service_registry()
+        day = plan["dates"][day_index]
+        task = plan["tasks"][task_index]
+        token = secrets.token_urlsafe(6)
+        old_screen = (nav_state.get(actor_id) or {}).get("screen")
+        pending = {
+            "operation": "readiness_plan", "service_id": service["id"],
+            "month": plan["month"], "day_index": day_index,
+            "task_index": task_index, "day": day, "task": task["name"],
+            "revision": schedule_plan.revision(plan), "keys": [],
+            "step": "readiness_plan", "token": token, "slot_view": view,
+            "slot_page": page,
+        }
+        pending_inputs[actor_id] = pending
         summary = await asyncio.to_thread(
             schedule_plan.plan_summary, registry, plan, run
         )
-        names = {person["key"]: person["name"] for person in summary.people}
-        day = plan["dates"][day_index]
-        task = plan["tasks"][task_index]
+        if (
+            pending_inputs.get(actor_id) is not pending
+            or (nav_state.get(actor_id) or {}).get("screen") != old_screen
+        ):
+            return
+        if not is_service_admin(actor_id, service["id"]):
+            raise PermissionError("Недостаточно прав.")
+        fresh = registry.get_schedule_plan(service["id"], plan["month"])
+        if not plan_current(registry.get_readiness_run(service["id"], plan["month"]), fresh) or (
+            schedule_plan.revision(fresh) != pending["revision"]
+        ):
+            pending_inputs.pop(actor_id, None)
+            await _send_dialog(message, "⚠️ График изменился — откройте его заново.", parse_mode=None)
+            return
+        by_key = {person["key"]: person for person in summary.people}
+        names = {key: display_name(person) for key, person in by_key.items()}
         current = schedule_plan.slot_people(plan, day, task["name"])
         free, quiet, rest = schedule_plan.candidates(
             plan, summary, day, task["name"]
         )
-        busy = schedule_plan.busy_on(plan, day, task["name"], summary.bundles)
-        token = secrets.token_urlsafe(6)
         keys = current + free + quiet + rest
-        pending_inputs[actor_id] = {
-            "operation": "readiness_plan",
-            "service_id": service["id"],
-            "month": plan["month"],
-            "day_index": day_index,
-            "task_index": task_index,
-            # Задача — по имени: пересчёт мог поменять список задач.
-            "day": day,
-            "task": task["name"],
-            "revision": schedule_plan.revision(plan),
-            "keys": keys,
-            "step": "readiness_plan",
-            "token": token,
-        }
+        pending["keys"] = keys
         need = task["needed"] if not task["max"] else f"{task['needed']}–{task['max']}"
-
-        def listed(people: list[str]) -> str:
-            return ", ".join(names.get(key, key) for key in people) or "никто"
-
         implicit = schedule_plan.implicit_plan(plan)
         task_day = task.get("day")
+        if task_day is None:
+            task_day = task.get("default_day")
+        if task_day is None:
+            task_day = 0
+        title = f"✏️ {service_label(service)} › График › {date.fromisoformat(day):%d.%m}"
+        if not implicit:
+            title += f" › {task['name']}"
         lines = [
-            f"✏️ {date.fromisoformat(day):%d.%m}"
-            + ("" if implicit else f" · «{task['name']}»")
-            + (
-                "" if task_day is None else
-                f" · {member_day_label(task_day)}"
+            title,
+            f"Нужно: {need}.",
+        ]
+        if view == "main":
+            lines.append("Сейчас:")
+            lines.extend(
+                f"  • {user_link(by_key[key].get('telegram_id'), names[key]) if key in by_key else key}"
+                + schedule_plan.week_person_day(
+                    plan, by_key.get(key) or {"key": key}, day, task["name"], task_day,
+                )
+                for key in current
             )
-            + f" (нужно {need})",
-            "Сейчас: " + (listed(current) if current else "⚠️ никого"),
-            "",
-            ("✅ Свободны: " if implicit
-             else "✅ Свободны и приписаны к задаче: ") + listed(free),
-            f"⚪ Не отвечали: {listed(quiet)}",
-            f"👥 Остальные из состава: {listed(rest)}",
-        ]
-        if busy:
-            lines.append("🔒 Заняты в этот день: " + ", ".join(
-                f"{names.get(key, key)} ({other})" for key, other in busy.items()
-            ))
-        lines += [
-            "",
-            "Нажмите имя — поставить, ❌ — убрать.",
-            "Кнопка «📅 На эту дату» задаёт день этого назначения только "
-            "для выбранной даты и не меняет повторяющийся «Свой день».",
-        ]
+            if not current:
+                lines.append("  ⚠️ Никого — выберите участника ниже.")
+            lines += ["", "Нажмите имя, чтобы назначить или убрать участника."]
+        else:
+            lines += ["", "Другие участники служения. Нажмите имя, чтобы назначить."]
         if notice:
             lines = [notice, ""] + lines
-        buttons = [
-            readiness_button(
-                f"❌ {names.get(key, key)}"[:60], "prem", service["id"],
-                f"{token}.{index}",
+        buttons = []
+        if view == "main":
+            buttons.extend(
+                readiness_button(
+                    f"❌ {names.get(key, key)}"[:60], "prem", service["id"],
+                    f"{token}.{index}",
+                )
+                for index, key in enumerate(current)
             )
-            for index, key in enumerate(current)
-        ]
         for group, mark in ((free, "✅"), (quiet, "⚪"), (rest, "👥")):
             for key in group:
+                belongs = task["name"] in (by_key.get(key) or {}).get("tasks", ())
+                if belongs != (view == "main"):
+                    continue
                 buttons.append(readiness_button(
-                    f"{mark} {names.get(key, key)}"[:60], "padd", service["id"],
+                    f"{'⚠️' if belongs and group is rest else mark} {names.get(key, key)}"[:60],
+                    "padd", service["id"],
                     f"{token}.{keys.index(key)}",
                 ))
-        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-        by_key = {person["key"]: person for person in summary.people}
-        # Обычный день служения — окно служения (без него — вс).
-        usual = DAY_WINDOWS.get(
-            schedule_plan.window_of(registry, service["id"]), "свои дни"
-        )
-        for index, key in enumerate(current):
-            # День только на эту дату (иначе — день задачи, свой день
-            # человека или окно).
-            offset = schedule_plan.slot_offset(
-                plan, by_key.get(key), day, task["name"]
-            )
-            label = member_day_label(offset) if offset is not None else usual
-            rows.append([readiness_button(
-                f"📅 На эту дату · {names.get(key, key)} — {label}"[:60],
-                "pday", service["id"], f"{token}.{index}",
-            )])
-        rows.append([readiness_button(
-            "➕ Другой человек из Telegram", "pnew", service["id"], token
-        )])
-        if current:
+        if view == "main":
+            for index, key in enumerate(current):
+                own_day = (by_key.get(key) or {}).get("day_offset")
+                if own_day is None or own_day == task_day:
+                    continue
+                weekday = schedule_plan.WEEKDAYS[
+                    (date.fromisoformat(day).weekday() + own_day) % 7
+                ]
+                label = names.get(key, key)
+                if len(label) > 48:
+                    label = label[:47] + "…"
+                buttons.append(readiness_button(
+                    f"📅 {label} ({weekday})",
+                    "pday", service["id"], f"{token}.{index}",
+                ))
+        if not buttons:
+            lines.append("Подходящих участников нет.")
+        page_count = max(1, (len(buttons) + 5) // 6)
+        page = min(max(page, 0), page_count - 1)
+        pending["slot_page"] = page
+        visible = buttons[page * 6:(page + 1) * 6]
+        rows = [visible[i:i + 2] for i in range(0, len(visible), 2)]
+        if page_count > 1:
+            lines.append(f"Страница {page + 1}/{page_count}")
+            navigation = []
+            if page:
+                navigation.append(readiness_button(
+                    "⬅️ Стр. " + str(page), "pslotpage", service["id"],
+                    f"{token}.{page - 1}",
+                ))
+            if page + 1 < page_count:
+                navigation.append(readiness_button(
+                    "➡️ Стр. " + str(page + 2), "pslotpage", service["id"],
+                    f"{token}.{page + 1}",
+                ))
+            rows.append(navigation)
+        if view == "main":
+            rows.append([
+                readiness_button("👥 Другие участники", "pslotother", service["id"], token),
+                readiness_button("➕ Из Telegram", "pnew", service["id"], token),
+            ])
+        if current and view == "main":
             rows.append([readiness_button(
                 "🚫 Оставить пустым", "pclear", service["id"], token
             )])
         rows.append([
-            readiness_button(
-                "⬅️ К датам", "pedit", service["id"],
-                plan["month"].replace("-", ""),
-            ) if implicit else readiness_button(
-                "⬅️ К дате", "pdate", service["id"], plan_arg(plan, day_index),
-            )
+            (readiness_button("⬅️ К задаче", "pslotmain", service["id"], token)
+             if view == "other" else
+             readiness_button("⬅️ К датам", "pedit", service["id"],
+                              plan["month"].replace("-", ""))
+             if implicit else
+             readiness_button("⬅️ К дате", "pdate", service["id"], plan_arg(plan, day_index))),
+            readiness_button("❓ Справка", "pslothelp", service["id"], token),
         ])
         await _send_dialog(
             message, "\n".join(lines),
@@ -7694,6 +7750,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 pending_inputs.pop(actor_id, None)
         if action in {
             "padd", "prem", "pclear", "pnew", "pday", "pdset",
+            "pslotother", "pslotmain", "pslothelp", "pslotreturn", "pslotpage",
             "pbulkdel", "pbulkkeep", "pbulktask", "pbulkback",
             "pbulkadd", "pbulksave",
         }:
@@ -7783,7 +7840,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         parts = (arg or "").split(".")
         if action in {
-            "precalc", "precalcok", "pdate", "ptask", "pslot", "pok", "pokok",
+            "precalc", "precalcok", "pdate", "pdayhelp", "ptask", "pslot", "pok", "pokok",
             "pbulkinit", "pquick", "pbulkdel", "pbulkkeep", "pbulktask", "pbulkback",
             "pbulkadd", "pbulksave",
         }:
@@ -7893,6 +7950,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return
         elif action == "pedit":
             await show_plan_dates(callback.message, service_id, plan)
+        elif action == "pdayhelp" and len(parts) == 2 and parts[1].isdigit() and (
+            int(parts[1]) < len(plan["dates"])
+        ):
+            day_index = int(parts[1])
+            day = date.fromisoformat(plan["dates"][day_index])
+            await _send_dialog(
+                callback.message,
+                f"❓ {service_label(service)} › График › {day:%d.%m} › Справка\n\n"
+                "Нажмите название задачи, чтобы изменить её участников отдельно.\n\n"
+                "🗑 Удалить — выберите номера участников: они будут сняты "
+                "со всех задач этого дня.\n\n"
+                "➕ Добавить — выберите задачу, затем номера участников. "
+                "Уже назначенные участники не будут заменены.\n\n"
+                "Изменения сохраняются в рабочем графике. Действующий "
+                "график обновится после утверждения.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    readiness_button("⬅️ К дате", "pdate", service_id,
+                                     plan_arg(plan, day_index)),
+                ]]),
+                _dialog_keep_rows=True, parse_mode=None,
+            )
         elif action == "pdate" and len(parts) == 2 and parts[1].isdigit() and (
             int(parts[1]) < len(plan["dates"])
         ):
@@ -8119,12 +8197,64 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             await _answer_callback(callback)
             return
+        elif action in {"pslotother", "pslotmain", "pslothelp", "pslotreturn", "pslotpage"}:
+            pending = pending_inputs[actor_id]
+            if pending.get("revision") != schedule_plan.revision(plan):
+                raise ValueError("График изменился — откройте его заново.")
+            day = pending["day"]
+            task_index = next(
+                (i for i, task in enumerate(plan["tasks"])
+                 if task["name"] == pending["task"]), None,
+            )
+            if day not in plan["dates"] or task_index is None:
+                raise ValueError("График изменился — откройте его заново.")
+            if action == "pslothelp":
+                await _send_dialog(
+                    callback.message,
+                    f"❓ {service_label(service)} › График › "
+                    f"{date.fromisoformat(day):%d.%m} › {pending['task']} › Справка\n\n"
+                    "❌ Имя — убрать назначенного; ✅ имя — назначить участника. "
+                    "⚪ — не ответил на опрос, ⚠️ — не отметил дату.\n\n"
+                    "👥 Другие участники — выбрать человека, не приписанного "
+                    "к задаче. При назначении бот покажет предупреждение. "
+                    "Занятые на несовместимой задаче не предлагаются.\n\n"
+                    "Если место одно, новый участник заменит назначенного. "
+                    "Если мест несколько и все заняты, сначала уберите кого-то.\n\n"
+                    "📅 Имя (день) — изменить день только этой задачи на "
+                    "выбранную неделю, не меняя постоянный «Свой день».\n\n"
+                    "Правки сохраняются в рабочем графике и вступят в силу "
+                    "после утверждения.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        readiness_button("⬅️ К задаче", "pslotreturn", service_id, pending["token"]),
+                    ]]),
+                    _dialog_keep_rows=True, parse_mode=None,
+                )
+            else:
+                view = (
+                    "other" if action == "pslotother" else
+                    "main" if action == "pslotmain" else pending.get("slot_view", "main")
+                )
+                page = pending.get("slot_page", 0) if action == "pslotreturn" else 0
+                if action == "pslotpage":
+                    if len(parts) != 2 or not parts[1].isdigit():
+                        raise ValueError("Страница устарела — откройте задачу заново.")
+                    page = int(parts[1])
+                await show_plan_slot(
+                    callback.message, actor_id, service, run, plan,
+                    plan["dates"].index(day), task_index, view=view, page=page,
+                )
         elif action == "pday":
             # День только на эту дату для поставленного человека.
             pending = pending_inputs[actor_id]
             index = int(parts[-1]) if parts[-1].isdigit() else -1
             if not 0 <= index < len(pending["keys"]):
                 raise ValueError("Экран устарел — откройте график заново.")
+            if pending.get("revision") != schedule_plan.revision(plan) or (
+                pending["keys"][index] not in schedule_plan.slot_people(
+                    plan, pending["day"], pending["task"],
+                )
+            ):
+                raise ValueError("График изменился — откройте его заново.")
             names = {
                 person["key"]: person["name"]
                 for person in registry.readiness_people(service_id)
@@ -8147,14 +8277,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             key_person = pending["keys"][index]
             await _send_dialog(
                 callback.message,
-                f"📅 {names.get(key_person, key_person)} · "
-                f"{date.fromisoformat(pending['day']):%d.%m}\n\nВ какой день "
-                "человек служит на этой неделе? Выбор действует только для "
-                "этой даты; «Как "
-                "обычно» — его свой день, без него — дни служения ("
-                + DAY_WINDOWS.get(
-                    schedule_plan.window_of(registry, service_id), "свои дни"
-                ) + ").",
+                f"📅 {service_label(service)} › График › "
+                f"{date.fromisoformat(pending['day']):%d.%m} › {pending['task']}\n\n"
+                f"{names.get(key_person, key_person)}: в какой день выполнить "
+                "эту задачу на выбранной неделе? Другие задачи и постоянный "
+                "«Свой день» не изменятся. «Как обычно» вернёт обычный день задачи.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                 _dialog_keep_rows=True,
                 _dialog_keyboard_limit=sum(len(row) for row in rows),
@@ -8180,7 +8307,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         )
                     plan = registry.set_schedule_day(
                         actor_id, service_id, key, pending["day"],
-                        pending["keys"][index], offset,
+                        pending["keys"][index], offset, task=pending["task"],
                     )
                 notice = "✅ День на эту дату: " + (
                     member_day_label(offset) if offset is not None
@@ -8537,6 +8664,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             plan_pending = member_pending
             if action in {
                 "padd", "prem", "pclear", "pnew", "pday", "pdset",
+                "pslotother", "pslotmain", "pslothelp", "pslotreturn", "pslotpage",
             } and not (
                 plan_pending
                 and plan_pending.get("operation") == "readiness_plan"
@@ -8551,7 +8679,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 member_pending.pop("menu_message_id", None)
             elif action in {
                 "addmt", "addms", "padd", "prem", "pclear", "pnew", "pday",
-                "pdset", "ownp", "owns", "pbulkdel", "pbulkkeep",
+                "pdset", "pslotother", "pslotmain", "pslothelp", "pslotreturn",
+                "pslotpage", "ownp", "owns", "pbulkdel", "pbulkkeep",
                 "pbulktask", "pbulkback", "pbulkadd", "pbulksave",
             }:
                 # Выбор задач идёт в одной сессии — pending не сбрасывается.
@@ -8583,6 +8712,27 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise ValueError("Некорректная страница графика.")
                 await show_month_graph(
                     callback.message, actor_id, service_id, int(arg or 0),
+                )
+                await _answer_callback(callback)
+                return
+            if action == "graphhelp":
+                if arg is not None and not arg.isdecimal():
+                    raise ValueError("Некорректная страница графика.")
+                await _send_dialog(
+                    callback.message,
+                    f"❓ {service_label(service)} › График › Справка\n\n"
+                    "✏️ Изменить — исправить рабочую копию графика; "
+                    "она станет действующей после утверждения.\n\n"
+                    "🔁 Замены — заменить участника в утверждённом графике.\n\n"
+                    "📥 Загрузить с диска — загрузить график из Excel.\n\n"
+                    "🗳 Опрос — настроить опрос и составить график по ответам.\n\n"
+                    "🧮 Авто — составить черновик текущего месяца без опроса.\n\n"
+                    "📊 Сводка — посмотреть график и нагрузку участников "
+                    "за текущий или следующий месяц.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        readiness_button("⬅️ К графику", "month", service_id, arg),
+                    ]]),
+                    _dialog_keep_rows=True, parse_mode=None,
                 )
                 await _answer_callback(callback)
                 return

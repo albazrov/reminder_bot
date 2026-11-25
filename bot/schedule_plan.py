@@ -378,8 +378,11 @@ def slot_offset(plan: dict, person: dict | None, day: str,
     графике, иначе день задачи, иначе личный."""
     key = (person or {}).get("key")
     overrides = plan.get("days", {}).get(day, {})
-    override = overrides.get(task_day_key(str(key), task))
-    if override is None:
+    task_key = task_day_key(str(key), task)
+    if task_key in overrides:
+        # None отменяет общий разовый день только для этой задачи.
+        override = overrides[task_key]
+    else:
         override = overrides.get(key)
     if override is not None:
         return override
@@ -585,10 +588,15 @@ def week_person_day(plan: dict, person: dict | None, day: str, task: str,
     )
 
 
-def person_day(person: dict | None, day: str, plan: dict | None = None) -> str:
+def person_day(person: dict | None, day: str, plan: dict | None = None,
+               task: str | None = None) -> str:
     """« (чт 29.10)» для человека с личным (или разовым) днём служения —
     в скобках, как окно у даты."""
-    offset = day_offset(plan, person, day)
+    offset = (
+        slot_offset(plan, person, day, task)
+        if plan is not None and task is not None
+        else day_offset(plan, person, day)
+    )
     if offset is None:
         return ""
     return (
@@ -603,15 +611,15 @@ def date_header(plan: dict, by_key: dict, day: str,
     и тот же свой день — он в скобках у даты («29.11 (чт 26.11)»), у имён
     не повторяется; у всех свои, но разные — дата без периода; иначе —
     дата с окном служения."""
-    people = [
-        key for keys in plan["slots"].get(day, {}).values() for key in keys
-    ]
-    offsets = {day_offset(plan, by_key.get(key), day) for key in people}
-    if people and None not in offsets and len(offsets) == 1:
+    offsets = {
+        slot_offset(plan, by_key.get(key) or {"key": key}, day, task)
+        for task, keys in plan["slots"].get(day, {}).items() for key in keys
+    }
+    if offsets and None not in offsets and len(offsets) == 1:
         (offset,) = offsets
         moment = date.fromisoformat(day) + timedelta(days=offset)
         return f"{_short(day)} ({_weekday_date(moment)})", True
-    if people and None not in offsets:
+    if offsets and None not in offsets:
         return _short(day), False
     return day_label(day, window), False
 
@@ -639,7 +647,8 @@ def plan_day_lines(plan: dict, day: str, by_key: dict, names: dict,
                         [
                             names.get(person, person) + mark(person, day, task["name"])
                             + week_person_day(
-                                plan, by_key.get(person), day, task["name"], offset,
+                                plan, by_key.get(person) or {"key": person},
+                                day, task["name"], offset,
                             )
                             for person in people
                         ],
@@ -654,7 +663,9 @@ def plan_day_lines(plan: dict, day: str, by_key: dict, names: dict,
             task["name"], task["needed"],
             [
                 names.get(person, person) + mark(person, day, task["name"])
-                + ("" if shared_day else person_day(by_key.get(person), day, plan))
+                + ("" if shared_day else person_day(
+                    by_key.get(person) or {"key": person}, day, plan, task["name"],
+                ))
                 for person in people
             ],
             bare=implicit_plan(plan),
@@ -975,7 +986,10 @@ def change_lines(plan: dict, people: list[dict], old_slots: dict,
         }
         for key in sorted(set(before) | set(after)):
             person, task = split_day_key(key)
-            if before.get(key) == after.get(key) or person not in serving:
+            if (
+                (key in before) == (key in after)
+                and before.get(key) == after.get(key)
+            ) or person not in serving:
                 continue
             offset = after.get(key)
             changes.append(
@@ -1039,31 +1053,31 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                         "      ", empty,
                         lambda key, name=name, offset=offset: link(key) + (
                             week_person_day(
-                                plan, by_key[key], day, name, offset
-                            ) if key in by_key else ""
+                                plan, by_key.get(key) or {"key": key}, day, name, offset
+                            )
                         ),
                     )
             continue
         label, shared_day = date_header(plan, by_key, day, window)
         lines += ["", f"🗓 {label}"]
 
-        def mention(key: str) -> str:
+        def mention(key: str, task: str) -> str:
             person = by_key.get(key)
             return link(key) + (
-                "" if shared_day or person is None
-                else person_day(person, day, plan)
+                "" if shared_day
+                else person_day(person or {"key": key}, day, plan, task)
             )
 
         for task in display_tasks(plan):
             keys = plan["slots"].get(day, {}).get(task["name"], [])
             if implicit_plan(plan):
                 lines += (
-                    [f"  • {mention(key)}" for key in keys] or [f"  {empty}"]
+                    [f"  • {mention(key, task['name'])}" for key in keys] or [f"  {empty}"]
                 )
                 continue
             lines += _people_lines(
                 f"  {task_emoji(task['name'])} {task['name']}", keys,
-                "    ", empty, mention,
+                "    ", empty, lambda key, name=task["name"]: mention(key, name),
             )
     if plan.get("approval_warnings"):
         lines += ["", "⚠️ Утверждено с предупреждениями:"] + plan["approval_warnings"]

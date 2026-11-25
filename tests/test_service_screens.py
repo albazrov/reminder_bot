@@ -127,8 +127,17 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertEqual(
                 [item.text for item in self.buttons(shown)],
                 ["✏️ Изменить", "🔁 Замены", "📥 Загрузить с диска",
-                 "🗳 Опрос", "🧮 Авто",
-                 "📊 Сводка", "⬅️ К служению"],
+                 "🗳 Опрос", "🧮 Авто", "📊 Сводка",
+                 "⬅️ К служению", "❓ Справка"],
+            )
+            rows = shown.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual(
+                [[button.text for button in row] for row in rows],
+                [
+                    ["✏️ Изменить", "🔁 Замены", "📥 Загрузить с диска"],
+                    ["🗳 Опрос", "🧮 Авто", "📊 Сводка"],
+                    ["⬅️ К служению", "❓ Справка"],
+                ],
             )
             self.assertIn(
                 "rdy:pedit:sound:202611",
@@ -153,6 +162,65 @@ class ServiceScreensTest(unittest.TestCase):
             self.assertIn("15.11.2026", self.text(back))
             denied = await self.press("rdy:month:sound", 9999)
             self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_graph_help_works_without_plan_and_preserves_page(self):
+        async def run():
+            main = await self.press("rdy:month:sound", 2001)
+            help_button = next(b for b in self.buttons(main) if b.text == "❓ Справка")
+            help_screen = await self.press(help_button.callback_data, 2001)
+            for name in ("Изменить", "Замены", "Загрузить с диска", "Опрос", "Авто", "Сводка"):
+                self.assertIn(name, self.text(help_screen))
+            self.assertEqual(self.buttons(help_screen)[0].callback_data, "rdy:month:sound:0")
+            back = await self.press(self.buttons(help_screen)[0].callback_data, 2001)
+            self.assertIn("График", self.text(back))
+            denied = await self.press(help_button.callback_data, 9999)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+
+            names = [f"Участник {index:03d} " + "И" * 25 for index in range(120)]
+            self.plan({"2026-11-15": {"Микшер": names}})
+            page = await self.press("rdy:month:sound:1", 2001)
+            self.assertIn("Страница 2/", self.text(page))
+            help_button = next(b for b in self.buttons(page) if b.text == "❓ Справка")
+            help_screen = await self.press(help_button.callback_data, 2001)
+            back = await self.press(self.buttons(help_screen)[0].callback_data, 2001)
+            self.assertIn("Страница 2/", self.text(back))
+
+        asyncio.run(run())
+
+    def test_day_help_explains_actions_and_returns_to_selected_date(self):
+        slots = {
+            "2026-11-15": {"Микшер": ["Анна"]},
+            "2026-11-22": {"Микшер": ["Борис"]},
+        }
+        self.plan(slots)
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611", 2001)
+            day_button = [
+                b for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ][1]
+            day = await self.press(day_button.callback_data, 2001)
+            self.assertIn("«Удалить» либо «Добавить»", self.text(day))
+            rows = day.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual([b.text for b in rows[-1]], ["⬅️ К датам", "❓ Справка"])
+            help_button = rows[-1][1]
+            help_screen = await self.press(help_button.callback_data, 2001)
+            for text in ("22.11", "название задачи", "со всех задач", "Добавить", "утверждения"):
+                self.assertIn(text, self.text(help_screen))
+            back_button = self.buttons(help_screen)[0]
+            self.assertEqual(back_button.callback_data, day_button.callback_data)
+            back = await self.press(back_button.callback_data, 2001)
+            self.assertIn("Борис", self.text(back))
+            denied = await self.press(help_button.callback_data, 9999)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+
+            changed = {"2026-11-15": {"Микшер": []}, "2026-11-22": {"Микшер": []}}
+            self.registry.set_schedule_slots(1001, "sound", "2026-11", changed)
+            stale = await self.press(help_button.callback_data, 2001)
+            self.assertIn("График изменился", self.text(stale))
 
         asyncio.run(run())
 
@@ -261,6 +329,343 @@ class ServiceScreensTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_slot_editor_separates_people_and_changes_only_selected_task_day(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.add_service_task(1001, "sound", "Запись")
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Анна", ("Микшер", "Запись")),
+            RosterMember("Борис", ("Микшер",)),
+            RosterMember("Виктор", ("Микшер",)),
+            RosterMember("Дмитрий", ("Микшер",)),
+            RosterMember("Елена", ("Запись",)),
+            RosterMember("Занят", ("Запись",)),
+        ]})
+        self.registry.set_responsible_contact(1001, "sound", "Микшер", "Анна", 3001)
+        self.registry.set_service_member_day(1001, "sound", "Анна", -4)
+        self.registry.set_service_member_day(1001, "sound", "Борис", -3)
+        day = "2026-11-15"
+        slots = {day: {"Микшер": ["Анна", "Борис", "Виктор"],
+                       "Запись": ["Анна", "Занят"]}}
+        self.plan(slots, tasks=[
+            {"name": "Микшер", "needed": 1, "max": 6, "day": -3},
+            {"name": "Запись", "needed": 1, "max": 6},
+        ])
+        self.registry.set_schedule_day(1001, "sound", "2026-11", day, "Анна", -1)
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day_screen = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day_screen)
+                if b.callback_data.startswith("rdy:ptask:") and "Микшер" in b.text
+            ))
+            text = self.text(slot)
+            self.assertIn("ЗВУК › График › 15.11 › Микшер", text)
+            self.assertIn('<a href="tg://user?id=3001">Анна</a> (сб 14.11)', text)
+            labels = [b.text for b in self.buttons(slot)]
+            self.assertTrue(any("Дмитрий" in label for label in labels))
+            self.assertFalse(any("Елена" in label or "Занят" in label for label in labels))
+            self.assertEqual(
+                [b.text for b in self.buttons(slot) if b.callback_data.startswith("rdy:pday:")],
+                ["📅 Анна (ср)"],
+            )
+            help_screen = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pslothelp:")
+            ))
+            self.assertIn("только этой задачи", self.text(help_screen))
+            slot = await self.press(self.buttons(help_screen)[0].callback_data)
+            other = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pslotother:")
+            ))
+            labels = [b.text for b in self.buttons(other)]
+            self.assertTrue(any("Елена" in label for label in labels))
+            self.assertFalse(any("Занят" in label or "Дмитрий" in label for label in labels))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(other)
+                if b.callback_data.startswith("rdy:pslotmain:")
+            ))
+            pick_day = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pday:")
+            ))
+            self.assertIn("Другие задачи", self.text(pick_day))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(pick_day)
+                if b.callback_data.startswith("rdy:pdset:") and b.callback_data.endswith(".-2")
+            ))
+            self.assertIn('Анна</a> (пт 13.11)', self.text(slot))
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            person = next(p for p in self.registry.readiness_people("sound") if p["name"] == "Анна")
+            self.assertEqual(schedule_plan.slot_offset(plan, person, day, "Микшер"), -2)
+            self.assertEqual(schedule_plan.slot_offset(plan, person, day, "Запись"), -1)
+            pick_day = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pday:")
+            ))
+            await self.press(next(
+                b.callback_data for b in self.buttons(pick_day)
+                if b.callback_data.startswith("rdy:pdset:") and b.callback_data.endswith(".n")
+            ))
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(schedule_plan.slot_offset(plan, person, day, "Микшер"), -3)
+            self.assertEqual(schedule_plan.slot_offset(plan, person, day, "Запись"), -1)
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day_screen)
+                if b.callback_data.startswith("rdy:ptask:") and "Микшер" in b.text
+            ))
+            # Кнопка прежней версии графика не открывает устаревшее назначение.
+            self.assertIn("График изменился", self.text(slot))
+            dates = await self.press("rdy:pedit:sound:202611")
+            day_screen = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day_screen)
+                if b.callback_data.startswith("rdy:ptask:") and "Микшер" in b.text
+            ))
+            help_data = next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pslothelp:")
+            )
+            denied = await self.press(help_data, 9999)
+            self.assertIn("Недостаточно прав", denied.answer.await_args.args[0])
+            other = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pslotother:")
+            ))
+            added = await self.press(next(
+                b.callback_data for b in self.buttons(other)
+                if b.callback_data.startswith("rdy:padd:") and "Елена" in b.text
+            ))
+            self.assertIn("не приписан", self.text(added))
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertIn("Елена", plan["slots"][day]["Микшер"])
+            self.assertEqual(plan["approved"], slots)
+
+        asyncio.run(run())
+
+    def test_slot_editor_does_not_replace_newer_screen_after_async_load(self):
+        self.plan(
+            {"2026-11-15": {"Микшер": ["Анна"]}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            task = next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+            original = asyncio.to_thread
+
+            async def delay(func, *args, **kwargs):
+                if func is schedule_plan.plan_summary:
+                    started.set()
+                    await release.wait()
+                return await original(func, *args, **kwargs)
+
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delay):
+                old = asyncio.create_task(self.press(task))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                newer = await self.press("rdy:pedit:sound:202611")
+                release.set()
+                stale = await old
+            self.assertIn("выберите дату", self.text(newer))
+            stale.message.answer.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_slot_editor_paginates_candidates_and_keeps_navigation(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember(f"Участник {i}", ("Микшер",)) for i in range(12)
+        ]})
+        self.plan({"2026-11-15": {"Микшер": []}},
+                  tasks=[{"name": "Микшер", "needed": 1, "max": 1}])
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            self.assertIn("Страница 1/2", self.text(slot))
+            buttons = self.buttons(slot)
+            self.assertEqual(sum(b.callback_data.startswith("rdy:padd:") for b in buttons), 6)
+            self.assertTrue(any(b.text == "❓ Справка" for b in buttons))
+            first_candidate = next(b.callback_data for b in buttons if b.callback_data.startswith("rdy:padd:"))
+            page = await self.press(next(
+                b.callback_data for b in buttons if b.callback_data.startswith("rdy:pslotpage:")
+            ))
+            self.assertIn("Страница 2/2", self.text(page))
+            self.assertTrue(any(b.text == "❓ Справка" for b in self.buttons(page)))
+            stale = await self.press(first_candidate)
+            self.assertIn("устарел", stale.answer.await_args.args[0].lower())
+            help_screen = await self.press(next(
+                b.callback_data for b in self.buttons(page)
+                if b.callback_data.startswith("rdy:pslothelp:")
+            ))
+            page = await self.press(self.buttons(help_screen)[0].callback_data)
+            self.assertIn("Страница 2/2", self.text(page))
+            chosen = next(b for b in self.buttons(page) if b.callback_data.startswith("rdy:padd:"))
+            name = chosen.text.split(" ", 1)[1]
+            await self.press(chosen.callback_data)
+            self.assertEqual(
+                self.registry.get_schedule_plan("sound", "2026-11")["slots"]["2026-11-15"]["Микшер"],
+                [name],
+            )
+
+        asyncio.run(run())
+
+    def test_slot_editor_keeps_task_members_with_different_poll_answers(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember(name, ("Микшер",)) for name in ("Анна", "Борис", "Вера")
+        ]})
+        for index, name in enumerate(("Анна", "Борис", "Вера"), 3001):
+            self.registry.set_responsible_contact(1001, "sound", "Микшер", name, index)
+        run = self.registry.create_readiness_run(
+            "sound", "2026-11", status="open",
+            dates=["2026-11-15", "2026-11-22"], poll_id="editor-poll",
+        )
+        self.registry.record_readiness_answer(
+            "editor-poll", 3001, "", "Анна", ["2026-11-22"],
+        )
+        self.registry.record_readiness_answer(
+            "editor-poll", 3003, "", "Вера", ["2026-11-15"],
+        )
+        self.registry.close_readiness_run(run["id"])
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=run["id"], dates=["2026-11-15"],
+            tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+            slots={"2026-11-15": {"Микшер": []}}, last_served={},
+        )
+
+        async def run_test():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            labels = [b.text for b in self.buttons(slot)]
+            self.assertIn("⚠️ Анна", labels)
+            self.assertIn("⚪ Борис", labels)
+            self.assertIn("✅ Вера", labels)
+            self.assertIn("Никого", self.text(slot))
+
+        asyncio.run(run_test())
+
+    def test_slot_day_button_compares_with_selected_date_without_task_day(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Анна", ("Микшер",)),
+            RosterMember("Борис", ("Микшер",)),
+        ]})
+        self.registry.set_service_member_day(1001, "sound", "Анна", 0)
+        self.registry.set_service_member_day(1001, "sound", "Борис", -1)
+        self.plan({"2026-11-15": {"Микшер": ["Анна", "Борис"]}},
+                  tasks=[{"name": "Микшер", "needed": 1, "max": 2}])
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            self.assertEqual(
+                [b.text for b in self.buttons(slot) if b.callback_data.startswith("rdy:pday:")],
+                ["📅 Борис (сб)"],
+            )
+
+        asyncio.run(run())
+
+    def test_add_day_tasks_are_paired_in_quick_and_legacy_editors(self):
+        names = ["Микшер", "Запись", "Пульт", "Сборка", "Камера"]
+        self.plan(
+            {"2026-11-15": {name: [] for name in names}},
+            tasks=[{"name": name, "needed": 1} for name in names],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            quick_add = next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:pquick:")
+                and b.callback_data.endswith(".add")
+            )
+            quick = await self.press(quick_add)
+            quick_rows = quick.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertEqual([len(row) for row in quick_rows], [2, 2, 1, 1])
+            self.assertEqual(quick_rows[-1][0].text, "⬅️ К дате")
+            quick_buttons = [button for row in quick_rows[:-1] for button in row]
+            self.assertEqual(len(quick_buttons), len(names))
+            for button in quick_buttons:
+                self.assertTrue(button.callback_data.startswith("rdy:pbulktask:"))
+                screen = await self.press(button.callback_data)
+                index = int(button.callback_data.rsplit(".", 1)[1])
+                self.assertIn(f"«{names[index]}»", self.text(screen))
+                quick = await self.press(next(
+                    b.callback_data for b in self.buttons(screen)
+                    if b.callback_data.startswith("rdy:pbulkback:")
+                ))
+
+            legacy_init = quick_add.replace(
+                "rdy:pquick:", "rdy:pbulkinit:", 1,
+            ).removesuffix(".add")
+            removal = await self.press(legacy_init)
+            legacy = await self.press(next(
+                b.callback_data for b in self.buttons(removal)
+                if b.callback_data.startswith("rdy:pbulkkeep:")
+            ))
+            legacy_rows = legacy.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard
+            self.assertEqual([len(row) for row in legacy_rows], [2, 2, 1, 1, 1])
+            self.assertEqual(
+                [button.text for row in legacy_rows[:3] for button in row],
+                [button.text for button in quick_buttons],
+            )
+            self.assertEqual(legacy_rows[-1][0].text, "⬅️ К участникам дня")
+
+        asyncio.run(run())
+
     def test_bulk_editor_does_not_replace_newer_editor_after_async_load(self):
         self.registry.add_service_task(1001, "sound", "Микшер")
         self.plan(
@@ -327,9 +732,15 @@ class ServiceScreensTest(unittest.TestCase):
             RosterMember("Анна", ("Микшер", "Запись")),
             RosterMember("Борис", ("Микшер",)),
         ]})
+        for task in ("Микшер", "Запись"):
+            self.registry.set_responsible_contact(
+                1001, "sound", task, "Анна", 3001,
+            )
         slots = {"2026-11-15": {"Микшер": ["Анна", "Борис"], "Запись": ["Анна"]}}
         self.plan(slots, tasks=[
-            {"name": "Микшер", "needed": 1}, {"name": "Запись", "needed": 1},
+            {"name": "Микшер", "needed": 1},
+            {"name": "Запись", "needed": 1, "day": -3},
+            {"name": "Пустая задача", "needed": 1},
         ])
         approved = self.registry.get_schedule_plan("sound", "2026-11")["approved"]
 
@@ -347,7 +758,15 @@ class ServiceScreensTest(unittest.TestCase):
                 b.callback_data for b in self.buttons(day)
                 if b.callback_data.startswith("rdy:pquick:") and b.callback_data.endswith(".remove")
             )
-            await self.press(remove)
+            removal = await self.press(remove)
+            text = self.text(removal)
+            self.assertIn("🗓 Неделя", text)
+            self.assertIn("Микшер", text)
+            self.assertIn("Запись", text)
+            self.assertIn("Пустая задача", text)
+            self.assertEqual(text.count('1. <a href="tg://user?id=3001">Анна</a>'), 2)
+            self.assertIn("2. Борис", text)
+            self.assertNotIn("Анна —", text)
             handler = next(
                 item.callback for item in self.router.message.handlers
                 if item.callback.__name__ == "on_service_parameter"
@@ -442,7 +861,7 @@ class ServiceScreensTest(unittest.TestCase):
             for _ in range(10):
                 texts.append(self.text(shown))
                 buttons = self.buttons(shown)
-                self.assertLessEqual(len(buttons), 8)
+                self.assertLessEqual(len(buttons), 10)
                 self.assertTrue(all(len(item.callback_data.encode()) <= 64 for item in buttons))
                 self.assertIn(
                     "rdy:pedit:sound:202611",
@@ -451,6 +870,7 @@ class ServiceScreensTest(unittest.TestCase):
                 self.assertIn("rdy:open:sound", [b.callback_data for b in buttons])
                 self.assertIn("service:service_excel:sound", [b.callback_data for b in buttons])
                 self.assertIn("rdy:summary:sound", [b.callback_data for b in buttons])
+                self.assertTrue(any(b.text == "❓ Справка" for b in buttons))
                 self.assertLessEqual(visible_units(self.text(shown)), 4096)
                 next_page = next((item for item in buttons if item.text == "➡️ Далее"), None)
                 if next_page is None:
@@ -573,7 +993,7 @@ class ServiceScreensTest(unittest.TestCase):
             for button in choices:
                 task = await self.press(button.callback_data)
                 index = int(button.callback_data.split(".")[-1])
-                self.assertIn(f"«{names[index]}»", self.text(task))
+                self.assertIn(f"› {names[index]}", self.text(task))
             self.assertEqual(self.registry.get_schedule_plan("kitchen", "2026-11"), before)
 
         asyncio.run(run())

@@ -7319,7 +7319,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             screen = await press("rdy:month:sound")
             rows = screen.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
             row = next(row for row in rows if any(b.text == "🧮 Авто" for b in row))
-            self.assertEqual([b.text for b in row], ["🗳 Опрос", "🧮 Авто"])
+            self.assertEqual([b.text for b in row], ["🗳 Опрос", "🧮 Авто", "📊 Сводка"])
             auto = next(b.callback_data for b in row if b.text == "🧮 Авто")
             self.assertEqual(auto, f"rdy:pfree:sound:{month}")
             built = await press(auto)
@@ -7412,7 +7412,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             dates = await press(f"rdy:pedit:kitchen:{month}")
             day = await press(button(dates, "rdy:pdate:"))
             day_override = await press(button(day, "rdy:ptask:"))
-            self.assertTrue(any(
+            self.assertFalse(any(
                 item.startswith("rdy:pday:")
                 for item in self.callback_data_list(day_override.message)
             ), (
@@ -7421,7 +7421,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ))
             bulk = await press(button(day, "rdy:pbulkinit:"))
             self.assertIn(
-                "участники всего дня",
+                "🗓",
                 bulk.message.answer.await_args.args[0].lower(),
             )
             input_handler = next(
@@ -7541,9 +7541,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             removal = await press(button(task_list, "rdy:pbulkback:"))
             removal_text = removal.message.answer.await_args.args[0]
             person_number = next(
-                line.split(".", 1)[0].strip()
+                line.split("•", 1)[1].split(".", 1)[0].strip()
                 for line in removal_text.splitlines()
-                if "В — Скатерти" in line
+                if "•" in line and ". В" in line
             )
             await input_handler(self.message(67890, person_number))
             task_list = await press(button(removal, "rdy:pbulkdel:"))
@@ -8371,13 +8371,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             dates_screen = await press(f"rdy:pedit:sound:{month_arg}")
             day = await press(data_of(dates_screen, "rdy:pdate:"))
             slot = await press(data_of(day, "rdy:ptask:"))
-            self.assertIn("Сейчас: Алексей", text_of(slot))
-            self.assertTrue(any(
+            self.assertIn('• <a href="tg://user?id=501">Алексей</a>', text_of(slot))
+            self.assertFalse(any(
                 button.callback_data.startswith("rdy:pday:")
                 for button in buttons(slot)
             ))
             bulk = await press(data_of(day, "rdy:pbulkinit:"))
-            self.assertIn("1. Алексей — звук", text_of(bulk))
+            self.assertIn("1. <a href=\"tg://user?id=501\">Алексей</a>", text_of(bulk))
+            self.assertIn("🎚️ звук", text_of(bulk))
             keep = data_of(bulk, "rdy:pbulkkeep:")
             task_list = await press(keep)
             task = next(
@@ -8405,7 +8406,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             task_list = await press(data_of(added, "rdy:pbulkback:"))
             removal = await press(data_of(task_list, "rdy:pbulkback:"))
-            self.assertIn("2. Борис — звук", text_of(removal))
+            self.assertIn("2. <a href=\"tg://user?id=502\">Борис</a>", text_of(removal))
             await input_handler(self.message(67890, "2"))
             task_list = await press(data_of(removal, "rdy:pbulkdel:"))
             candidates = await press(data_of(task_list, "rdy:pbulktask:"))

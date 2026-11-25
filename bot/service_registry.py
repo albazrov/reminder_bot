@@ -25,6 +25,7 @@ from .services import (
     normalized_name,
     sort_tasks_for_display,
     split_day_key,
+    task_day_key,
 )
 from .task_rules import AssignmentWarnings, assignment_issues, dependent_tasks
 
@@ -7534,7 +7535,7 @@ class ServiceRegistry:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT tasks_json, slots_json FROM schedule_plans "
+                "SELECT tasks_json, slots_json, days_json FROM schedule_plans "
                 "WHERE service_id = ? AND month = ?",
                 (service_id, month),
             ).fetchone()
@@ -7545,12 +7546,19 @@ class ServiceRegistry:
                 if task["name"] == old else task
                 for task in json.loads(row["tasks_json"])
             ]
+            days = {}
+            for day, entries in json.loads(row["days_json"] or "{}").items():
+                days[day] = {}
+                for key, offset in entries.items():
+                    person, task = split_day_key(key)
+                    days[day][task_day_key(person, new) if task == old else key] = offset
             connection.execute(
-                "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, "
+                "UPDATE schedule_plans SET tasks_json = ?, slots_json = ?, days_json = ?, "
                 "updated_at = ? WHERE service_id = ? AND month = ?",
                 (
                     json.dumps(tasks, ensure_ascii=False),
-                    renamed(json.loads(row["slots_json"])), _utc_now(),
+                    renamed(json.loads(row["slots_json"])),
+                    json.dumps(days, ensure_ascii=False), _utc_now(),
                     service_id, month,
                 ),
             )
@@ -7558,10 +7566,9 @@ class ServiceRegistry:
 
     def set_schedule_day(
         self, actor_id: int, service_id: str, month: str, day: str, key: str,
-        offset: int | None,
+        offset: int | None, *, task: str | None = None,
     ) -> dict:
-        """День служения человека только на эту дату графика (сдвиг от
-        воскресенья; None — как обычно)."""
+        """Разовый день человека или одного назначения; None — как обычно."""
         _validate_positive_id(actor_id, "actor_id")
         if offset is not None and (
             isinstance(offset, bool) or not isinstance(offset, int)
@@ -7579,17 +7586,26 @@ class ServiceRegistry:
             if row is None:
                 raise ValueError("График не найден — откройте его заново.")
             days = json.loads(row["days_json"] or "{}")
-            # День на дату — для всех задач человека: разовые дни задач
-            # (из Excel) он заменяет.
-            for other in list(days.get(day, {})):
-                if split_day_key(other)[0] == key and other != key:
-                    days[day].pop(other)
-            if offset is None:
-                days.get(day, {}).pop(key, None)
-                if not days.get(day):
-                    days.pop(day, None)
+            if task is not None:
+                slots = json.loads(row["slots_json"])
+                if key not in slots.get(day, {}).get(task, []):
+                    raise ValueError("Участник больше не назначен на эту задачу.")
+                task_key = task_day_key(key, task)
+                if offset is None and key not in days.get(day, {}):
+                    days.get(day, {}).pop(task_key, None)
+                else:
+                    days.setdefault(day, {})[task_key] = offset
             else:
-                days.setdefault(day, {})[key] = offset
+                # Прежний общий перенос заменяет отдельные дни задач.
+                for other in list(days.get(day, {})):
+                    if split_day_key(other)[0] == key and other != key:
+                        days[day].pop(other)
+                if offset is None:
+                    days.get(day, {}).pop(key, None)
+                else:
+                    days.setdefault(day, {})[key] = offset
+            if not days.get(day):
+                days.pop(day, None)
             self.task_assignment_warnings(
                 service_id, json.loads(row["slots_json"]), days=days,
                 connection=connection,
