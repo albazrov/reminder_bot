@@ -601,6 +601,11 @@ class ServiceRegistry:
                         delete_at, next_attempt_at
                     );
 
+                CREATE TABLE IF NOT EXISTS group_reminder_expiry_warnings (
+                    expiration_id INTEGER PRIMARY KEY,
+                    message TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS group_reminder_migrations (
                     name TEXT PRIMARY KEY
                 );
@@ -4662,6 +4667,7 @@ class ServiceRegistry:
         *,
         retry_after: int | None = None,
         final: bool = False,
+        warning: str | None = None,
     ) -> None:
         _validate_positive_id(expiration_id, "expiration_id")
         if now.tzinfo is None or now.utcoffset() is None:
@@ -4693,6 +4699,28 @@ class ServiceRegistry:
                 WHERE id = ?
                 """,
                 (attempts, next_attempt, failed_at, error[:500], expiration_id),
+            )
+            if final and warning is not None:
+                connection.execute(
+                    "INSERT OR IGNORE INTO group_reminder_expiry_warnings "
+                    "(expiration_id, message) VALUES (?, ?)",
+                    (expiration_id, warning),
+                )
+
+    def list_group_reminder_expiry_warnings(self) -> list[dict]:
+        with self._connection(notify=False) as connection:
+            rows = connection.execute(
+                "SELECT expiration_id, message FROM group_reminder_expiry_warnings "
+                "ORDER BY expiration_id LIMIT 100"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete_group_reminder_expiry_warning(self, expiration_id: int) -> None:
+        _validate_positive_id(expiration_id, "expiration_id")
+        with self._connection(notify=False) as connection:
+            connection.execute(
+                "DELETE FROM group_reminder_expiry_warnings WHERE expiration_id = ?",
+                (expiration_id,),
             )
 
     # Deprecated aliases retained for older integrations.
@@ -7538,6 +7566,7 @@ class ServiceRegistry:
 
     def set_schedule_slots(
         self, actor_id: int, service_id: str, month: str, slots: dict,
+        *, validate_new_people: bool = False,
     ) -> dict:
         """Ручная правка графика админом служения («✏️ Изменить»). Разовые
         дни убранных из даты людей отбрасываются."""
@@ -7546,12 +7575,31 @@ class ServiceRegistry:
             connection.execute("BEGIN IMMEDIATE")
             self._require_service_editor(connection, actor_id, service_id)
             row = connection.execute(
-                "SELECT days_json FROM schedule_plans "
+                "SELECT days_json, slots_json FROM schedule_plans "
                 "WHERE service_id = ? AND month = ?",
                 (service_id, month),
             ).fetchone()
             if row is None:
                 raise ValueError("График не найден — откройте его заново.")
+            if validate_new_people:
+                old_slots = json.loads(row["slots_json"])
+                eligible = {
+                    person["key"]: set(person["tasks"])
+                    for person in self.readiness_people(
+                        service_id, connection=connection
+                    )
+                }
+                for day, tasks in slots.items():
+                    for task, people in tasks.items():
+                        existing = set(old_slots.get(day, {}).get(task, ()))
+                        if any(
+                            task not in eligible.get(person, set())
+                            for person in people if person not in existing
+                        ):
+                            raise ValueError(
+                                "Состав или задачи участников изменились — "
+                                "откройте график и выберите участников заново."
+                            )
             days = {}
             for day, people_days in json.loads(row["days_json"] or "{}").items():
                 serving = {

@@ -6703,7 +6703,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         staged = {**plan, "slots": pending["working_slots"]}
         token_arg = plan_arg(plan, pending["token"])
         if pending["stage"] == "remove":
-            assignments = dict(_day_participants(staged, day))
+            day_assignments = _day_participants(staged, day)
+            assignments = dict(day_assignments)
+            day_people = [person for person, _ in day_assignments]
+            if pending["day_people"] != day_people:
+                pending["day_people"] = day_people
+                pending["selected"] = []
+                pending["selected_keys"] = []
             lines = [
                 f"✏️ {date.fromisoformat(day):%d.%m} — участники всего дня:",
             ]
@@ -6779,7 +6785,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             free, quiet, rest = schedule_plan.candidates(
                 staged, summary, day, task_name
             )
-            already_in_week = set(pending["day_people"])
+            already_in_week = {
+                person for person, _ in _day_participants(staged, day)
+            }
             candidates = [
                 person for person in (*free, *quiet, *rest)
                 if person not in already_in_week
@@ -7295,6 +7303,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 run, plan = await load_plan(
                     pending["service_id"], pending["month"]
                 )
+                if pending_inputs.get(actor_id) is not pending:
+                    return
                 if (
                     not plan_current(run, plan)
                     or schedule_plan.revision(plan) != pending.get("revision")
@@ -7342,6 +7352,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 run, plan = await load_plan(
                     pending["service_id"], pending["month"]
                 )
+                if pending_inputs.get(actor_id) is not pending:
+                    return
                 if (
                     not plan_current(run, plan)
                     or schedule_plan.revision(plan) != pending.get("revision")
@@ -7386,14 +7398,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
     async def on_plan_action(
         callback: CallbackQuery, action: str, service: dict, arg: str | None,
-        actor_id: int, now: datetime,
+        actor_id: int, now: datetime, *, save_snapshot=None,
+        save_pending=None,
     ) -> None:
         """Действия «📋 График» (этап 5.4–5.5)."""
-        save_snapshot = None
-        if action == "pbulksave":
-            live_pending = pending_inputs.get(actor_id)
-            if live_pending and live_pending.get("bulk_editor"):
-                save_snapshot = copy_plan_slots(live_pending["working_slots"])
         registry = service_registry()
         service_id = service["id"]
         if action in {"plan", "pok"}:
@@ -7718,6 +7726,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     pending["stage"] = "remove"
                 else:
                     notice = "⚠️ Вернуться на предыдущий шаг нельзя."
+                pending["selected"] = []
+                pending["selected_keys"] = []
             elif action == "pbulkadd":
                 if pending.get("stage") != "add":
                     notice = "⚠️ Сначала выберите задачу для добавления."
@@ -7747,6 +7757,9 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         pending["selected"] = []
                         pending["selected_keys"] = []
             elif action == "pbulksave":
+                if pending is not save_pending:
+                    await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
+                    return
                 if pending.get("stage") not in {"task", "add"}:
                     await _answer_callback(
                         callback, "⚠️ Сначала завершите выбор участников."
@@ -7792,7 +7805,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         return
                     if pending["working_slots"] != fresh_plan["slots"]:
                         plan = registry.set_schedule_slots(
-                            actor_id, service_id, key, pending["working_slots"]
+                            actor_id, service_id, key, pending["working_slots"],
+                            validate_new_people=True,
                         )
                     else:
                         plan = fresh_plan
@@ -8207,6 +8221,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             key = f"{year:04d}-{month:02d}"
             settings = registry.get_readiness_settings(service_id)
             member_pending = pending_inputs.get(actor_id)
+            save_pending = member_pending if action == "pbulksave" else None
+            save_snapshot = (
+                copy_plan_slots(save_pending["working_slots"])
+                if save_pending and save_pending.get("bulk_editor") else None
+            )
             if action in {"addmt", "addms"} and not (
                 member_pending
                 and member_pending.get("operation") == "readiness_member"
@@ -8245,7 +8264,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             }:
                 # Выбор задач идёт в одной сессии — pending не сбрасывается.
                 await clean_previous_menu(callback.message, debug)
-                pending_inputs[actor_id].pop("menu_message_id", None)
+                if pending_inputs.get(actor_id) is not member_pending or not member_pending:
+                    await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
+                    return
+                member_pending.pop("menu_message_id", None)
             else:
                 await clean_and_clear_pending_actor(actor_id)
                 await clean_previous_menu(callback.message, debug)
@@ -8284,7 +8306,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 return
             if action in PLAN_ACTIONS:
                 await on_plan_action(
-                    callback, action, service, arg, actor_id, now
+                    callback, action, service, arg, actor_id, now,
+                    save_snapshot=save_snapshot, save_pending=save_pending,
                 )
                 return
             if action in {
@@ -10697,16 +10720,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 ):
                     await _answer_callback(callback, "⚠️ Этот экран уже устарел.")
                     return
-                pending.pop("group_reminder_merge", None)
-                pending.pop("group_reminder_draft", None)
                 source_id = merge["source_id"]
                 if action == "mrg_ok":
-                    if source_id is not None or merge["merged_body"] is not None:
-                        merge_changes = (
-                            {"body": merge["merged_body"]}
-                            if merge["merged_body"] is not None
-                            else {}
-                        )
+                    merge_changes = (
+                        {"body": merge["merged_body"]}
+                        if merge["merged_body"] is not None
+                        else {}
+                    )
+                    try:
                         registry.merge_group_reminder(
                             actor_id,
                             merge["target_id"],
@@ -10716,6 +10737,47 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             source_slot=merge["source_slot"],
                             **merge_changes,
                         )
+                    except ValueError:
+                        target = registry.get_group_reminder(merge["target_id"])
+                        current_service = registry.get_service(service_id)
+                        current_ttl = (
+                            target.get("ttl_hours")
+                            if target and target.get("ttl_hours") is not None
+                            else current_service.get("group_reminder_ttl_hours")
+                            if current_service else None
+                        )
+                        if (
+                            target and current_service
+                            and target["service_id"] == service_id
+                            and target["enabled"]
+                            and (target["reminder_days"], target["reminder_time"])
+                            == merge["target_slot"]
+                            and current_ttl != merge["target_ttl"]
+                        ):
+                            source = (
+                                registry.get_group_reminder(source_id)
+                                if source_id is not None else None
+                            )
+                            if source_id is not None and (
+                                not source or source["service_id"] != service_id
+                                or (source["reminder_days"], source["reminder_time"])
+                                != merge["source_slot"]
+                            ):
+                                raise
+                            await _answer_callback(
+                                callback, "⚠️ Срок жизни изменился. Подтвердите заново."
+                            )
+                            await offer_group_reminder_merge(
+                                callback.message, actor_id, service_id, target,
+                                days=merge["days"], time=merge["time"],
+                                body=merge["body"], source_id=source_id,
+                                source_slot=merge["source_slot"], period=source,
+                            )
+                            return
+                        raise
+                    pending.pop("group_reminder_merge", None)
+                    pending.pop("group_reminder_draft", None)
+                    if source_id is not None or merge["merged_body"] is not None:
                         await refresh_jobs()
                     await enter_group_reminder_card(
                         callback.message, actor_id, service_id,
@@ -10741,15 +10803,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             allow_duplicate=True,
                         )
                         opened_id = source_id
+                    pending.pop("group_reminder_merge", None)
+                    pending.pop("group_reminder_draft", None)
                     await refresh_jobs()
                     await enter_group_reminder_card(
                         callback.message, actor_id, service_id, opened_id
                     )
                 elif source_id is None:
+                    pending.pop("group_reminder_merge", None)
+                    pending.pop("group_reminder_draft", None)
                     await show_reminder_rules_menu(
                         callback.message, actor_id, service_id
                     )
                 else:
+                    pending.pop("group_reminder_merge", None)
+                    pending.pop("group_reminder_draft", None)
                     await enter_group_reminder_card(
                         callback.message, actor_id, service_id, source_id
                     )

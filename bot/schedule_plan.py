@@ -157,7 +157,7 @@ async def last_served(
     return result, None
 
 
-def plan_tasks(registry, service_id: str) -> list[dict]:
+def plan_tasks(registry, service_id: str, *, catalog: list[dict] | None = None) -> list[dict]:
     """Распределяемые задачи в порядке каталога: минимум и максимум
     (служение без задач — одна задача с его названием)."""
     return [
@@ -168,7 +168,9 @@ def plan_tasks(registry, service_id: str) -> list[dict]:
             **({"requires_any": task["requires_any"]}
                if task.get("requires_any") else {}),
         }
-        for task in registry.plan_tasks(service_id)
+        for task in (
+            catalog if catalog is not None else registry.plan_tasks(service_id)
+        )
     ]
 
 
@@ -224,15 +226,16 @@ async def prepare_draft(
         registry, run["service_id"], year, month, people, events_loader,
         logger,
     )
+    catalog = registry.plan_tasks(run["service_id"])
+    settings = registry.get_readiness_settings(run["service_id"])
     summary = await asyncio.to_thread(
         summarize, registry, run,
         last_served={key: date.fromisoformat(day) for key, day in served.items()},
         assume_free=run["id"] is None,
+        catalog=catalog, settings=settings,
     )
-    tasks = plan_tasks(registry, run["service_id"])
-    default_day = registry.get_readiness_settings(
-        run["service_id"]
-    )["day_from"]
+    tasks = plan_tasks(registry, run["service_id"], catalog=catalog)
+    default_day = settings["day_from"]
     if default_day:
         tasks = [{**task, "default_day": default_day} for task in tasks]
     slots = {

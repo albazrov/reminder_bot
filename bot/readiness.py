@@ -361,7 +361,8 @@ def _excluded_slot_availability(
 
 def summarize(registry, run: dict, *, with_plan: bool = True,
               last_served: dict[str, date] | None = None,
-              assume_free: bool = False) -> Summary:
+              assume_free: bool = False, catalog: list[dict] | None = None,
+              settings: dict | None = None) -> Summary:
     """last_served — последнее служение человека (ключ) в прошлом
     месяце: для интервала между служениями. assume_free — график без
     опроса: все из состава с задачами свободны во все даты."""
@@ -435,7 +436,8 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
     if with_plan:
         tasks = {person["key"]: person["tasks"] for person in people}
         # У служения без задач — одна задача с его названием.
-        catalog = registry.plan_tasks(run["service_id"])
+        if catalog is None:
+            catalog = registry.plan_tasks(run["service_id"])
         summary.implicit = any(task["implicit"] for task in catalog)
         week_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
         free = {}
@@ -455,7 +457,8 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
         silent = {person["key"] for person in summary.not_answered}
         free.update({name: week_dates for name in silent})
         # Лимит служений в месяц: личный главнее лимита служения.
-        settings = registry.get_readiness_settings(run["service_id"])
+        if settings is None:
+            settings = registry.get_readiness_settings(run["service_id"])
         allocation_priority = (
             ALLOCATION_MINIMUM_LOAD if assume_free
             else settings["allocation_priority"]

@@ -2948,6 +2948,37 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_merge_ttl_conflict_preserves_draft_and_requires_confirmation(self):
+        async def run():
+            self._preview_with_data()
+            self.registry.set_group_reminder_default_ttl(67890, "sound", 6)
+            menu = await self._open_sound_reminders()
+            await self._click(
+                menu.message,
+                lambda button: button.text == "➕ Добавить напоминание",
+            )
+            await self._type("1")
+            await self._type("18:00")
+            merge_screen = await self._type("Новый текст")
+            self.assertIn("уже есть напоминание", merge_screen.answer.await_args.args[0])
+            self.registry.set_group_reminder_default_ttl(67890, "sound", 24)
+            conflict = await self._click(
+                merge_screen, lambda button: button.text == "🔗 Объединить"
+            )
+            self.assertIn("24 ч", conflict.message.answer.await_args.args[0])
+            self.assertIn("Новый текст", conflict.message.answer.await_args.args[0])
+            self.assertEqual(self._sound_slots(), [(1, "18:00", None)])
+            await self._click(
+                conflict.message,
+                lambda button: button.text == "➕ Отдельным сообщением",
+            )
+            self.assertEqual(
+                self._sound_slots(),
+                [(1, "18:00", None), (1, "18:00", "Новый текст")],
+            )
+
+        asyncio.run(run())
+
     def test_same_slot_and_same_text_keeps_one_reminder(self):
         async def run():
             menu = await self._open_sound_reminders()
@@ -7438,6 +7469,45 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await input_handler(self.message(67890, "1"))
             add_callback = button(current, "rdy:pbulkadd:")
             save_callback = button(current, "rdy:pbulksave:")
+            invoked = False
+
+            async def add_during_cleanup(*args, **kwargs):
+                nonlocal invoked
+                if not invoked:
+                    invoked = True
+                    await press(add_callback)
+
+            with patch(
+                "bot.handlers.clean_previous_message",
+                new=AsyncMock(side_effect=add_during_cleanup),
+            ):
+                current = await press(save_callback)
+            self.assertTrue(invoked)
+            self.assertIn(
+                "черновик изменился после нажатия",
+                current.message.answer.await_args.args[0].lower(),
+            )
+            task_list = await press(button(current, "rdy:pbulkback:"))
+            removal = await press(button(task_list, "rdy:pbulkback:"))
+            removal_text = removal.message.answer.await_args.args[0]
+            person_number = next(
+                line.split(".", 1)[0].strip()
+                for line in removal_text.splitlines()
+                if "В — Скатерти" in line
+            )
+            await input_handler(self.message(67890, person_number))
+            task_list = await press(button(removal, "rdy:pbulkdel:"))
+            task_button = next(
+                b.callback_data
+                for row in task_list.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for b in row if "Скатерти" in b.text
+            )
+            current = await press(task_button)
+            await input_handler(self.message(67890, "1"))
+            add_callback = button(current, "rdy:pbulkadd:")
+            save_callback = button(current, "rdy:pbulksave:")
             lock_entries = 0
 
             class AddWhileSaving:
@@ -7700,6 +7770,43 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(len(plan["slots"][first_day]["звук"]), 1)
             again = await press("rdy:open:sound")
             self.assertIn("(без опроса)", text_of(again))
+
+            dates = await press(f"rdy:pedit:sound:{month_arg}")
+            day = await press(data_of(dates, "rdy:pdate:"))
+            slot = await press(data_of(day, "rdy:pbulkinit:"))
+            task_list = await press(data_of(slot, "rdy:pbulkkeep:"))
+            task = await press(data_of(task_list, "rdy:pbulktask:"))
+            ask_user = await press(data_of(task, "rdy:pnew:"))
+            request = ask_user.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].keyboard[0][0].request_users
+            invalid = self.message(67890, "")
+            invalid.text = None
+            invalid.users_shared = SimpleNamespace(
+                request_id=request.request_id,
+                users=[SimpleNamespace(
+                    user_id=776, first_name="", last_name="", username="",
+                )],
+            )
+            cancel_message = self.message(67890, "/cancel")
+            cancel_handler = self.message_handler("on_cancel_service_command")
+
+            class CancelDuringRecovery:
+                async def __aenter__(self):
+                    await cancel_handler(cancel_message)
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return False
+
+            with patch.object(
+                readiness, "service_lock",
+                side_effect=lambda service_id: CancelDuringRecovery(),
+            ):
+                await self.message_handler("on_users_shared")(invalid)
+            self.assertTrue(cancel_message.answer.await_count)
+            self.assertFalse(invalid.answer.await_args_list)
+            stale = await press(data_of(task, "rdy:pbulksave:"))
+            self.assertIn("устарел", stale.answer.await_args.args[0].lower())
 
             dates = await press(f"rdy:pedit:sound:{month_arg}")
             day = await press(data_of(dates, "rdy:pdate:"))
@@ -8240,6 +8347,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_schedule_plan("sound", key)["slots"][dates[0]]["звук"],
                 ["Алексей"],
             )
+            task_list = await press(data_of(added, "rdy:pbulkback:"))
+            removal = await press(data_of(task_list, "rdy:pbulkback:"))
+            self.assertIn("2. Борис — звук", text_of(removal))
+            await input_handler(self.message(67890, "2"))
+            task_list = await press(data_of(removal, "rdy:pbulkdel:"))
+            candidates = await press(data_of(task_list, "rdy:pbulktask:"))
+            self.assertIn("1. Борис", text_of(candidates))
+            await input_handler(self.message(67890, "1"))
+            added = await press(data_of(candidates, "rdy:pbulkadd:"))
             save = next(
                 button for button in buttons(added)
                 if button.text == "✅ Сохранить"
@@ -8260,6 +8376,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 if button.text == "🗑 Удалить выбранных"
             )
             after_delete = await press(delete.callback_data)
+            candidates = await press(data_of(after_delete, "rdy:pbulktask:"))
+            self.assertIn("Алексей", text_of(candidates))
+            after_delete = await press(data_of(candidates, "rdy:pbulkback:"))
             save = next(
                 button for button in buttons(after_delete)
                 if button.text == "✅ Сохранить без добавления"

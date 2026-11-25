@@ -705,6 +705,77 @@ class EventNotesTest(unittest.TestCase):
             self.registry.list_group_reminder_expiry_captures(), []
         )
 
+    def test_expiry_capture_survives_post_send_slot_check_failure(self):
+        self.plan(chat_id=-10002, message_id=900)
+        reminder = self.registry.list_group_reminders("sound")[0]
+        self.registry.set_group_reminder_default_ttl(1001, "sound", 1)
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=500)),
+            delete_message=AsyncMock(return_value=True),
+        )
+        credentials = SimpleNamespace(admin_tg_id=1001, yandex_public_url="unused")
+
+        async def run():
+            with patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(return_value=({"звук": ["A"]}, True)),
+            ), patch("bot.app.send_admin_reports", new=AsyncMock()), patch(
+                "bot.app._same_reminder_slot",
+                side_effect=[True, sqlite3.OperationalError("slot read failed")],
+            ):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "slot read"):
+                    await app._process_service_reminder(
+                        bot, credentials, self.path, ZoneInfo("UTC"),
+                        self.registry, "sound", reminder["id"], LOG, LOG,
+                        run_date=date(2026, 10, 31),
+                    )
+            self.assertEqual(len(self.registry.list_group_reminder_expiry_captures()), 1)
+            self.assertFalse(self.registry.is_group_reminder_delivered(
+                reminder["id"], "2026-11-01", "group:-10002"
+            ))
+            await app._expire_group_reminder_messages(
+                bot, self.registry, 1001,
+                datetime.now(timezone.utc) + timedelta(hours=2), LOG,
+            )
+
+        asyncio.run(run())
+        bot.delete_message.assert_awaited_once_with(-10002, 500)
+
+    def test_terminal_deletion_warning_retries_without_redeleting(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        sent_at = datetime(2026, 11, 1, 18, tzinfo=timezone.utc)
+        self.registry.record_group_reminder_messages(
+            "sound", reminder["id"], "2026-11-02", ((-10002, 504),), 1,
+            sent_at=sent_at,
+        )
+        bot = SimpleNamespace(delete_message=AsyncMock(side_effect=(
+            TelegramForbiddenError(
+                DeleteMessage(chat_id=-10002, message_id=504), "Forbidden"
+            )
+        )))
+        now = sent_at + timedelta(hours=1)
+
+        async def run():
+            with patch("bot.app._notify_admin", new=AsyncMock(
+                side_effect=[False, True]
+            )) as notify:
+                await app._expire_group_reminder_messages(
+                    bot, self.registry, 1001, now, LOG
+                )
+                self.assertEqual(len(
+                    self.registry.list_group_reminder_expiry_warnings()
+                ), 1)
+                await app._expire_group_reminder_messages(
+                    bot, self.registry, 1001, now + timedelta(minutes=1), LOG
+                )
+                self.assertEqual(notify.await_count, 2)
+                self.assertEqual(
+                    self.registry.list_group_reminder_expiry_warnings(), []
+                )
+
+        asyncio.run(run())
+        bot.delete_message.assert_awaited_once_with(-10002, 504)
+
     def test_group_message_reference_ignores_non_group_destinations(self):
         message = SimpleNamespace(message_id=500)
         self.assertIsNone(group_message_reference(message, 1001))

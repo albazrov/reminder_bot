@@ -98,6 +98,56 @@ class SchedulePlanTest(unittest.TestCase):
             schedule_plan.build_draft(self.registry, self.run, loader, LOG)
         )
 
+    def test_prepare_draft_keeps_task_day_snapshot_during_calculation(self):
+        real_summarize = readiness.summarize
+        seen = {}
+
+        def summarize_after_change(registry, run, **kwargs):
+            self.registry.set_service_task_day(1001, "sound", "сборка", -4)
+            seen["catalog"] = kwargs["catalog"]
+            return real_summarize(registry, run, **kwargs)
+
+        with unittest.mock.patch(
+            "bot.schedule_plan.summarize", side_effect=summarize_after_change
+        ):
+            plan = asyncio.run(schedule_plan.build_draft(
+                self.registry, self.run, None, LOG
+            ))
+
+        original = next(t for t in seen["catalog"] if t["name"] == "сборка")
+        saved = next(t for t in plan["tasks"] if t["name"] == "сборка")
+        current = next(
+            t for t in self.registry.plan_tasks("sound") if t["name"] == "сборка"
+        )
+        self.assertIsNone(original["day"])
+        self.assertIsNone(saved["day"])
+        self.assertEqual(current["day"], -4)
+
+    def test_bulk_save_rejects_removed_candidate_but_keeps_existing_slots(self):
+        plan = self.draft()
+        slots = {
+            day: {task: list(people) for task, people in tasks.items()}
+            for day, tasks in plan["slots"].items()
+        }
+        for tasks in slots.values():
+            for people in tasks.values():
+                people[:] = [person for person in people if person != "Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        self.registry.remove_service_member(1001, "sound", "Борис")
+        proposed = {
+            day: {task: list(people) for task, people in tasks.items()}
+            for day, tasks in plan["slots"].items()
+        }
+        proposed[plan["dates"][0]]["звук"].append("Борис")
+        with self.assertRaisesRegex(ValueError, "Состав или задачи участников"):
+            self.registry.set_schedule_slots(
+                1001, "sound", "2026-11", proposed, validate_new_people=True
+            )
+        self.assertEqual(
+            self.registry.get_schedule_plan("sound", "2026-11")["slots"],
+            plan["slots"],
+        )
+
     def test_import_checks_content_revision_inside_transaction(self):
         plan = self.draft()
         version = self.registry.schedule_plan_version(plan)

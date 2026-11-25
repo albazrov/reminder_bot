@@ -1984,24 +1984,24 @@ async def _process_service_reminder(
                     debug_logger,
                 )
             else:
+                sent_at = datetime.now(timezone.utc)
+                if ttl_hours is not None and message_refs:
+                    try:
+                        registry.capture_group_reminder_messages(
+                            service_id,
+                            reminder["id"],
+                            event_date.isoformat(),
+                            tuple(message_refs),
+                            ttl_hours,
+                            sent_at=sent_at,
+                        )
+                    except Exception:
+                        debug_logger.exception(
+                            "Не удалось сохранить снимок сообщений "
+                            "напоминания %s для автоудаления",
+                            reminder["id"],
+                        )
                 if _same_reminder_slot(registry, reminder):
-                    sent_at = datetime.now(timezone.utc)
-                    if ttl_hours is not None and message_refs:
-                        try:
-                            registry.capture_group_reminder_messages(
-                                service_id,
-                                reminder["id"],
-                                event_date.isoformat(),
-                                tuple(message_refs),
-                                ttl_hours,
-                                sent_at=sent_at,
-                            )
-                        except Exception:
-                            debug_logger.exception(
-                                "Не удалось сохранить снимок сообщений "
-                                "напоминания %s для автоудаления",
-                                reminder["id"],
-                            )
                     registry.mark_group_reminder_delivered(
                         reminder["id"],
                         event_date.isoformat(),
@@ -2127,37 +2127,31 @@ async def _expire_group_reminder_messages(
             if "message to delete not found" in str(exc).lower():
                 registry.complete_group_reminder_message_deletion(item["id"])
                 continue
+            warning = (
+                f"Не удалось удалить групповое напоминание служения "
+                f"«{item['service_id']}» на {item['event_date']}. "
+                "Проверьте права бота и удалите сообщение вручную."
+            )
             registry.record_group_reminder_message_delete_error(
-                item["id"], str(exc), now, final=True
+                item["id"], str(exc), now, final=True, warning=warning,
             )
             debug_logger.error(
                 "Не удалось удалить групповое напоминание %s в чате %s: %s",
                 item["reminder_id"], item["chat_id"], exc,
             )
-            await _notify_admin(
-                bot,
-                admin_id,
-                f"Не удалось удалить групповое напоминание служения "
-                f"«{item['service_id']}» на {item['event_date']}. "
-                "Проверьте права бота и удалите сообщение вручную.",
-                debug_logger,
-            )
         except TelegramForbiddenError as exc:
+            warning = (
+                f"Бот не может удалить групповое напоминание служения "
+                f"«{item['service_id']}» на {item['event_date']}. "
+                "Удалите это сообщение вручную. Проверьте права бота "
+                "для следующих автоудалений."
+            )
             registry.record_group_reminder_message_delete_error(
-                item["id"], str(exc), now, final=True
+                item["id"], str(exc), now, final=True, warning=warning,
             )
             debug_logger.error(
                 "Нет прав удалить групповое напоминание %s в чате %s: %s",
                 item["reminder_id"], item["chat_id"], exc,
-            )
-            await _notify_admin(
-                bot,
-                admin_id,
-                f"Бот не может удалить групповое напоминание служения "
-                f"«{item['service_id']}» на {item['event_date']}. "
-                "Удалите это сообщение вручную. Проверьте права бота "
-                "для следующих автоудалений.",
-                debug_logger,
             )
         except TelegramRetryAfter as exc:
             delay = max(1, int(exc.retry_after))
@@ -2191,6 +2185,11 @@ async def _expire_group_reminder_messages(
             )
         else:
             registry.complete_group_reminder_message_deletion(item["id"])
+    for warning in registry.list_group_reminder_expiry_warnings():
+        if await _notify_admin(bot, admin_id, warning["message"], debug_logger):
+            registry.complete_group_reminder_expiry_warning(
+                warning["expiration_id"]
+            )
 
 
 async def _process_user_reminder_schedule(
