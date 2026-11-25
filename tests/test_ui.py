@@ -309,8 +309,13 @@ class DialogRenderingTest(unittest.TestCase):
     def test_pagination_attaches_markup_only_to_last_screen(self):
         async def send():
             send_message = AsyncMock(
-                return_value=SimpleNamespace(message_id=2)
+                side_effect=[
+                    SimpleNamespace(message_id=2),
+                    SimpleNamespace(message_id=3),
+                    SimpleNamespace(message_id=4),
+                ]
             )
+            sent_messages = []
             markup = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Next", callback_data="next")
             ]])
@@ -320,10 +325,14 @@ class DialogRenderingTest(unittest.TestCase):
                 42,
                 "Заголовок\n" + "x" * 700,
                 reply_markup=markup,
+                on_message=sent_messages.append,
             )
 
-            self.assertEqual(result.message_id, 2)
+            self.assertEqual(result.message_id, 4)
             self.assertEqual(send_message.await_count, 3)
+            self.assertEqual(
+                [message.message_id for message in sent_messages], [2, 3, 4]
+            )
             self.assertTrue(
                 all(
                     call.kwargs["reply_markup"] is None

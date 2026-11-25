@@ -24,7 +24,7 @@ _RICH_MARKER = re.compile(
 )
 _STATUS_PREFIX = re.compile(r"^(?:✅|❌|⚠️|ℹ️|⏳)\s*")
 _NAVIGATION_PREFIXES = ("⬅️", "✖️", "✅", "➡️", "↩️", "🏠")
-_SINGLE_ACTION_PREFIXES = ("⏰", "📝", "➕")
+_SINGLE_ACTION_PREFIXES = ("⏰", "📝", "➕", "🗑")
 _MENU_CLOSED_TEXT = "📋 Предыдущее меню закрыто."
 _MESSAGE_DELETE_AGE_SECONDS = 48 * 60 * 60
 
@@ -498,6 +498,7 @@ async def send_telegram_screen(
     chat_id: int,
     text: str,
     limit: int = MAX_SCREEN_UNITS,
+    on_message: Callable[[Any], None] | None = None,
     **kwargs,
 ) -> Any:
     """Send a safe HTML screen, splitting long text at Telegram UI boundaries."""
@@ -518,6 +519,8 @@ async def send_telegram_screen(
             ),
             **kwargs,
         )
+        if on_message is not None:
+            on_message(result)
     return result
 
 

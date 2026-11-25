@@ -48,7 +48,7 @@ from .service_registry import (  # noqa: F401 — шаблоны для экра
     DEFAULT_READINESS_INTRO_REVERSE,
     DEFAULT_READINESS_REMINDER,
 )
-from .ui import send_telegram_screen, user_link
+from .ui import send_telegram_screen, user_link, visible_units
 
 MONTHS_IN = (
     "январе", "феврале", "марте", "апреле", "мае", "июне",
@@ -361,7 +361,8 @@ def _excluded_slot_availability(
 
 def summarize(registry, run: dict, *, with_plan: bool = True,
               last_served: dict[str, date] | None = None,
-              assume_free: bool = False) -> Summary:
+              assume_free: bool = False, catalog: list[dict] | None = None,
+              settings: dict | None = None) -> Summary:
     """last_served — последнее служение человека (ключ) в прошлом
     месяце: для интервала между служениями. assume_free — график без
     опроса: все из состава с задачами свободны во все даты."""
@@ -435,7 +436,8 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
     if with_plan:
         tasks = {person["key"]: person["tasks"] for person in people}
         # У служения без задач — одна задача с его названием.
-        catalog = registry.plan_tasks(run["service_id"])
+        if catalog is None:
+            catalog = registry.plan_tasks(run["service_id"])
         summary.implicit = any(task["implicit"] for task in catalog)
         week_dates = frozenset(date.fromisoformat(day) for day in run["dates"])
         free = {}
@@ -455,7 +457,8 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
         silent = {person["key"] for person in summary.not_answered}
         free.update({name: week_dates for name in silent})
         # Лимит служений в месяц: личный главнее лимита служения.
-        settings = registry.get_readiness_settings(run["service_id"])
+        if settings is None:
+            settings = registry.get_readiness_settings(run["service_id"])
         allocation_priority = (
             ALLOCATION_MINIMUM_LOAD if assume_free
             else settings["allocation_priority"]
@@ -557,9 +560,22 @@ def outside_name(answer: dict) -> str:
     )
 
 
+def outside_answer_text(dates: list[str], reverse_poll: bool) -> str:
+    if UNAVAILABLE_ALL in dates or not dates:
+        return "не сможет"
+    if AVAILABLE_ALL in dates:
+        return "в любые даты"
+    labels = []
+    for value in dates:
+        day, task = option_parts(value)
+        labels.append(_short(day) + (f" — {task}" if task else ""))
+    return ("недоступен: " if reverse_poll else "") + ", ".join(labels)
+
+
 def progress_text(service_label: str, run: dict, summary: Summary, tz,
-                  reminder: str | None = None) -> str:
-    """reminder — строка «когда напоминание» (идущий опрос)."""
+                  reminder: str | None = None,
+                  forecast_text: str | None = None) -> str:
+    """reminder — срок напоминания; forecast_text — общий рендер плана."""
     year, month = month_of(run)
     status = {
         "open": f"до {local_text(run['deadline'], tz)}",
@@ -600,35 +616,8 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
             + ")"
             for key, dates in summary.answered.items()
         )]
-    if summary.plan is not None:
-        silent = {person["key"] for person in summary.not_answered}
-        lines += ["", "Предварительно:"]
-        used_silent = False
-        for day in run["dates"]:
-            event_date = date.fromisoformat(day)
-            lines += ["", f"🗓 {event_date:%d.%m}"]
-            for task, needed in sort_tasks_for_display(
-                summary.plan.needed.items(), run["service_id"],
-                name=lambda item: item[0],
-            ):
-                people = summary.plan.slots.get((event_date, task), [])
-                used_silent |= any(person in silent for person in people)
-                lines += task_lines(
-                    task, needed,
-                    [
-                        names.get(person, person)
-                        + ("*" if person in silent else "")
-                        for person in people
-                    ],
-                    empty="⚠️ некого поставить", bare=summary.implicit,
-                )
-        if used_silent:
-            lines.append(
-                "* не ответил(а) — поставлен(а) по общей логике, после "
-                "ответивших"
-            )
     for answer in summary.outside:
-        days = ", ".join(_short(day) for day in answer["dates"]) or "не сможет"
+        days = outside_answer_text(answer["dates"], summary.reverse_poll)
         lines.append(
             f"⚪ Вне состава: {outside_name(answer)} ({days}) — нет задач, "
             "не распределяется"
@@ -645,6 +634,8 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
         lines += ["", "⏳ Не ответили: " + ", ".join(
             waiting + [f"{name} (без Telegram)" for name in without_telegram]
         )]
+    if forecast_text:
+        lines += ["", forecast_text]
     return "\n".join(lines)
 
 
@@ -753,11 +744,17 @@ def poll_options(registry, service_id: str, year: int, month: int,
     result = []
     for item in sorted(items, key=lambda item: (item["date"], item.get("task", ""))):
         actual_day = date.fromisoformat(item["date"])
-        label = (
-            f"{actual_day:%d.%m}" if item.get("date_only")
-            else f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
-        )
-        if len(label) > 100:
+        label = f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
+        if item.get("date_only") and visible_units(label) > 100:
+            prefix = f"{actual_day:%d.%m} — "
+            included = []
+            for task in item["tasks"]:
+                candidate = prefix + ", ".join([*included, task]) + ", …"
+                if visible_units(candidate) > 100:
+                    break
+                included.append(task)
+            label = prefix + (", ".join(included) + ", " if included else "") + "…"
+        elif visible_units(label) > 100:
             raise ValueError(
                 f"Слишком длинное название задач для варианта опроса "
                 f"{actual_day:%d.%m}."
@@ -769,6 +766,28 @@ def poll_options(registry, service_id: str, year: int, month: int,
             "а для выбранных дат задач их получилось больше."
         )
     return result
+
+
+def grouped_options_note(options: list[dict]) -> str:
+    grouped = [item for item in options if item.get("date_only")]
+    if not grouped:
+        return ""
+    lines = [
+        "Одна дата относится ко всем вашим задачам в этот день.",
+    ]
+    shortened = [
+        item for item in grouped
+        if item["label"] != (
+            f"{date.fromisoformat(item['date']):%d.%m} — " + ", ".join(item["tasks"])
+        )
+    ]
+    if shortened:
+        lines += [
+            "", "Полный список задач для сокращённых вариантов:",
+            *(f"{date.fromisoformat(item['date']):%d.%m} — "
+              + ", ".join(item["tasks"]) for item in shortened),
+        ]
+    return "\n".join(lines)
 
 
 def run_option_dates(run: dict) -> list[str]:
@@ -955,13 +974,17 @@ async def launch_run(
     sending_poll = False
     _LAUNCHING[0] += 1
     try:
+        intro_body = intro_text(
+            service, people, year, month, deadline, tz,
+            settings.get("intro_template"), phrase(settings, "own_days"),
+            settings["reverse_poll"],
+        )
+        note = grouped_options_note(options)
+        if note:
+            intro_body += "\n\n" + note
         intro = await send_telegram_screen(
             send_chunk, chat_id,
-            intro_text(
-                service, people, year, month, deadline, tz,
-                settings.get("intro_template"), phrase(settings, "own_days"),
-                settings["reverse_poll"],
-            ),
+            intro_body,
             limit=text_limit,
         )
         sending_poll = True
