@@ -293,7 +293,9 @@ class ReadinessFlowTest(unittest.TestCase):
         bot = fake_bot()
         run = self.launch(bot)
         self.assertEqual(bot.send_poll.await_args.kwargs["options"], [
-            "01.11", "08.11", "15.11", "22.11", "29.11",
+            "01.11 — звук, сборка", "08.11 — звук, сборка",
+            "15.11 — звук, сборка", "22.11 — звук, сборка",
+            "29.11 — звук, сборка",
             "✅ Смогу в любые даты",
             "❌ Не смогу в этом месяце",
         ])
@@ -307,7 +309,9 @@ class ReadinessFlowTest(unittest.TestCase):
         )
         summary = readiness.summarize(self.registry, run)
         self.assertEqual(summary.available["Алексей"], ["2026-11-01"])
-        self.assertEqual(readiness.run_option_label(run, dates[0]), "01.11")
+        self.assertEqual(
+            readiness.run_option_label(run, dates[0]), "01.11 — звук, сборка"
+        )
         self.assertTrue(any(
             "Алексей" in names for (day, _), names in summary.plan.slots.items()
             if day == date(2026, 11, 1)
@@ -340,7 +344,7 @@ class ReadinessFlowTest(unittest.TestCase):
         )
         run = self.launch(fake_bot())
         self.assertEqual(len(run["options"]), 10)
-        self.assertEqual(run["options"][0]["label"], "29.10")
+        self.assertEqual(run["options"][0]["label"], "29.10 — сборка")
         marked = readiness.answer_dates([0], run["options"], reverse_poll=True)
         self.registry.record_readiness_answer(
             run["poll_id"], 501, "alex", "Алексей", marked,
@@ -368,6 +372,22 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertEqual(set(readiness.option_slots(overlapping)), {
             (date(2026, 11, 1), "А"), (date(2026, 11, 8), "Б"),
         })
+
+    def test_grouped_long_options_keep_all_tasks_in_intro(self):
+        self.registry.set_readiness_settings(1001, "sound", dates_only=True)
+        tasks = [{"name": "🎛" * 60, "day": None}, {"name": "запись", "day": None}]
+        people = [{"tasks": [task["name"] for task in tasks], "day_offset": None}]
+        with (
+            patch.object(self.registry, "plan_tasks", return_value=tasks),
+            patch.object(self.registry, "readiness_people", return_value=people),
+        ):
+            options = readiness.poll_options(self.registry, "sound", 2026, 11)
+        self.assertLessEqual(len(options[0]["label"].encode("utf-16-le")) // 2, 100)
+        self.assertTrue(options[0]["label"].endswith("…"))
+        self.assertEqual(options[0]["label"], "01.11 — …")
+        self.assertEqual(options[0]["tasks"], [task["name"] for task in tasks])
+        note = readiness.grouped_options_note(options)
+        self.assertIn("🎛" * 60 + ", запись", note)
 
     def launch(self, bot):
         return asyncio.run(readiness.launch_run(

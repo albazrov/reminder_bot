@@ -710,7 +710,7 @@ class DependentHandlerTest(unittest.TestCase):
                         and (text is None or text in item.text))
 
         click("svc_tasks:open:kitchen")
-        click(button("svc_tasks:card:", DUTY))
+        click(button("svc_tasks:card:", DUTY.lower()))
         click(button("svc_tasks:dep:"))
         click(button("svc_tasks:danchor:", HEAD))
         click(button("svc_tasks:dpage:", "➡️"))

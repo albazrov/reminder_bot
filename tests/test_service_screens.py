@@ -169,7 +169,50 @@ class ServiceScreensTest(unittest.TestCase):
         self.assertIn("назначений нет", text)
         self.assertNotIn("Не утверждён", text)
 
-    def test_editing_approved_plan_adds_without_replacing_until_save(self):
+    def test_member_month_assignments_use_approved_replacements_and_history(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        for name, user_id in (("Алексей", 3001), ("Мария", 3002)):
+            self.registry.set_responsible_contact(1001, "sound", "Микшер", name, user_id)
+        tasks = [{"name": "Микшер", "needed": 1}]
+        self.plan({"2026-10-04": {"Микшер": ["Мария"]}}, month="2026-10", tasks=tasks)
+        self.plan({"2026-11-15": {"Микшер": ["Алексей"]}}, tasks=tasks)
+        self.registry.set_replacement(
+            "sound", "2026-11-15", "Микшер", "Алексей", "Мария", 3002, "", "admin", 1001,
+        )
+        self.registry.set_schedule_slots(
+            1001, "sound", "2026-11", {"2026-11-15": {"Микшер": ["Алексей"]}},
+        )
+        people = self.registry.readiness_people("sound")
+        selected, dates, previous = schedule_plan.member_month_assignments(
+            self.registry, "sound", date(2026, 11, 1), people,
+        )
+        self.assertIsNotNone(selected["approved"])
+        self.assertEqual(dates.get("Мария"), {date(2026, 11, 15)})
+        self.assertNotIn("Алексей", dates)
+        self.assertEqual(previous.get("Мария"), date(2026, 10, 4))
+
+    def test_member_history_does_not_restore_replaced_person_from_snapshot(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        for name, user_id in (("Алексей", 3001), ("Мария", 3002)):
+            self.registry.set_responsible_contact(1001, "sound", "Микшер", name, user_id)
+        tasks = [{"name": "Микшер", "needed": 1}]
+        self.plan({"2026-10-04": {"Микшер": ["Алексей"]}}, month="2026-10", tasks=tasks)
+        self.registry.set_replacement(
+            "sound", "2026-10-04", "Микшер", "Алексей", "Мария", 3002, "", "admin", 1001,
+        )
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=["2026-11-15"],
+            tasks=tasks, slots={"2026-11-15": {"Микшер": []}},
+            last_served={"Алексей": "2026-10-04"},
+        )
+        _, _, previous = schedule_plan.member_month_assignments(
+            self.registry, "sound", date(2026, 11, 1),
+            self.registry.readiness_people("sound"),
+        )
+        self.assertNotIn("Алексей", previous)
+        self.assertEqual(previous["Мария"], date(2026, 10, 4))
+
+    def test_editing_approved_plan_saves_working_copy_immediately(self):
         from bot.excel_parser import RosterMember
 
         self.registry.sync_service_rosters({"sound": [
@@ -187,13 +230,10 @@ class ServiceScreensTest(unittest.TestCase):
                 button.callback_data for button in self.buttons(dates)
                 if button.callback_data.startswith("rdy:pdate:")
             ))
-            bulk = await self.press(next(
-                button.callback_data for button in self.buttons(day)
-                if button.callback_data.startswith("rdy:pbulkinit:")
-            ))
             task_list = await self.press(next(
-                button.callback_data for button in self.buttons(bulk)
-                if button.callback_data.startswith("rdy:pbulkkeep:")
+                button.callback_data for button in self.buttons(day)
+                if button.callback_data.startswith("rdy:pquick:")
+                and button.callback_data.endswith(".add")
             ))
             add_stage = await self.press(next(
                 button.callback_data for button in self.buttons(task_list)
@@ -204,24 +244,74 @@ class ServiceScreensTest(unittest.TestCase):
                 item.callback for item in self.router.message.handlers
                 if item.callback.__name__ == "on_service_parameter"
             )
-            await input_handler(self.message(1001, "1"))
-            added = await self.press(next(
-                button.callback_data for button in self.buttons(add_stage)
-                if button.text == "➕ Добавить выбранных"
-            ))
-            before_save = self.registry.get_schedule_plan("sound", "2026-11")
-            self.assertEqual(before_save["slots"], slots)
-            self.assertEqual(before_save["approved"], approved)
-            saved = await self.press(next(
-                button.callback_data for button in self.buttons(added)
-                if button.text == "✅ Сохранить"
-            ))
+            saved = self.message(1001, "1")
+            await input_handler(saved)
             current = self.registry.get_schedule_plan("sound", "2026-11")
             self.assertEqual(current["slots"]["2026-11-15"]["Микшер"],
                              ["Алексей", "Борис"])
             self.assertEqual(current["approved"], approved)
             self.assertTrue(current["dirty"])
-            self.assertIn("участники всего дня", self.text(saved))
+            self.assertIn("Микшер", saved.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_removing_from_day_is_immediate_and_rejects_stale_input(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.add_service_task(1001, "sound", "Запись")
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Анна", ("Микшер", "Запись")),
+            RosterMember("Борис", ("Микшер",)),
+        ]})
+        slots = {"2026-11-15": {"Микшер": ["Анна", "Борис"], "Запись": ["Анна"]}}
+        self.plan(slots, tasks=[
+            {"name": "Микшер", "needed": 1}, {"name": "Запись", "needed": 1},
+        ])
+        approved = self.registry.get_schedule_plan("sound", "2026-11")["approved"]
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            for button in self.buttons(day):
+                if button.callback_data.startswith("rdy:ptask:"):
+                    self.assertNotIn("Анна", button.text)
+                    self.assertNotIn("Борис", button.text)
+            remove = next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:pquick:") and b.callback_data.endswith(".remove")
+            )
+            await self.press(remove)
+            handler = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            invalid = self.message(1001, "99")
+            await handler(invalid)
+            self.assertEqual(self.registry.get_schedule_plan("sound", "2026-11")["slots"], slots)
+            await handler(self.message(1001, "1"))
+            current = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(current["slots"]["2026-11-15"]["Микшер"], ["Борис"])
+            self.assertEqual(current["slots"]["2026-11-15"]["Запись"], [])
+            self.assertEqual(current["approved"], approved)
+
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:pquick:") and b.callback_data.endswith(".remove")
+            ))
+            self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+            stale = self.message(1001, "1")
+            await handler(stale)
+            self.assertIn("График изменился", stale.answer.await_args.args[0])
+            self.assertEqual(self.registry.get_schedule_plan("sound", "2026-11")["slots"], slots)
 
         asyncio.run(run())
 

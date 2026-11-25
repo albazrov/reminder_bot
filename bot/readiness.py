@@ -48,7 +48,7 @@ from .service_registry import (  # noqa: F401 — шаблоны для экра
     DEFAULT_READINESS_INTRO_REVERSE,
     DEFAULT_READINESS_REMINDER,
 )
-from .ui import send_telegram_screen, user_link
+from .ui import send_telegram_screen, user_link, visible_units
 
 MONTHS_IN = (
     "январе", "феврале", "марте", "апреле", "мае", "июне",
@@ -732,11 +732,17 @@ def poll_options(registry, service_id: str, year: int, month: int,
     result = []
     for item in sorted(items, key=lambda item: (item["date"], item.get("task", ""))):
         actual_day = date.fromisoformat(item["date"])
-        label = (
-            f"{actual_day:%d.%m}" if item.get("date_only")
-            else f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
-        )
-        if len(label) > 100:
+        label = f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
+        if item.get("date_only") and visible_units(label) > 100:
+            prefix = f"{actual_day:%d.%m} — "
+            included = []
+            for task in item["tasks"]:
+                candidate = prefix + ", ".join([*included, task]) + ", …"
+                if visible_units(candidate) > 100:
+                    break
+                included.append(task)
+            label = prefix + (", ".join(included) + ", " if included else "") + "…"
+        elif visible_units(label) > 100:
             raise ValueError(
                 f"Слишком длинное название задач для варианта опроса "
                 f"{actual_day:%d.%m}."
@@ -748,6 +754,28 @@ def poll_options(registry, service_id: str, year: int, month: int,
             "а для выбранных дат задач их получилось больше."
         )
     return result
+
+
+def grouped_options_note(options: list[dict]) -> str:
+    grouped = [item for item in options if item.get("date_only")]
+    if not grouped:
+        return ""
+    lines = [
+        "Одна дата относится ко всем вашим задачам в этот день.",
+    ]
+    shortened = [
+        item for item in grouped
+        if item["label"] != (
+            f"{date.fromisoformat(item['date']):%d.%m} — " + ", ".join(item["tasks"])
+        )
+    ]
+    if shortened:
+        lines += [
+            "", "Полный список задач для сокращённых вариантов:",
+            *(f"{date.fromisoformat(item['date']):%d.%m} — "
+              + ", ".join(item["tasks"]) for item in shortened),
+        ]
+    return "\n".join(lines)
 
 
 def run_option_dates(run: dict) -> list[str]:
@@ -934,13 +962,17 @@ async def launch_run(
     sending_poll = False
     _LAUNCHING[0] += 1
     try:
+        intro_body = intro_text(
+            service, people, year, month, deadline, tz,
+            settings.get("intro_template"), phrase(settings, "own_days"),
+            settings["reverse_poll"],
+        )
+        note = grouped_options_note(options)
+        if note:
+            intro_body += "\n\n" + note
         intro = await send_telegram_screen(
             send_chunk, chat_id,
-            intro_text(
-                service, people, year, month, deadline, tz,
-                settings.get("intro_template"), phrase(settings, "own_days"),
-                settings["reverse_poll"],
-            ),
+            intro_body,
             limit=text_limit,
         )
         sending_poll = True

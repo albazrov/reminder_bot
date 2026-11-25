@@ -1175,6 +1175,24 @@ class ServiceRegistryTest(unittest.TestCase):
         self.assertTrue(self.registry.is_service_admin(3003, "sound"))
         self.assertTrue(self.registry.is_service_admin(3003, "books"))
 
+    def test_admin_display_name_is_scoped_and_super_admin_only(self):
+        self.registry.add_service_admin(1001, "sound", 3003, display_name="Имя Telegram")
+        self.registry.add_service_admin(1001, "books", 3003)
+        with self.assertRaises(PermissionError):
+            self.registry.set_service_admin_display_name(3003, "sound", 3003, "Анна")
+        with self.assertRaises(ValueError):
+            self.registry.set_service_admin_display_name(1001, "sound", 3003, " ")
+        self.assertEqual(self.registry.service_admin_display_names("sound")[3003], "Имя Telegram")
+        self.registry.set_service_admin_display_name(1001, "sound", 3003, "Анна")
+        self.registry.add_service_admin(1001, "sound", 3003, display_name="Другое имя")
+        self.assertEqual(self.registry.service_admin_display_names("sound")[3003], "Анна")
+        self.assertEqual(self.registry.service_admin_display_names("books")[3003], "")
+        self.registry.initialize(1001, -10001)
+        self.assertEqual(self.registry.service_admin_display_names("sound")[3003], "Анна")
+        self.registry.remove_service_admin(1001, "sound", 3003)
+        with self.assertRaises(ValueError):
+            self.registry.set_service_admin_display_name(1001, "sound", 3003, "Анна")
+
     def test_existing_admin_username_can_be_refreshed_without_duplicate_audit(self):
         self.registry.add_service_admin(1001, "sound", 3003)
 

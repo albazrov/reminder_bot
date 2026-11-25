@@ -2191,7 +2191,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
         await self.callback_handler("on_service_tasks")(opened)
         if task is None:
             return await self._click(
-                opened.message, lambda button: button.text == "⏰ Всё служение"
+                opened.message, lambda button: button.text == "⏰ Напоминания"
             )
         card = await self._click(
             opened.message, lambda button: button.text == f"🟢 {task}"
@@ -2326,7 +2326,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             await self.callback_handler("on_service_tasks")(opened)
             root = await self._click(
-                opened.message, lambda button: button.text == "⏰ Всё служение"
+                opened.message, lambda button: button.text == "⏰ Напоминания"
             )
             self.assertIn("Всё служение", root.message.answer.await_args.args[0])
             menu = await self._click(
@@ -6510,9 +6510,39 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.callback_data_list(setup.message),
                 ["service:service_chat:sound", "service:service_admin_add:sound",
                  "service:service_admin_remove:sound",
+                 "admin_name:list:sound",
                  "service:service_chat_disable:sound",
                  "service:service_settings:sound"],
             )
+            self.registry.add_service_admin(67890, "sound", 3003, "some_admin")
+            self.registry.add_service_admin(67890, "sound", 3004)
+            self.registry.set_responsible_contact(
+                67890, "sound", "Микшер", "Имя участника", 3003,
+            )
+            setup = callback("service:service_setup:sound")
+            await self.callback_handler("on_service_selected")(setup)
+            self.assertIn("@some_admin", setup.message.answer.await_args.args[0])
+            self.assertIn("Имя неизвестно", setup.message.answer.await_args.args[0])
+            self.assertNotIn("Имя участника", setup.message.answer.await_args.args[0])
+            names = callback("admin_name:list:sound")
+            await self.callback_handler("on_admin_name")(names)
+            edit_data = next(
+                data for data in self.callback_data_list(names.message)
+                if data.startswith("admin_name:edit:sound:")
+            )
+            edit = callback(edit_data)
+            await self.callback_handler("on_admin_name")(edit)
+            await self.message_handler("on_service_parameter")(
+                self.message(67890, "Анна")
+            )
+            self.assertEqual(self.registry.service_admin_display_names("sound")[3003], "Анна")
+            setup = callback("service:service_setup:sound")
+            await self.callback_handler("on_service_selected")(setup)
+            self.assertIn("Анна", setup.message.answer.await_args.args[0])
+            self.assertNotIn("@some_admin", setup.message.answer.await_args.args[0])
+            forbidden = callback("admin_name:list:sound", 3003)
+            await self.callback_handler("on_admin_name")(forbidden)
+            forbidden.answer.assert_awaited()
             # Проверка доставки — в «📡 Групповой чат», когда чат назначен.
             chat = callback("service:service_chat:sound")
             await self.callback_handler("on_service_selected")(chat)
@@ -6585,7 +6615,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             await self._click(
                 toggle.message,
-                lambda button: button.text == "➕ Добавить задачу",
+                lambda button: button.text == "➕ Новая задача",
                 actor_id=67890,
             )
             added = await self._type("Перевозка", actor_id=67890)
@@ -6600,6 +6630,28 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_task_list_merges_unbound_member_and_exact_task_contact(self):
+        async def run():
+            members = [{"name": "Участник", "tasks": ["спевка"], "telegram_id": None}]
+            contacts = [{"name": "Участник", "task": "спевка", "telegram_id": 24680}]
+            opened = SimpleNamespace(
+                data="svc_tasks:open:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            with (
+                patch.object(self.registry, "list_service_members", return_value=members),
+                patch.object(self.registry, "list_responsible_contacts", return_value=contacts),
+                patch.object(self.registry, "service_display_names", return_value={}),
+            ):
+                await self.callback_handler("on_service_tasks")(opened)
+            screen = opened.message.answer.await_args.args[0]
+            self.assertEqual(screen.count("Участник "), 1)
+            self.assertIn('href="tg://user?id=24680"', screen)
+
+        asyncio.run(run())
+
     def test_admin_sets_own_day_for_task(self):
         async def run():
             self.registry.add_service_admin(67890, "sound", 24680)
@@ -6610,15 +6662,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await self.callback_handler("on_service_tasks")(opened)
-            days = await self._click(
+            card = await self._click(
                 opened.message,
-                lambda button: button.text == "📅 Дни задач",
+                lambda button: button.text == "🟢 звук",
                 actor_id=24680,
             )
-            self.assertIn("🎚️ звук — дни служения", days.message.answer.await_args.args[0])
             pick = await self._click(
-                days.message,
-                lambda button: button.text == "📅 звук",
+                card.message,
+                lambda button: button.text == "📅 День задачи",
                 actor_id=24680,
             )
             chosen = await self._click(
@@ -6627,8 +6678,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 actor_id=24680,
             )
             screen = chosen.message.answer.await_args.args[0]
-            self.assertIn("✅ «звук»: ср (вс -4)", screen)
-            self.assertIn("🎚️ звук — ср (вс -4)", screen)
+            self.assertIn("📋 звук", screen)
             self.assertEqual(
                 next(
                     task for task in self.registry.list_service_tasks("sound")
@@ -6638,7 +6688,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             back = await self._click(
                 chosen.message,
-                lambda button: button.text == "📅 звук",
+                lambda button: button.text == "📅 День задачи",
                 actor_id=24680,
             )
             reset = await self._click(
@@ -6646,9 +6696,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 lambda button: button.text == "↩️ Дни служения",
                 actor_id=24680,
             )
-            self.assertIn(
-                "✅ «звук»: дни служения", reset.message.answer.await_args.args[0]
-            )
+            self.assertIn("📋 звук", reset.message.answer.await_args.args[0])
             tasks = await self._click(
                 reset.message,
                 lambda button: button.text == "⬅️ К задачам",
@@ -6667,14 +6715,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             await self.callback_handler("on_service_tasks")(opened)
-            people = await self._click(
+            card = await self._click(
                 opened.message,
-                lambda button: button.text == "👥 Нужно людей",
+                lambda button: button.text == "🟢 звук",
                 actor_id=67890,
             )
             choice = await self._click(
-                people.message,
-                lambda button: button.text.startswith("👥 звук"),
+                card.message,
+                lambda button: button.text.startswith("👥 Команда"),
                 actor_id=67890,
             )
             saved = await self._click(
@@ -6682,10 +6730,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 lambda button: button.text == "👥 3–4",
                 actor_id=67890,
             )
-            self.assertIn(
-                "✅ «звук»: нужно людей — 3–4",
-                saved.message.answer.await_args.args[0],
-            )
+            self.assertIn("📋 звук", saved.message.answer.await_args.args[0])
             task = next(
                 item for item in self.registry.list_service_tasks("sound")
                 if item["name"] == "звук"
@@ -6711,7 +6756,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await self.callback_handler("on_service_tasks")(opened)
             task = await self._click(
                 opened.message,
-                lambda button: button.text.startswith("🟢 Компьютер"),
+                lambda button: button.text.startswith("🟢 компьютер"),
                 actor_id=67890,
             )
             difficulty = await self._click(
@@ -7200,8 +7245,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertTrue(self.registry.get_readiness_settings("sound")["dates_only"])
             preview = await press("rdy:overview:sound")
             text = preview.message.answer.await_args.args[0]
-            self.assertIn(f"• {first_sunday:%d.%m}\n", text)
-            self.assertNotIn(" — звук", text)
+            self.assertIn(f"• {first_sunday:%d.%m} — звук\n", text)
+            self.assertIn("всем вашим задачам", text)
             await press("rdy:fmt:sound:tasks")
 
             self.registry.sync_service_rosters({"sound": [
@@ -7334,6 +7379,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 return cb
 
             def button(cb, prefix):
+                if prefix == "rdy:pbulkinit:":
+                    quick = next(data for data in self.callback_data_list(cb.message)
+                                 if data.startswith("rdy:pquick:") and data.endswith(".remove"))
+                    return quick.replace("rdy:pquick:", prefix, 1).removesuffix(".remove")
                 return next(data for data in self.callback_data_list(cb.message)
                             if data.startswith(prefix))
 
@@ -7748,6 +7797,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             return callback.message.answer.await_args.args[0]
 
         def data_of(callback, prefix):
+            if prefix == "rdy:pbulkinit:":
+                quick = data_of(callback, "rdy:pquick:")
+                return quick.replace("rdy:pquick:", prefix, 1).removesuffix(".remove")
             return next(
                 button.callback_data
                 for row in callback.message.answer.await_args.kwargs[
@@ -8291,6 +8343,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             ]
 
         def data_of(callback, prefix):
+            if prefix == "rdy:pbulkinit:":
+                quick = data_of(callback, "rdy:pquick:")
+                return quick.replace("rdy:pquick:", prefix, 1).removesuffix(".remove")
             return next(
                 button.callback_data for button in buttons(callback)
                 if button.callback_data.startswith(prefix)
@@ -9158,10 +9213,65 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                     "✅ 🆕 Иван",
                     "⚠️ Мария · нет в списке",
                     "➕ Добавить участника",
+                    "📊 Свод инф.",
                     "🗓 По датам графика",
                     "⬅️ К карточке служения",
                 ],
             )
+
+        asyncio.run(run())
+
+    def test_member_summary_switches_months_and_returns_to_members(self):
+        async def run():
+            members = await self.open_members()
+            summary = await self.press_inline(
+                members.message, "📊 Свод инф.", "on_contact_navigation",
+            )
+            text = summary.message.answer.await_args.args[0]
+            self.assertIn("ответственные", text)
+            self.assertIn("Предыдущее служение: нет данных", text)
+            self.assertNotIn("@alex", text)
+            next_month = await self.press_inline(
+                summary.message, "➡️ Следующий месяц", "on_contact_navigation",
+            )
+            current = await self.press_inline(
+                next_month.message, "⬅️ Текущий месяц", "on_contact_navigation",
+            )
+            members = await self.press_inline(
+                current.message, "⬅️ К ответственным", "on_contact_navigation",
+            )
+            self.assertIn("Состав", members.message.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_member_summary_does_not_replace_newer_member_page(self):
+        from bot import schedule_plan
+
+        async def run():
+            started = asyncio.Event()
+            release = asyncio.Event()
+            original_to_thread = asyncio.to_thread
+
+            async def delayed_to_thread(func, *args, **kwargs):
+                if func is schedule_plan.member_month_assignments:
+                    started.set()
+                    await release.wait()
+                return await original_to_thread(func, *args, **kwargs)
+
+            with patch("bot.handlers.MEMBER_PAGE_SIZE", 1):
+                members = await self.open_members()
+                with patch("bot.handlers.asyncio.to_thread", side_effect=delayed_to_thread):
+                    summary_task = asyncio.create_task(self.press_inline(
+                        members.message, "📊 Свод инф.", "on_contact_navigation",
+                    ))
+                    await asyncio.wait_for(started.wait(), timeout=2)
+                    page = await self.press_inline(
+                        members.message, "📋 Далее ➡️", "on_contact_navigation",
+                    )
+                    release.set()
+                    summary = await summary_task
+                self.assertIn("Состав", page.message.answer.await_args.args[0])
+                summary.message.answer.assert_not_awaited()
 
         asyncio.run(run())
 

@@ -274,6 +274,7 @@ class ServiceRegistry:
                     service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
                     telegram_id INTEGER NOT NULL CHECK (telegram_id > 0),
                     username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
                     created_by INTEGER NOT NULL CHECK (created_by > 0),
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, telegram_id)
@@ -1054,6 +1055,7 @@ class ServiceRegistry:
                     "INTEGER CHECK (ttl_hours BETWEEN 1 AND 47)",
                 ),
                 ("service_tasks", "people_max", "INTEGER"),
+                ("service_admins", "display_name", "TEXT NOT NULL DEFAULT ''"),
                 ("service_tasks", "day_offset", "INTEGER"),
                 ("service_tasks", "same_week", "INTEGER NOT NULL DEFAULT 0"),
                 (
@@ -1521,9 +1523,9 @@ class ServiceRegistry:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO service_admins (
-                    service_id, telegram_id, username, created_by, created_at
+                    service_id, telegram_id, username, display_name, created_by, created_at
                 )
-                SELECT ?, telegram_id, username, created_by, created_at
+                SELECT ?, telegram_id, username, display_name, created_by, created_at
                 FROM service_admins WHERE service_id = ?
                 """,
                 (new_id, old_id),
@@ -2473,6 +2475,7 @@ class ServiceRegistry:
         service_id: str,
         telegram_id: int,
         username: str = "",
+        display_name: str = "",
     ) -> None:
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(telegram_id, "telegram_id")
@@ -2483,6 +2486,9 @@ class ServiceRegistry:
             r"[A-Za-z][A-Za-z0-9_]{4,31}", normalized_username
         ):
             raise ValueError("Некорректный Telegram username.")
+        display_name = " ".join(display_name.split())
+        if len(display_name) > 100 or "\x00" in display_name:
+            raise ValueError("Имя администратора не должно превышать 100 символов.")
         with self._connection() as connection:
             self._require_super_admin(connection, actor_id)
             self._require_service(connection, service_id)
@@ -2493,13 +2499,15 @@ class ServiceRegistry:
             ).fetchone()
             connection.execute(
                 "INSERT INTO service_admins "
-                "(service_id, telegram_id, username, created_by, created_at) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "(service_id, telegram_id, username, display_name, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(service_id, telegram_id) DO UPDATE SET "
                 "username = CASE WHEN excluded.username != '' "
-                "THEN excluded.username ELSE service_admins.username END",
+                "THEN excluded.username ELSE service_admins.username END, "
+                "display_name = CASE WHEN service_admins.display_name = '' "
+                "THEN excluded.display_name ELSE service_admins.display_name END",
                 (
-                    service_id, telegram_id, normalized_username,
+                    service_id, telegram_id, normalized_username, display_name,
                     actor_id, _utc_now(),
                 ),
             )
@@ -6790,6 +6798,38 @@ class ServiceRegistry:
                 (service_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def service_admin_display_names(self, service_id: str) -> dict[int, str]:
+        with self._connection() as connection:
+            self._require_service(connection, service_id)
+            rows = connection.execute(
+                "SELECT telegram_id, display_name FROM service_admins "
+                "WHERE service_id = ?",
+                (service_id,),
+            ).fetchall()
+        return {row["telegram_id"]: row["display_name"] for row in rows}
+
+    def set_service_admin_display_name(
+        self, actor_id: int, service_id: str, telegram_id: int, name: str,
+    ) -> None:
+        _validate_positive_id(telegram_id, "telegram_id")
+        name = " ".join(name.split())
+        if not name or len(name) > 100 or "\x00" in name:
+            raise ValueError("Введите имя длиной от 1 до 100 символов.")
+        with self._connection() as connection:
+            self._require_super_admin(connection, actor_id)
+            self._require_service(connection, service_id)
+            cursor = connection.execute(
+                "UPDATE service_admins SET display_name = ? "
+                "WHERE service_id = ? AND telegram_id = ?",
+                (name, service_id, telegram_id),
+            )
+            if not cursor.rowcount:
+                raise ValueError("Администратор больше не назначен.")
+            self._audit(
+                connection, actor_id, "service_admin_name_changed", service_id,
+                {"telegram_id": telegram_id},
+            )
 
     # --- Опрос готовности (этап 5) ---
 
