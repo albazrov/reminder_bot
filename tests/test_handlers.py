@@ -2089,6 +2089,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 67890, "sound", 2, "09:00", "Другой текст",
                 allow_duplicate=True,
             )
+            primary_id = self.registry.list_group_reminders("sound")[0]["id"]
             reminders = await self._open_sound_reminders()
             default_menu = await self._click(
                 reminders.message,
@@ -2156,6 +2157,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             await self.callback_handler("on_group_reminder_action")(
                 stale_callback
+            )
+            self.assertIsNone(
+                self.registry.get_group_reminder(primary_id)["ttl_hours"]
             )
             self.assertIsNone(
                 self.registry.get_group_reminder(other_id)["ttl_hours"]
@@ -6972,9 +6976,8 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 self.registry.get_readiness_settings("sound")["intro_template"]
             )
             progress = await press(f"rdy:progress:sound:{month_arg}")
-            self.assertIn(
-                "Ход опроса", progress.message.answer.await_args.args[0]
-            )
+            progress_text = progress.message.answer.await_args.args[0]
+            self.assertIn("Ход опроса", progress_text)
             # Ручная правка дня открывается из графика.
             section = await press("rdy:month:sound")
             self.assertIn(
@@ -6985,6 +6988,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             draft_screen = await press(f"rdy:pprev:sound:{month_arg}")
             draft_text = draft_screen.message.answer.await_args.args[0]
             self.assertIn("⏳ Предварительный — опрос идёт", draft_text)
+            self.assertIn(
+                draft_text.replace("<b>", "").replace("</b>", ""),
+                progress_text,
+            )
             self.assertNotIn(
                 "Утвердить",
                 str(draft_screen.message.answer.await_args.kwargs["reply_markup"]),
@@ -7323,7 +7330,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             dates = await press(f"rdy:pedit:kitchen:{month}")
             day = await press(button(dates, "rdy:pdate:"))
-            day_override = await press(button(day, "rdy:pslot:"))
+            day_override = await press(button(day, "rdy:ptask:"))
             self.assertTrue(any(
                 item.startswith("rdy:pday:")
                 for item in self.callback_data_list(day_override.message)
@@ -7331,12 +7338,11 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 day_override.message.answer.await_args.args[0],
                 self.callback_data_list(day_override.message),
             ))
-            task_button = next(
-                b.callback_data
-                for row in day.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
-                for b in row if "Скатерти" in b.text
+            bulk = await press(button(day, "rdy:pbulkinit:"))
+            self.assertIn(
+                "участники всего дня",
+                bulk.message.answer.await_args.args[0].lower(),
             )
-            slot = await press(task_button)
             input_handler = next(
                 item.callback for item in self.admin_router.message.handlers
                 if item.callback.__name__ == "on_service_parameter"
@@ -7347,12 +7353,26 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Выбраны номера: 1",
                 removal_selection.answer.await_args.args[0],
             )
-            removed = await press(button(slot, "rdy:pbulkdel:"))
+            removed = await press(button(bulk, "rdy:pbulkdel:"))
+            self.assertIn(
+                "выберите задачу",
+                removed.message.answer.await_args.args[0].lower(),
+            )
+            choose_task = next(
+                b.callback_data
+                for row in removed.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for b in row if "Скатерти" in b.text
+            )
+            candidates = await press(choose_task)
             self.assertIn(
                 "Участники, которые не назначены на этот день",
-                removed.message.answer.await_args.args[0],
+                candidates.message.answer.await_args.args[0],
             )
-            stale_save = button(removed, "rdy:pbulksave:")
+            await input_handler(self.message(67890, "1"))
+            candidates = await press(button(candidates, "rdy:pbulkadd:"))
+            stale_save = button(candidates, "rdy:pbulksave:")
             cancel_handler = self.message_handler("on_cancel_service_command")
             cancel_message = self.message(67890, "/cancel")
             service_lock = readiness.service_lock
@@ -7395,20 +7415,52 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             dates = await press(f"rdy:pedit:kitchen:{month}")
             day = await press(button(dates, "rdy:pdate:"))
+            bulk = await press(button(day, "rdy:pbulkinit:"))
+            stale_delete = button(bulk, "rdy:pbulkdel:")
+            current = await press(button(bulk, "rdy:pbulkkeep:"))
+            self.assertIn("выберите задачу", current.message.answer.await_args.args[0].lower())
+            current = await press(stale_delete)
+            self.assertIn(
+                "уже изменился",
+                current.message.answer.await_args.args[0].lower(),
+            )
             task_button = next(
                 b.callback_data
-                for row in day.message.answer.await_args.kwargs[
+                for row in current.message.answer.await_args.kwargs[
                     "reply_markup"
                 ].inline_keyboard
                 for b in row if "Скатерти" in b.text
             )
             current = await press(task_button)
-            current = await press(button(current, "rdy:pbulkkeep:"))
             self.assertIn("1. В", "".join(
                 call.args[0] for call in current.message.answer.await_args_list
             ))
             await input_handler(self.message(67890, "1"))
-            current = await press(button(current, "rdy:pbulkadd:"))
+            add_callback = button(current, "rdy:pbulkadd:")
+            save_callback = button(current, "rdy:pbulksave:")
+            lock_entries = 0
+
+            class AddWhileSaving:
+                async def __aenter__(self):
+                    nonlocal lock_entries
+                    lock_entries += 1
+                    if lock_entries == 2:
+                        await press(add_callback)
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return False
+
+            with patch.object(
+                readiness, "service_lock",
+                side_effect=lambda service_id: AddWhileSaving(),
+            ):
+                current = await press(save_callback)
+            self.assertIn(
+                "черновик изменился после нажатия",
+                current.message.answer.await_args.args[0].lower(),
+            )
+            plan = self.registry.get_schedule_plan("kitchen", key)
+            self.assertEqual(plan["slots"][plan["dates"][0]]["Скатерти"], [])
             stale_callback = await press(stale_save)
             self.assertIn(
                 "устарел",
@@ -7651,9 +7703,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
             dates = await press(f"rdy:pedit:sound:{month_arg}")
             day = await press(data_of(dates, "rdy:pdate:"))
-            slot = await press(data_of(day, "rdy:ptask:"))
-            slot = await press(data_of(slot, "rdy:pbulkkeep:"))
-            ask_user = await press(data_of(slot, "rdy:pnew:"))
+            slot = await press(data_of(day, "rdy:pbulkinit:"))
+            task_list = await press(data_of(slot, "rdy:pbulkkeep:"))
+            task = await press(data_of(task_list, "rdy:pbulktask:"))
+            ask_user = await press(data_of(task, "rdy:pnew:"))
             parameter_handler = self.message_handler("on_service_parameter")
             back = self.message(67890, CONTACT_BACK_TEXT)
             await parameter_handler(back)
@@ -8155,16 +8208,21 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             dates_screen = await press(f"rdy:pedit:sound:{month_arg}")
             day = await press(data_of(dates_screen, "rdy:pdate:"))
             slot = await press(data_of(day, "rdy:ptask:"))
-            self.assertIn("1. Алексей — звук", text_of(slot))
-            keep = next(
-                (button for button in buttons(slot)
-                 if button.text.endswith("Без удаления")),
-                None,
+            self.assertIn("Сейчас: Алексей", text_of(slot))
+            self.assertTrue(any(
+                button.callback_data.startswith("rdy:pday:")
+                for button in buttons(slot)
+            ))
+            bulk = await press(data_of(day, "rdy:pbulkinit:"))
+            self.assertIn("1. Алексей — звук", text_of(bulk))
+            keep = data_of(bulk, "rdy:pbulkkeep:")
+            task_list = await press(keep)
+            task = next(
+                button.callback_data for button in buttons(task_list)
+                if button.callback_data.startswith("rdy:pbulktask:")
+                and "звук" in button.text
             )
-            self.assertIsNotNone(
-                keep, (text_of(slot), [button.text for button in buttons(slot)])
-            )
-            candidates = await press(keep.callback_data)
+            candidates = await press(task)
             self.assertIn("1. Борис", text_of(candidates))
             input_handler = next(
                 item.callback for item in self.admin_router.message.handlers
@@ -8174,7 +8232,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             await input_handler(number_message)
             add = next(
                 button for button in buttons(candidates)
-                if button.text == "➕ Добавить"
+                if button.text == "➕ Добавить выбранных"
             )
             added = await press(add.callback_data)
             self.assertIn("Назначенные участники не будут заменены", text_of(added))
@@ -8194,17 +8252,17 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("График изменился", text_of(stale))
 
             # Удаление выполняется отдельно, сразу для всех назначений дня.
-            task_again = await press(data_of(saved, "rdy:ptask:"))
+            task_again = await press(data_of(saved, "rdy:pbulkinit:"))
             number_message = self.message(67890, "1, 2")
             await input_handler(number_message)
             delete = next(
                 button for button in buttons(task_again)
-                if button.text == "🗑 Удалить"
+                if button.text == "🗑 Удалить выбранных"
             )
             after_delete = await press(delete.callback_data)
             save = next(
                 button for button in buttons(after_delete)
-                if button.text == "✅ Сохранить"
+                if button.text == "✅ Сохранить без добавления"
             )
             await press(save.callback_data)
             plan = self.registry.get_schedule_plan("sound", key)

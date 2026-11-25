@@ -187,13 +187,17 @@ class ServiceScreensTest(unittest.TestCase):
                 button.callback_data for button in self.buttons(dates)
                 if button.callback_data.startswith("rdy:pdate:")
             ))
-            task = await self.press(next(
+            bulk = await self.press(next(
                 button.callback_data for button in self.buttons(day)
-                if button.callback_data.startswith("rdy:ptask:")
+                if button.callback_data.startswith("rdy:pbulkinit:")
+            ))
+            task_list = await self.press(next(
+                button.callback_data for button in self.buttons(bulk)
+                if button.callback_data.startswith("rdy:pbulkkeep:")
             ))
             add_stage = await self.press(next(
-                button.callback_data for button in self.buttons(task)
-                if button.text.endswith("Без удаления")
+                button.callback_data for button in self.buttons(task_list)
+                if button.callback_data.startswith("rdy:pbulktask:")
             ))
             self.assertIn("1. Борис", self.text(add_stage))
             input_handler = next(
@@ -203,7 +207,7 @@ class ServiceScreensTest(unittest.TestCase):
             await input_handler(self.message(1001, "1"))
             added = await self.press(next(
                 button.callback_data for button in self.buttons(add_stage)
-                if button.text == "➕ Добавить"
+                if button.text == "➕ Добавить выбранных"
             ))
             before_save = self.registry.get_schedule_plan("sound", "2026-11")
             self.assertEqual(before_save["slots"], slots)

@@ -211,22 +211,21 @@ def plan_summary(registry, plan: dict, run: dict | None) -> Summary:
     )
 
 
-async def build_draft(
+async def prepare_draft(
     registry, run: dict, events_loader, logger: logging.Logger,
-    *, save: bool = True,
-) -> dict:
-    """Предложенный график по ответам опроса (run["id"] is None — без
-    опроса, все свободны); ручные правки сбрасываются. save=False —
-    предварительный, пока опрос идёт: по текущим ответам, в базу не
-    пишется (утверждать его нельзя)."""
+) -> tuple[dict, Summary]:
+    """Рассчитать график и вернуть тот же снимок ответов для его отображения.
+
+    run["id"] is None — режим без опроса, все участники свободны.
+    """
     year, month = month_of(run)
     people = registry.readiness_people(run["service_id"])
     served, note = await last_served(
         registry, run["service_id"], year, month, people, events_loader,
         logger,
     )
-    summary = summarize(
-        registry, run,
+    summary = await asyncio.to_thread(
+        summarize, registry, run,
         last_served={key: date.fromisoformat(day) for key, day in served.items()},
         assume_free=run["id"] is None,
     )
@@ -245,22 +244,33 @@ async def build_draft(
         }
         for day in run["dates"]
     }
+    plan = {
+        "service_id": run["service_id"], "month": month_key(year, month),
+        "run_id": run["id"], "source": "poll",
+        "dates": list(run["dates"]), "tasks": tasks, "slots": slots,
+        "last_served": served, "note": note, "edited": 0,
+        "approved": None, "approved_at": None, "approved_days": {},
+        "approved_tasks": None, "days": {}, "republish": 0,
+        "dirty": True, "message_ids": [], "baseline": None,
+        "chat_id": None, "message_id": None, "updated_at": None,
+        "served_offsets": {}, "served_snapshot": False,
+    }
+    return plan, summary
+
+
+async def build_draft(
+    registry, run: dict, events_loader, logger: logging.Logger,
+    *, save: bool = True,
+) -> dict:
+    """Подготовить черновик; save=False возвращает только временный прогноз."""
+    plan, _ = await prepare_draft(registry, run, events_loader, logger)
     if not save:
-        return {
-            "service_id": run["service_id"], "month": month_key(year, month),
-            "run_id": run["id"], "source": "poll",
-            "dates": list(run["dates"]), "tasks": tasks, "slots": slots,
-            "last_served": served, "note": note, "edited": 0,
-            "approved": None, "approved_at": None, "approved_days": {},
-            "approved_tasks": None, "days": {}, "republish": 0,
-            "dirty": True, "message_ids": [], "baseline": None,
-            "chat_id": None, "message_id": None, "updated_at": None,
-            "served_offsets": {}, "served_snapshot": False,
-        }
+        return plan
     return registry.save_schedule_draft(
-        run["service_id"], month_key(year, month),
-        run_id=run["id"], dates=list(run["dates"]), tasks=tasks, slots=slots,
-        last_served=served, note=note,
+        plan["service_id"], plan["month"],
+        run_id=plan["run_id"], dates=plan["dates"], tasks=plan["tasks"],
+        slots=plan["slots"], last_served=plan["last_served"],
+        note=plan["note"],
     )
 
 
@@ -608,7 +618,8 @@ def window_of(registry, service_id: str) -> tuple[int, int]:
 
 
 def plan_text(service_label: str, plan: dict, summary: Summary, tz,
-              window: tuple[int, int] = (0, 0)) -> str:
+              window: tuple[int, int] = (0, 0), *,
+              status_override: str | None = None) -> str:
     """window — окно дней служения от воскресенья (Уборка: −1, +1)."""
     year, month = map(int, plan["month"].split("-"))
     names = {person["key"]: display_name(person) for person in summary.people}
@@ -633,6 +644,7 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         return ""
 
     done, total = covered(plan)
+    source_mode = plan_source_mode(plan)
     if plan["approved"] is None:
         status = "📝 Черновик — ещё не утверждён"
     elif plan.get("moved") and not plan.get("republish") and (
@@ -649,18 +661,22 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
         )
     else:
         status = f"✅ Утверждён {local_text(plan['approved_at'], tz)}"
-    source_label = "Авто" if plan["run_id"] is None else "Опрос"
+    if status_override is not None:
+        status = status_override
+    source_label = {
+        "poll": "Опрос", "auto": "Авто", "excel": "Excel",
+    }[source_mode]
+    if source_mode == "excel":
+        overview = "📥 Источник — Excel, напоминания и замены по графику бота"
+    elif source_mode == "auto":
+        overview = "🧮 Без опроса: все из состава считаются свободными"
+    else:
+        overview = f"Ответили {len(summary.answered)} из {len(polled)}"
     lines = [
         f"📋 {service_label} › График › {source_label} › {month_title(year, month)}",
         status,
         "",
-        (
-            "📥 Загружен из Excel — напоминания и замены по нему"
-            if plan.get("source") == "excel"
-            else "🧮 Без опроса: все из состава считаются свободными"
-            if plan["run_id"] is None
-            else f"Ответили {len(summary.answered)} из {len(polled)}"
-        ) + f" · закрыто мест {done} из {total}",
+        overview + f" · закрыто мест {done} из {total}",
     ]
     used_silent = False
     weekly = bool(task_days(plan)) or any(
@@ -748,6 +764,13 @@ def plan_text(service_label: str, plan: dict, summary: Summary, tz,
     if plan.get("note"):
         lines.append(f"ℹ️ Интервалы: {plan['note']}")
     return "\n".join(lines)
+
+
+def plan_source_mode(plan: dict) -> str:
+    """Источник плана: Excel имеет приоритет, иначе различаем опрос и авто."""
+    if plan.get("source") == "excel":
+        return "excel"
+    return "auto" if plan.get("run_id") is None else "poll"
 
 
 def slot_people(plan: dict, day: str, task: str) -> list[str]:

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.methods import DeleteMessage
 
 from bot import app, handlers, schedule_plan
@@ -650,6 +650,61 @@ class EventNotesTest(unittest.TestCase):
         ))
         self.assertGreaterEqual(reports.await_count, 1)
 
+    def test_expiry_capture_survives_delivery_marker_failure(self):
+        self.plan(chat_id=-10002, message_id=900)
+        reminder = self.registry.list_group_reminders("sound")[0]
+        self.registry.set_group_reminder_default_ttl(1001, "sound", 1)
+        bot = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(message_id=500)
+            ),
+            delete_message=AsyncMock(return_value=True),
+        )
+        credentials = SimpleNamespace(
+            admin_tg_id=1001, yandex_public_url="unused"
+        )
+
+        async def send_and_expire():
+            with patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(return_value=({"звук": ["A"]}, True)),
+            ), patch("bot.app.send_admin_reports", new=AsyncMock()), patch.object(
+                self.registry,
+                "mark_group_reminder_delivered",
+                side_effect=sqlite3.OperationalError("delivery write failed"),
+            ):
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError, "delivery write failed"
+                ):
+                    await app._process_service_reminder(
+                        bot,
+                        credentials,
+                        self.path,
+                        ZoneInfo("UTC"),
+                        self.registry,
+                        "sound",
+                        reminder["id"],
+                        LOG,
+                        LOG,
+                        run_date=date(2026, 10, 31),
+                    )
+            self.assertEqual(
+                len(self.registry.list_group_reminder_expiry_captures()), 1
+            )
+            await app._expire_group_reminder_messages(
+                bot,
+                self.registry,
+                1001,
+                datetime.now(timezone.utc) + timedelta(hours=2),
+                LOG,
+            )
+
+        asyncio.run(send_and_expire())
+        bot.delete_message.assert_awaited_once_with(-10002, 500)
+        self.assertEqual(
+            self.registry.list_group_reminder_expiry_captures(), []
+        )
+
     def test_group_message_reference_ignores_non_group_destinations(self):
         message = SimpleNamespace(message_id=500)
         self.assertIsNone(group_message_reference(message, 1001))
@@ -671,17 +726,24 @@ class EventNotesTest(unittest.TestCase):
         )
         bot = SimpleNamespace(delete_message=AsyncMock(return_value=False))
         now = sent_at + timedelta(hours=1)
+        error_at = now + timedelta(seconds=50)
 
-        asyncio.run(app._expire_group_reminder_messages(
-            bot, self.registry, 1001, now, LOG
-        ))
+        class ErrorTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return error_at
+
+        with patch("bot.app.datetime", ErrorTime):
+            asyncio.run(app._expire_group_reminder_messages(
+                bot, self.registry, 1001, now, LOG
+            ))
 
         retry = self.registry.list_due_group_reminder_messages(
-            now + timedelta(seconds=1)
+            error_at + timedelta(seconds=1)
         )
         self.assertEqual(retry, [])
         retry = self.registry.list_due_group_reminder_messages(
-            now + timedelta(seconds=2)
+            error_at + timedelta(seconds=2)
         )
         bot.delete_message.assert_awaited_once_with(-10002, 501)
         self.assertEqual(len(retry), 1)
@@ -726,6 +788,34 @@ class EventNotesTest(unittest.TestCase):
             error_at + timedelta(seconds=60)
         )
         self.assertEqual([item["message_id"] for item in retry], [502])
+
+    def test_group_reminder_forbidden_deletion_requires_manual_cleanup(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        sent_at = datetime(2026, 11, 1, 18, tzinfo=timezone.utc)
+        self.registry.record_group_reminder_messages(
+            "sound", reminder["id"], "2026-11-02", ((-10002, 503),), 1,
+            sent_at=sent_at,
+        )
+        bot = SimpleNamespace(delete_message=AsyncMock(side_effect=(
+            TelegramForbiddenError(
+                DeleteMessage(chat_id=-10002, message_id=503), "Forbidden"
+            )
+        )), send_message=AsyncMock())
+        now = sent_at + timedelta(hours=1)
+
+        asyncio.run(app._expire_group_reminder_messages(
+            bot, self.registry, 1001, now, LOG
+        ))
+
+        self.assertEqual(
+            self.registry.list_due_group_reminder_messages(
+                now + timedelta(days=1)
+            ),
+            [],
+        )
+        admin_text = bot.send_message.await_args.args[1]
+        self.assertIn("удалите это сообщение вручную", admin_text.lower())
+        self.assertIn("следующих автоудалений", admin_text.lower())
 
     def test_personal_preview_matches_real_delivery_and_db_failure_is_not_delivered(self):
         self.plan()

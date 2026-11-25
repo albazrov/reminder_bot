@@ -4482,7 +4482,10 @@ class ServiceRegistry:
         _validate_positive_id(reminder_id, "reminder_id")
         self._validate_group_reminder_ttl(ttl_hours)
         with self._connection() as connection:
-            self._require_service(connection, service_id)
+            if connection.execute(
+                "SELECT 1 FROM services WHERE id = ?", (service_id,)
+            ).fetchone() is None:
+                raise ValueError("Служение не найдено.")
             self._insert_group_reminder_message_expirations(
                 connection,
                 service_id,
@@ -4503,6 +4506,48 @@ class ServiceRegistry:
                     reminder_id,
                     event_date,
                     json.dumps(message_refs, separators=(",", ":")),
+                ),
+            )
+
+    def capture_group_reminder_messages(
+        self,
+        service_id: str,
+        reminder_id: int,
+        event_date: str,
+        message_refs: tuple[tuple[int, int], ...],
+        ttl_hours: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> None:
+        _validate_positive_id(reminder_id, "reminder_id")
+        self._validate_group_reminder_ttl(ttl_hours)
+        if not message_refs:
+            raise ValueError("Нет Telegram-сообщений для планирования удаления.")
+        captured_at = sent_at or datetime.now(timezone.utc)
+        if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+            raise ValueError("Время отправки должно содержать часовой пояс.")
+        refs_json = json.dumps(message_refs, separators=(",", ":"))
+        with self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM services WHERE id = ?", (service_id,)
+            ).fetchone() is None:
+                raise ValueError("Служение не найдено.")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO group_reminder_expiry_captures (
+                    service_id, reminder_id, event_date, message_refs_json,
+                    ttl_hours, sent_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    service_id,
+                    reminder_id,
+                    event_date,
+                    refs_json,
+                    ttl_hours,
+                    captured_at.astimezone(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
                 ),
             )
 

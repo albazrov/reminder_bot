@@ -727,6 +727,12 @@ class SchedulePlanTest(unittest.TestCase):
         )
         self.assertEqual(plan["source"], "excel")
         self.assertFalse(plan["dirty"])
+        rendered = schedule_plan.plan_text(
+            "ЗВУК", plan,
+            schedule_plan.plan_summary(self.registry, plan, None), TZ,
+        )
+        self.assertIn("📋 ЗВУК › График › Excel › ноябрь 2026", rendered)
+        self.assertNotIn("Ответили", rendered)
         # Обратно — события для напоминаний: среда — своей датой.
         back = {
             item.event_date: sorted((a.task, a.name) for a in item.assignments)
@@ -1033,6 +1039,7 @@ class SchedulePlanTest(unittest.TestCase):
         # Служение без задач: люди сразу под датой, без названия служения.
         summary = schedule_plan.plan_summary(self.registry, plan, None)
         text = schedule_plan.plan_text("УБОРКА", plan, summary, TZ)
+        self.assertIn("📋 УБОРКА › График › Авто › ноябрь 2026", text)
         self.assertNotIn(f"   {task_emoji(name)} {name}", text)
         self.assertIn("🗓 01.11\n   • ", text)
         published = schedule_plan.publication_text(

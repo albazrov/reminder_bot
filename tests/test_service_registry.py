@@ -119,17 +119,19 @@ class ServiceRegistryTest(unittest.TestCase):
             sent_at + timedelta(hours=1),
             retry_after=60,
         )
+        retry_before = self.registry.list_due_group_reminder_messages(
+            sent_at + timedelta(hours=1, seconds=59)
+        )
         self.assertEqual(
-            len(self.registry.list_due_group_reminder_messages(
-                sent_at + timedelta(hours=1, seconds=59)
-            )),
-            1,
+            [item["message_id"] for item in retry_before], [201]
         )
         retry = self.registry.list_due_group_reminder_messages(
             sent_at + timedelta(hours=1, seconds=60)
         )
-        self.assertEqual(len(retry), 2)
-        failed = retry[0]
+        self.assertEqual(
+            [item["message_id"] for item in retry], [200, 201]
+        )
+        failed = next(item for item in retry if item["message_id"] == 200)
         self.registry.record_group_reminder_message_delete_error(
             failed["id"],
             "no permission",
@@ -143,6 +145,39 @@ class ServiceRegistryTest(unittest.TestCase):
             1,
         )
         self.registry.complete_group_reminder_message_deletion(retry[1]["id"])
+        self.assertEqual(
+            self.registry.list_due_group_reminder_messages(
+                sent_at + timedelta(days=2)
+            ),
+            [],
+        )
+
+    def test_expiry_capture_can_be_promoted_after_service_archival(self):
+        reminder = self.registry.list_group_reminders("sound")[0]
+        sent_at = datetime(2026, 11, 1, 18, tzinfo=timezone.utc)
+        refs = ((-10001, 202),)
+        self.registry.capture_group_reminder_messages(
+            "sound", reminder["id"], "2026-11-02", refs, 1,
+            sent_at=sent_at,
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "UPDATE services SET archived = 1 WHERE id = 'sound'"
+            )
+
+        self.registry.record_group_reminder_messages(
+            "sound", reminder["id"], "2026-11-02", refs, 1,
+            sent_at=sent_at,
+        )
+
+        self.assertEqual(self.registry.list_group_reminder_expiry_captures(), [])
+        due = self.registry.list_due_group_reminder_messages(
+            sent_at + timedelta(hours=1)
+        )
+        self.assertEqual(
+            [(item["chat_id"], item["message_id"]) for item in due],
+            [(-10001, 202)],
+        )
 
     def test_group_reminder_merge_keeps_surviving_reminder_ttl(self):
         target_id = self.registry.add_group_reminder(

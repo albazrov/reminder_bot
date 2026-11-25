@@ -741,7 +741,12 @@ class ReadinessFlowTest(unittest.TestCase):
         )
         self.assertEqual(summary.plan.slots[(date(2026, 11, 1), "звук")], ["Алексей"])
         self.assertEqual(summary.plan.slots[(date(2026, 11, 1), "сборка")], ["Глеб"])
-        text = readiness.progress_text("ЗВУК", run, summary, TZ)
+        forecast = "📋 ЗВУК › График › Опрос › ноябрь 2026\n🗓 01.11"
+        text = readiness.progress_text(
+            "ЗВУК", run,
+            readiness.summarize(self.registry, run, with_plan=False),
+            TZ, forecast_text=forecast,
+        )
         self.assertIn("Ответили 3 из 4 · вне состава: 1", text)
         self.assertIn("01.11 — звук — 2", text)
         self.assertIn("01.11 — сборка — 2", text)
@@ -749,6 +754,8 @@ class ReadinessFlowTest(unittest.TestCase):
         self.assertIn("08.11 — сборка — 1", text)
         self.assertIn("⚪ Вне состава: Сергей (15)", text)
         self.assertIn("Дмитрий (без Telegram)", text)
+        self.assertIn(forecast, text)
+        self.assertNotIn("Предварительно:", text)
         # Отзыв голоса.
         record("poll-1", 503, "", "Глеб", None)
         self.assertNotIn(

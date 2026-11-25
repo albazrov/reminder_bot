@@ -558,8 +558,9 @@ def outside_name(answer: dict) -> str:
 
 
 def progress_text(service_label: str, run: dict, summary: Summary, tz,
-                  reminder: str | None = None) -> str:
-    """reminder — строка «когда напоминание» (идущий опрос)."""
+                  reminder: str | None = None,
+                  forecast_text: str | None = None) -> str:
+    """reminder — срок напоминания; forecast_text — общий рендер плана."""
     year, month = month_of(run)
     status = {
         "open": f"до {local_text(run['deadline'], tz)}",
@@ -600,33 +601,6 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
             + ")"
             for key, dates in summary.answered.items()
         )]
-    if summary.plan is not None:
-        silent = {person["key"] for person in summary.not_answered}
-        lines += ["", "Предварительно:"]
-        used_silent = False
-        for day in run["dates"]:
-            event_date = date.fromisoformat(day)
-            lines += ["", f"🗓 {event_date:%d.%m}"]
-            for task, needed in sort_tasks_for_display(
-                summary.plan.needed.items(), run["service_id"],
-                name=lambda item: item[0],
-            ):
-                people = summary.plan.slots.get((event_date, task), [])
-                used_silent |= any(person in silent for person in people)
-                lines += task_lines(
-                    task, needed,
-                    [
-                        names.get(person, person)
-                        + ("*" if person in silent else "")
-                        for person in people
-                    ],
-                    empty="⚠️ некого поставить", bare=summary.implicit,
-                )
-        if used_silent:
-            lines.append(
-                "* не ответил(а) — поставлен(а) по общей логике, после "
-                "ответивших"
-            )
     for answer in summary.outside:
         days = ", ".join(_short(day) for day in answer["dates"]) or "не сможет"
         lines.append(
@@ -645,6 +619,8 @@ def progress_text(service_label: str, run: dict, summary: Summary, tz,
         lines += ["", "⏳ Не ответили: " + ", ".join(
             waiting + [f"{name} (без Telegram)" for name in without_telegram]
         )]
+    if forecast_text:
+        lines += ["", forecast_text]
     return "\n".join(lines)
 
 
