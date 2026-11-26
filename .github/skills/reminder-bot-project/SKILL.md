@@ -76,7 +76,21 @@ Raspberry Pi specifics:
   they are not implemented in the current work. Check for duplicates first;
   update an existing issue when appropriate and share the issue link.
 
-## Release checkpoint (14.11.2026)
+## Release checkpoint (26.11.2026)
+
+- PR #81 (`dev` → `test`) and PR #84 (`test` → `main`) are merged.
+  Production commit is `6cad288ffa279d2747440943cee60185e730e2ea`;
+  workflow `45722758346` passed tests and production deployment, and
+  reported the bot started successfully. PR #81 test deployment and PR #84
+  CI also passed.
+- Local validation before release: 1048 tests passed, 11 skipped on macOS;
+  `compileall` and `git diff --check` passed. CodeRabbit findings on PR #81
+  were fixed before release. A post-merge review request was rejected because
+  the PR was closed; do not treat that as a fresh review of the merged code.
+- Manual Telegram acceptance and the presence of a new production backup
+  archive were not checked.
+
+## Historical release checkpoint (14.11.2026)
 
 - Participant name links, replacement-menu formatting, and readiness-poll
   overview are committed as `5fd9068` and `d380074` on `dev`.
@@ -84,9 +98,9 @@ Raspberry Pi specifics:
   passed. PR #57 (`test` → `main`) is merged as `852ea376`; CI, review (5/5,
   no actionable findings), and production workflow `43584342858` passed.
   Manual Telegram acceptance was not performed.
-- The new poll-format package (`dates_only`, full overview despite the option
-  limit, no extra home button) is prepared for the next release; its final
-  deployment status must be checked separately.
+- The poll-format package (`dates_only`, full overview despite the option
+  limit, no extra home button) was pending release at this checkpoint; see
+  the current release checkpoint above for the later status.
 - Full local validation after the review fix: 985 tests, 11 skipped.
   Re-check GitHub before any further release action; this is a dated
   checkpoint, not permission to merge or deploy.
@@ -564,7 +578,7 @@ Raspberry Pi specifics:
   must not be sent for that month without an approved graph. The saved
   approved graph is authoritative; changed Excel is not an automatic source
   switch. Approval enforcement for group/personal reminders and monthly
-  summaries is implemented locally but not yet released. Safe Excel refresh
+  summaries is released in production as part of PR #84. Safe Excel refresh
   remains in `BACKLOG.md`.
 - Week bundles: `service_tasks.same_week` (`set_service_task_same_week`,
   UI `svc_tasks:week|wtog`) and `service_members.week_tasks_json`
@@ -808,8 +822,8 @@ Raspberry Pi specifics:
   per-service source switch and «📥 Загрузить график из Excel».
   Later clarification supersedes live-Excel fallback for reminders: no
   approved graph saved in the bot for a service/month means no reminders for
-  that schedule. Enforcement is implemented locally; safe Excel refresh is
-  still planned in `BACKLOG.md`.
+  that schedule. Enforcement is released in production; safe Excel refresh
+  is still planned in `BACKLOG.md`.
 
 ### Rich text, mentions, and message length
 
