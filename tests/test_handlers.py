@@ -7434,7 +7434,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Выбраны номера: 1",
                 removal_selection.answer.await_args.args[0],
             )
-            removed = await press(button(bulk, "rdy:pbulkdel:"))
+            removed = await press(button(SimpleNamespace(message=removal_selection), "rdy:pbulkdel:"))
             self.assertIn(
                 "выберите задачу",
                 removed.message.answer.await_args.args[0].lower(),
@@ -7451,8 +7451,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Участники, которые не назначены на этот день",
                 candidates.message.answer.await_args.args[0],
             )
-            await input_handler(self.message(67890, "1"))
-            candidates = await press(button(candidates, "rdy:pbulkadd:"))
+            selection = self.message(67890, "1")
+            await input_handler(selection)
+            candidates = await press(button(SimpleNamespace(message=selection), "rdy:pbulkadd:"))
             stale_save = button(candidates, "rdy:pbulksave:")
             cancel_handler = self.message_handler("on_cancel_service_command")
             cancel_message = self.message(67890, "/cancel")
@@ -7516,9 +7517,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertIn("1. В", "".join(
                 call.args[0] for call in current.message.answer.await_args_list
             ))
-            await input_handler(self.message(67890, "1"))
-            add_callback = button(current, "rdy:pbulkadd:")
-            save_callback = button(current, "rdy:pbulksave:")
+            selection = self.message(67890, "1")
+            await input_handler(selection)
+            add_callback = button(SimpleNamespace(message=selection), "rdy:pbulkadd:")
+            save_callback = button(SimpleNamespace(message=selection), "rdy:pbulksave:")
             invoked = False
 
             async def add_during_cleanup(*args, **kwargs):
@@ -7545,8 +7547,9 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for line in removal_text.splitlines()
                 if "•" in line and ". В" in line
             )
-            await input_handler(self.message(67890, person_number))
-            task_list = await press(button(removal, "rdy:pbulkdel:"))
+            selection = self.message(67890, person_number)
+            await input_handler(selection)
+            task_list = await press(button(SimpleNamespace(message=selection), "rdy:pbulkdel:"))
             task_button = next(
                 b.callback_data
                 for row in task_list.message.answer.await_args.kwargs[
@@ -7555,9 +7558,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 for b in row if "Скатерти" in b.text
             )
             current = await press(task_button)
-            await input_handler(self.message(67890, "1"))
-            add_callback = button(current, "rdy:pbulkadd:")
-            save_callback = button(current, "rdy:pbulksave:")
+            selection = self.message(67890, "1")
+            await input_handler(selection)
+            add_callback = button(SimpleNamespace(message=selection), "rdy:pbulkadd:")
+            save_callback = button(SimpleNamespace(message=selection), "rdy:pbulksave:")
             lock_entries = 0
 
             class AddWhileSaving:
@@ -8395,7 +8399,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             number_message = self.message(67890, "1")
             await input_handler(number_message)
             add = next(
-                button for button in buttons(candidates)
+                button for button in buttons(SimpleNamespace(message=number_message))
                 if button.text == "➕ Добавить выбранных"
             )
             added = await press(add.callback_data)
@@ -8407,12 +8411,14 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             task_list = await press(data_of(added, "rdy:pbulkback:"))
             removal = await press(data_of(task_list, "rdy:pbulkback:"))
             self.assertIn("2. <a href=\"tg://user?id=502\">Борис</a>", text_of(removal))
-            await input_handler(self.message(67890, "2"))
-            task_list = await press(data_of(removal, "rdy:pbulkdel:"))
+            selection = self.message(67890, "2")
+            await input_handler(selection)
+            task_list = await press(data_of(SimpleNamespace(message=selection), "rdy:pbulkdel:"))
             candidates = await press(data_of(task_list, "rdy:pbulktask:"))
             self.assertIn("1. Борис", text_of(candidates))
-            await input_handler(self.message(67890, "1"))
-            added = await press(data_of(candidates, "rdy:pbulkadd:"))
+            selection = self.message(67890, "1")
+            await input_handler(selection)
+            added = await press(data_of(SimpleNamespace(message=selection), "rdy:pbulkadd:"))
             save = next(
                 button for button in buttons(added)
                 if button.text == "✅ Сохранить"
@@ -8429,7 +8435,7 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             number_message = self.message(67890, "1, 2")
             await input_handler(number_message)
             delete = next(
-                button for button in buttons(task_again)
+                button for button in buttons(SimpleNamespace(message=number_message))
                 if button.text == "🗑 Удалить выбранных"
             )
             after_delete = await press(delete.callback_data)

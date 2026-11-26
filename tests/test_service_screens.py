@@ -396,6 +396,8 @@ class ServiceScreensTest(unittest.TestCase):
                 if b.callback_data.startswith("rdy:pday:")
             ))
             self.assertIn("Другие задачи", self.text(pick_day))
+            self.assertIn('<a href="tg://user?id=3001">Анна</a>', self.text(pick_day))
+            self.assertIn("свой день участника или день служения", self.text(pick_day))
             slot = await self.press(next(
                 b.callback_data for b in self.buttons(pick_day)
                 if b.callback_data.startswith("rdy:pdset:") and b.callback_data.endswith(".-2")
@@ -485,6 +487,229 @@ class ServiceScreensTest(unittest.TestCase):
                 stale = await old
             self.assertIn("выберите дату", self.text(newer))
             stale.message.answer.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_slot_callback_does_not_reopen_editor_after_cancel_during_load(self):
+        from bot import readiness
+
+        self.plan(
+            {"2026-11-15": {"Микшер": ["Анна"]}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            other = next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pslotother:")
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+
+            class DelayedLock:
+                async def __aenter__(self):
+                    started.set()
+                    await release.wait()
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return False
+
+            cancel = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_cancel_service_command"
+            )
+            with patch.object(readiness, "service_lock", return_value=DelayedLock()):
+                old = asyncio.create_task(self.press(other))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                await cancel(self.message(text="/cancel"))
+                release.set()
+                stale = await old
+            stale.message.answer.assert_not_awaited()
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_bulk_delete_rejects_selection_not_shown_on_pressed_screen(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.plan(
+            {"2026-11-15": {"Микшер": ["Анна", "Борис"]}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 2}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            quick = next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:pquick:") and b.callback_data.endswith(".remove")
+            )
+            await self.press(quick.replace("rdy:pquick:", "rdy:pbulkinit:").removesuffix(".remove"))
+            input_handler = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            first = self.message(text="1")
+            sending, send_release = asyncio.Event(), asyncio.Event()
+            started, release = asyncio.Event(), asyncio.Event()
+            original = asyncio.to_thread
+
+            async def delay_send(text, **kwargs):
+                if "Выбраны номера: 1" in text:
+                    sending.set()
+                    await send_release.wait()
+                return SimpleNamespace(message_id=4567)
+
+            async def delay(func, *args, **kwargs):
+                if func is schedule_plan.plan_summary:
+                    started.set()
+                    await release.wait()
+                return await original(func, *args, **kwargs)
+
+            first.answer.side_effect = delay_send
+            pending_first = asyncio.create_task(input_handler(first))
+            await asyncio.wait_for(sending.wait(), timeout=2)
+            second = self.message(text="2")
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delay):
+                pending_render = asyncio.create_task(input_handler(second))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                send_release.set()
+                await pending_first
+                release.set()
+                await pending_render
+            second.answer.assert_not_awaited()
+            old_delete = next(
+                b.callback_data for b in self.buttons(SimpleNamespace(message=first))
+                if b.callback_data.startswith("rdy:pbulkdel:")
+            )
+            stale = await self.press(old_delete)
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            stale.message.answer.assert_not_awaited()
+            self.assertEqual(
+                self.registry.get_schedule_plan("sound", "2026-11")["slots"]["2026-11-15"]["Микшер"],
+                ["Анна", "Борис"],
+            )
+            retry = self.message(text="2")
+            await input_handler(retry)
+            self.assertIn("Выбраны номера: 2", retry.answer.await_args.args[0])
+            current = next(
+                b.callback_data for b in self.buttons(SimpleNamespace(message=retry))
+                if b.callback_data.startswith("rdy:pbulkdel:")
+            )
+            task_list = await self.press(current)
+            saved = await self.press(next(
+                b.callback_data for b in self.buttons(task_list)
+                if b.callback_data.startswith("rdy:pbulksave:")
+            ))
+            self.assertIn("Анна", self.text(saved))
+            self.assertEqual(
+                self.registry.get_schedule_plan("sound", "2026-11")["slots"]["2026-11-15"]["Микшер"],
+                ["Анна"],
+            )
+
+        asyncio.run(run())
+
+    def test_bulk_add_rejects_selection_from_an_older_screen(self):
+        from bot import readiness
+        from bot.excel_parser import RosterMember
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Анна", ("Микшер",)),
+            RosterMember("Борис", ("Микшер",)),
+        ]})
+        self.plan(
+            {"2026-11-15": {"Микшер": []}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 2}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            quick = next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:pquick:") and b.callback_data.endswith(".remove")
+            )
+            removal = await self.press(
+                quick.replace("rdy:pquick:", "rdy:pbulkinit:").removesuffix(".remove")
+            )
+            tasks = await self.press(next(
+                b.callback_data for b in self.buttons(removal)
+                if b.callback_data.startswith("rdy:pbulkkeep:")
+            ))
+            candidates = await self.press(next(
+                b.callback_data for b in self.buttons(tasks)
+                if b.callback_data.startswith("rdy:pbulktask:")
+            ))
+            input_handler = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_service_parameter"
+            )
+            picker = next(
+                b.callback_data for b in self.buttons(candidates)
+                if b.callback_data.startswith("rdy:pnew:")
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+            original_lock = readiness.service_lock
+            calls = 0
+
+            class DelayedLock:
+                async def __aenter__(self):
+                    started.set()
+                    await release.wait()
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return False
+
+            def delay_first_lock(service_id):
+                nonlocal calls
+                calls += 1
+                return DelayedLock() if calls == 1 else original_lock(service_id)
+
+            first = self.message(text="1")
+            with patch.object(readiness, "service_lock", side_effect=delay_first_lock):
+                pending_picker = asyncio.create_task(self.press(picker))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                await input_handler(first)
+                release.set()
+                stale_picker = await pending_picker
+            stale_picker.message.answer.assert_not_awaited()
+            self.assertIn("устарел", stale_picker.answer.await_args.args[0])
+            old_add = next(
+                b.callback_data for b in self.buttons(SimpleNamespace(message=first))
+                if b.callback_data.startswith("rdy:pbulkadd:")
+            )
+            second = self.message(text="2")
+            await input_handler(second)
+            stale = await self.press(old_add)
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            stale.message.answer.assert_not_awaited()
+            added = await self.press(next(
+                b.callback_data for b in self.buttons(SimpleNamespace(message=second))
+                if b.callback_data.startswith("rdy:pbulkadd:")
+            ))
+            saved = await self.press(next(
+                b.callback_data for b in self.buttons(added)
+                if b.callback_data.startswith("rdy:pbulksave:")
+            ))
+            self.assertIn("Борис", self.text(saved))
+            self.assertEqual(
+                self.registry.get_schedule_plan("sound", "2026-11")["slots"]["2026-11-15"]["Микшер"],
+                ["Борис"],
+            )
 
         asyncio.run(run())
 

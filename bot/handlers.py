@@ -7739,7 +7739,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     async def on_plan_action(
         callback: CallbackQuery, action: str, service: dict, arg: str | None,
         actor_id: int, now: datetime, *, save_snapshot=None,
-        save_pending=None,
+        save_pending=None, editor_pending=None,
     ) -> None:
         """Действия «📋 График» (этап 5.4–5.5)."""
         registry = service_registry()
@@ -7830,6 +7830,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             return
         run, plan = await load_plan(service_id, key)
+        if editor_pending is not None:
+            if pending_inputs.get(actor_id) is not editor_pending or (
+                action in {
+                    "padd", "prem", "pclear", "pnew", "pday", "pdset",
+                    "pslotother", "pslotmain", "pslothelp", "pslotreturn", "pslotpage",
+                }
+                and (arg or "").split(".")[0] != editor_pending.get("token")
+            ):
+                await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
+                return
         if not plan_current(run, plan):
             await show_readiness(
                 callback.message, service_id,
@@ -8255,8 +8265,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             ):
                 raise ValueError("График изменился — откройте его заново.")
-            names = {
-                person["key"]: person["name"]
+            people = {
+                person["key"]: person
                 for person in registry.readiness_people(service_id)
             }
             token = pending["token"]
@@ -8275,13 +8285,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "⬅️ К задаче", "pdset", service_id, f"{token}.{index}.back"
             )])
             key_person = pending["keys"][index]
+            person = people.get(key_person)
+            person_name = (
+                user_link(person.get("telegram_id"), display_name(person))
+                if person else key_person
+            )
             await _send_dialog(
                 callback.message,
                 f"📅 {service_label(service)} › График › "
                 f"{date.fromisoformat(pending['day']):%d.%m} › {pending['task']}\n\n"
-                f"{names.get(key_person, key_person)}: в какой день выполнить "
+                f"{person_name}: в какой день выполнить "
                 "эту задачу на выбранной неделе? Другие задачи и постоянный "
-                "«Свой день» не изменятся. «Как обычно» вернёт обычный день задачи.",
+                "«Свой день» не изменятся. «Как обычно» вернёт день задачи, "
+                "а если он не задан — свой день участника или день служения.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                 _dialog_keep_rows=True,
                 _dialog_keyboard_limit=sum(len(row) for row in rows),
@@ -8673,6 +8689,22 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             ):
                 await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
                 return
+            if action in {
+                "pbulkdel", "pbulkkeep", "pbulktask", "pbulkback",
+                "pbulkadd", "pbulksave",
+            }:
+                token_parts = (arg or "").split(".")
+                if not (
+                    plan_pending
+                    and plan_pending.get("operation") == "readiness_plan"
+                    and plan_pending.get("service_id") == service_id
+                    and len(token_parts) >= 3
+                    and token_parts[2] == plan_pending.get("token")
+                ):
+                    await answer_quietly(
+                        callback, "⚠️ Экран устарел — повторите выбор."
+                    )
+                    return
             if (action == "pokok" and member_pending
                     and member_pending.get("operation") == "plan_warning"):
                 await clean_previous_menu(callback.message, debug)
@@ -8750,6 +8782,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await on_plan_action(
                     callback, action, service, arg, actor_id, now,
                     save_snapshot=save_snapshot, save_pending=save_pending,
+                    editor_pending=member_pending if action in {
+                        "padd", "prem", "pclear", "pnew", "pday", "pdset",
+                        "pslotother", "pslotmain", "pslothelp", "pslotreturn",
+                        "pslotpage", "pbulkdel", "pbulkkeep", "pbulktask",
+                        "pbulkback", "pbulkadd", "pbulksave",
+                    } else None,
                 )
                 return
             if action in {
@@ -16617,6 +16655,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         message, actor_id, service_id, plan, plan["dates"].index(day), names,
                     )
                     return
+                pending["token"] = secrets.token_urlsafe(5)
                 pending["selected"] = selected
                 if pending["step"] == "plan_add_numbers":
                     candidates = pending.get("candidate_keys", [])
