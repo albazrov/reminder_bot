@@ -7095,11 +7095,18 @@ class ServiceRegistry:
                 for plan in plans:
                     tasks = json.loads(plan["tasks_json"])
                     for task in tasks:
-                        if "window" in task:
+                        saved_window = task.get("window") or task.get(
+                            "window_backup"
+                        )
+                        if saved_window is not None:
                             if (new["day_from"], new["day_to"]) == (0, 0):
-                                task.pop("window")
+                                task.pop("window", None)
+                                task["window_backup"] = saved_window
                             else:
-                                task["window"] = [new["day_from"], new["day_to"]]
+                                task["window"] = [
+                                    new["day_from"], new["day_to"]
+                                ]
+                                task.pop("window_backup", None)
                         if new["day_from"]:
                             task["default_day"] = new["day_from"]
                         else:

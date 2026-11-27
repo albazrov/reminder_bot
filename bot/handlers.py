@@ -1291,11 +1291,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
         lines.append(f"⏰ Напоминания групп · {reminders_status}")
         now = datetime.now(context.timezone)
-        upcoming = [
-            (*occurrence, item)
-            for item in enabled_reminders
-            if (occurrence := upcoming_group_reminder(registry, item, now)) is not None
-        ]
+        upcoming = []
+        occurrence_conflicts = []
+        for item in enabled_reminders:
+            try:
+                occurrence = upcoming_group_reminder(registry, item, now)
+            except ValueError as exc:
+                occurrence_conflicts.append(str(exc))
+                continue
+            if occurrence is not None:
+                upcoming.append((*occurrence, item))
         if upcoming:
             event_date, send_date, source_sunday, period_label, reminder = min(
                 upcoming,
@@ -1318,6 +1323,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 lines.append(f"✉️ Ближайшая отправка · {schedule}")
             if period_label is not None:
                 lines.append(f"📆 Период · {period_label}")
+        if occurrence_conflicts:
+            lines.extend([
+                "",
+                "⚠️ Не удалось определить отправку: "
+                + " ".join(dict.fromkeys(occurrence_conflicts)),
+                "Проверьте указанные утверждённые графики или измените "
+                "период напоминания.",
+            ])
         personal_templates = service["personal_templates"]
         admins_count = len(registry.list_service_admins(service_id))
         lines.extend(
@@ -2666,17 +2679,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         return "воскресенья"
 
     def upcoming_group_reminder(registry, reminder: dict, now: datetime):
-        range_occurrence = group_reminder_occurrence(
+        occurrence = group_reminder_occurrence(
             now, reminder, registry, reminder["service_id"],
         )
-        if range_occurrence is not None and range_occurrence[2] is not None:
-            event_date, send_date, source_sunday = range_occurrence
-        else:
-            occurrence = reminder_occurrence(now, reminder)
-            if occurrence is None:
-                return None
-            event_date, send_date = occurrence
-            source_sunday = None
+        if occurrence is None:
+            return None
+        event_date, send_date, source_sunday = occurrence
         snapshot = (
             schedule_plan.approved_range_week(
                 registry, reminder["service_id"], source_sunday,
@@ -4023,8 +4031,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending["step"] = "group_reminder_card"
         pending["reminder_id"] = reminder_id
         now = datetime.now(context.timezone)
-        occurrence = upcoming_group_reminder(registry, reminder, now)
+        occurrence_error = None
+        try:
+            occurrence = upcoming_group_reminder(registry, reminder, now)
+        except ValueError as exc:
+            occurrence = None
+            occurrence_error = str(exc)
         send_text = (
+            f"⚠️ Не удалось определить: {occurrence_error}"
+            if occurrence_error else
             f"{occurrence[1]:%d.%m.%Y} в {reminder['reminder_time']}"
             if occurrence else "— (период завершён)"
         )
@@ -4050,6 +4065,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"{anchor}\n"
             f"🗓 Период: {period_text(reminder, now.date(), registry)}\n"
             f"✉️ Отправка: {send_text}\n"
+            + (
+                "Проверьте указанные утверждённые графики или измените "
+                "период напоминания.\n"
+                if occurrence_error else ""
+            )
             + (f"📆 Период работы: {occurrence[3]}\n" if range_mode else "")
             + f"🗑 Удаление в чате: {group_reminder_ttl_text(reminder, service)}\n"
             f"📝 Текст: {body_status}\n"
@@ -10455,6 +10475,19 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 f"дня задачи «{draft['task']}»" if draft.get("task")
                 else "воскресенья"
             )
+            if not draft.get("task"):
+                registry = service_registry()
+                if registry is not None:
+                    today = datetime.now(context.timezone).date()
+                    sunday = today + timedelta(days=(6 - today.weekday()) % 7)
+                    for weeks in range(6):
+                        if schedule_plan.approved_range_week(
+                            registry,
+                            service_id,
+                            sunday + timedelta(days=7 * weeks),
+                        ) is not None:
+                            anchor = "начала периода"
+                            break
             text = (
                 "➕ Новое напоминание · шаг 1 из 3\n\n"
                 f"📅 За сколько дней до {anchor} отправить?\n"

@@ -209,7 +209,7 @@ class TaskDayProcessingTest(unittest.TestCase):
                 SUPER, common, None, date(2026, 11, 1), today=tuesday,
             )
 
-    def test_range_period_stays_active_through_monday_start(self):
+    def test_range_period_stays_active_through_the_approved_window(self):
         self.registry.set_responsible_contact(
             SUPER, "sound", "звук", "Алексей", 501,
         )
@@ -242,11 +242,11 @@ class TaskDayProcessingTest(unittest.TestCase):
             period_end_offset=offsets[1],
         )
 
-        self.assertEqual(offsets, (0, 1))
+        self.assertEqual(offsets, (0, 2))
         self.assertEqual(
             group_reminder_period_status(
                 self.registry, self.registry.get_group_reminder(reminder_id),
-                date(2026, 11, 2),
+                date(2026, 11, 3),
             ),
             "active",
         )
@@ -260,16 +260,35 @@ class TaskDayProcessingTest(unittest.TestCase):
         )
         self.assertEqual(
             self.registry.disable_expired_group_reminders(
-                date(2026, 11, 2), {reminder_id: offsets[1]},
+                date(2026, 11, 3), {reminder_id: offsets[1]},
             ),
             [],
         )
         self.assertEqual(
             self.registry.disable_expired_group_reminders(
-                date(2026, 11, 3), {reminder_id: offsets[1]},
+                date(2026, 11, 4), {reminder_id: offsets[1]},
             ),
             [reminder_id],
         )
+
+    def test_preview_does_not_restore_suppressed_ordinary_occurrence(self):
+        from bot import app
+
+        reminder_id = self.reminder(None)
+        credentials = SimpleNamespace(
+            admin_tg_id=SUPER, yandex_public_url="unused",
+        )
+        with patch(
+            "bot.app.group_reminder_occurrence", return_value=None,
+        ), patch(
+            "bot.app.reminder_occurrence",
+            side_effect=AssertionError("ordinary fallback was called"),
+        ):
+            with self.assertRaisesRegex(ValueError, "Период напоминания завершён"):
+                asyncio.run(app.get_group_reminder_preview(
+                    reminder_id, credentials, self.tmp, TZ, self.registry,
+                    MagicMock(),
+                ))
 
     def test_common_reminder_skips_rehearsal_wednesday(self):
         reminder_id = self.reminder(None)
@@ -314,10 +333,6 @@ class TaskDayProcessingTest(unittest.TestCase):
             approved_slot_days=schedule_plan.approved_slot_days(plan, people),
             approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
         )
-        self.registry.set_replacement(
-            "sound", "2026-10-29", "звук", "Борис", "Виктор",
-            503, "", "admin", SUPER,
-        )
         reminder_id = self.reminder(None, days=1)
         self.registry.update_group_reminder(
             SUPER, reminder_id, body="{sunday_date}\n{task_assignments}",
@@ -337,15 +352,30 @@ class TaskDayProcessingTest(unittest.TestCase):
         from bot.ui import plain_text
         preview_text = plain_text(preview["text"])
         self.assertIn("Анна — 27.10 (вт)", preview_text)
-        self.assertIn("Виктор — 29.10 (чт) – 02.11 (пн)", preview_text)
+        self.assertIn("Борис — 29.10 (чт) – 02.11 (пн)", preview_text)
         bot = SimpleNamespace(
             send_message=AsyncMock(return_value=SimpleNamespace(message_id=99)),
             edit_message_text=AsyncMock(),
         )
         logger = MagicMock()
+        replacement_applied = False
+
+        async def send_group_then_replace(send, chat_id, text, service, **kwargs):
+            nonlocal replacement_applied
+            await send(chat_id, text, **kwargs)
+            if not replacement_applied:
+                replacement_applied = True
+                self.registry.set_replacement(
+                    "sound", "2026-10-29", "звук", "Борис", "Виктор",
+                    503, "", "admin", SUPER,
+                )
 
         async def run():
-            with patch.object(app, "_notify_admin", new=AsyncMock()) as notify:
+            with patch.object(
+                app, "send_to_service_group", side_effect=send_group_then_replace,
+            ), patch.object(
+                app, "_notify_admin", new=AsyncMock(),
+            ) as notify:
                 for day in (date(2026, 10, 28), date(2026, 10, 28), date(2026, 10, 31)):
                     await app._process_service_reminder(
                         bot, SimpleNamespace(admin_tg_id=SUPER), self.tmp, TZ,
@@ -357,8 +387,8 @@ class TaskDayProcessingTest(unittest.TestCase):
                 group_text = bot.send_message.await_args_list[0].args[1]
                 report_text = plain_text(bot.send_message.await_args_list[1].args[1])
                 self.assertIn(">Анна</a> — 27.10 (вт)", group_text)
-                self.assertIn(">Виктор</a> — 29.10 (чт) – 02.11 (пн)", group_text)
-                self.assertNotIn("Борис", group_text)
+                self.assertIn(">Борис</a> — 29.10 (чт) – 02.11 (пн)", group_text)
+                self.assertNotIn("Виктор", group_text)
                 self.assertIn("📅 27.10 (вт)", report_text)
                 self.assertIn("📆 29.10 (чт) – 02.11 (пн)", report_text)
                 self.assertIn("Анна (звук)", report_text)

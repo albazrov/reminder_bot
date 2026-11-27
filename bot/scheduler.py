@@ -114,7 +114,7 @@ def group_reminder_period_offsets(registry, reminder: dict) -> tuple[int, int]:
         if snapshot is not None and (
             not reminder.get("task") or reminder["task"] == snapshot[1]
         ):
-            end_offset = snapshot[0][0]
+            end_offset = snapshot[0][1]
     return default_offset, end_offset
 
 
@@ -270,7 +270,9 @@ def group_reminder_occurrence(
                     best = candidate
                 elif use_range and best[2] != sunday:
                     raise ValueError(
-                        "На один день приходятся напоминания разных недель."
+                        f"На {event_date:%d.%m} приходятся напоминания разных "
+                        f"недель ({best[2]:%d.%m} и {sunday:%d.%m}). Проверьте "
+                        "эти утверждённые графики."
                     )
         sunday += timedelta(days=7)
     if best is None:

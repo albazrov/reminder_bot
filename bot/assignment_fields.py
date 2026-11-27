@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from string import Formatter
 from typing import TYPE_CHECKING
 
@@ -50,7 +50,7 @@ def resolve_assignment_fields(
 ) -> AssignmentFields:
     from .event_notes import source_sunday_for_event, validate_event_sunday
     from .presentation import display_name, person_label, task_emoji
-    from .schedule_plan import _effective_plan_assignments
+    from .schedule_plan import WEEKDAYS, _effective_plan_assignments
     from .excel_parser import is_informational_name
     from .service_registry import task_token
     from .services import sort_tasks_for_display
@@ -114,11 +114,41 @@ def resolve_assignment_fields(
             replacement_people=replacement_people if own else None,
         )
         by_key.update(replacement_people)
+        source_day = date.fromisoformat(sunday)
+        windows = {
+            item["name"]: tuple(item["window"])
+            for item in plan.get("approved_tasks") or plan.get("tasks") or []
+            if "window" in item
+        } if own else {}
+        fixed_assignments = {}
+        if own:
+            fixed_slots = {
+                task_name: list(keys)
+                for task_name, keys in (
+                    (plan.get("approved_fixed_days") or {})
+                    .get(sunday, {})
+                ).items()
+                if keys
+            }
+            if fixed_slots:
+                fixed_plan = {
+                    **plan,
+                    "approved": {sunday: fixed_slots},
+                }
+                fixed_assignments = _effective_plan_assignments(
+                    registry, fixed_plan, people, keyed=True,
+                    source_sunday=sunday,
+                    replacement_people=replacement_people,
+                )
+        fixed_records = {
+            (day.isoformat(), task_name, key)
+            for day, tasks in fixed_assignments.items()
+            for task_name, keys in tasks.items()
+            for key in keys
+        }
         lines = []
         rows = []
         for day, tasks in sorted(assignments.items()):
-            if day < cutoff:
-                continue
             for name, keys in sort_tasks_for_display(
                 tasks.items(), source_id, name=lambda item: item[0],
             ):
@@ -127,12 +157,30 @@ def resolve_assignment_fields(
                 for key in dict.fromkeys(keys):
                     if not key:
                         continue
+                    is_fixed = (day.isoformat(), name, key) in fixed_records
+                    window = windows.get(name)
+                    if day < cutoff and not (
+                        own and window and not is_fixed
+                        and source_day + timedelta(days=window[1]) >= cutoff
+                    ):
+                        continue
                     person = by_key.get(key)
                     label = (
                         person_label(name, key, {(name, key): person})
                         if own and person else display_name(person, key)
                     )
-                    day_label = f" — {day:%d.%m}" if own and day.isoformat() != sunday else ""
+                    if own and window and not is_fixed:
+                        start = source_day + timedelta(days=window[0])
+                        end = source_day + timedelta(days=window[1])
+                        day_label = (
+                            f" — {start:%d.%m} ({WEEKDAYS[start.weekday()]}) – "
+                            f"{end:%d.%m} ({WEEKDAYS[end.weekday()]})"
+                        )
+                    else:
+                        day_label = (
+                            f" — {day:%d.%m}"
+                            if own and day.isoformat() != sunday else ""
+                        )
                     lines.append(f"{task_emoji(name)} {name}{day_label} — {label}")
                     rows.append((day.isoformat(), name, key, label))
         value = "\n".join(lines)

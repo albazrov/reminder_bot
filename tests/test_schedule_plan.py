@@ -1436,6 +1436,38 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("🗓 05.11 (чт) – 09.11 (пн)", text)
         self.assertNotIn("🎚️ звук", text)
 
+    def test_neighbor_month_overview_keeps_replaced_fixed_and_range_assignments(self):
+        from bot.ui import plain_text
+
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -5)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("sound", 2026, 11), None, LOG,
+        ))
+        slots = {day: {"звук": []} for day in plan["dates"]}
+        slots["2026-11-01"]["звук"] = ["Алексей", "Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        self.registry.set_replacement(
+            "sound", "2026-10-27", "звук", "Алексей", "Борис",
+            502, "", "admin", 1001,
+        )
+
+        text = plain_text(schedule_plan.month_overview(
+            self.registry, 1001, "sound", date(2026, 10, 1),
+        ))
+
+        self.assertIn("27.10 (вт)", text)
+        self.assertIn("29.10 (чт) – 02.11 (пн)", text)
+        self.assertGreaterEqual(text.count("Борис"), 2)
+
     def test_range_excel_requires_real_dates_and_uses_approved_snapshot(self):
         self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
         self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
@@ -1460,6 +1492,7 @@ class SchedulePlanTest(unittest.TestCase):
         self.assertIn("27.10 (вт)", text)
         self.assertIn("05.11 (чт) – 09.11 (пн)", text)
         self.assertIn("Файл Excel не создан", text)
+        self.assertIn("это лист «ОКТЯБРЬ26»", text)
         with self.assertRaisesRegex(ValueError, "точные даты"):
             schedule_plan.excel_file(self.registry, self.service(), plan, people)
 
@@ -1561,12 +1594,14 @@ class SchedulePlanTest(unittest.TestCase):
             _range_reminder_week(
                 self.registry, "sound", {"task": None}, date(2026, 11, 30),
             )
-        with self.assertRaisesRegex(ValueError, "разных недель"):
+        with self.assertRaisesRegex(ValueError, "разных недель") as raised:
             group_reminder_occurrence(
                 datetime(2026, 11, 29, 12, 0, tzinfo=TZ),
                 {"task": None, "reminder_days": 0, "reminder_time": "18:00"},
                 self.registry, "sound",
             )
+        self.assertIn("29.11", str(raised.exception))
+        self.assertIn("06.12", str(raised.exception))
 
     def test_group_occurrence_uses_approved_range_not_current_settings(self):
         from bot.scheduler import group_reminder_occurrence
@@ -1649,7 +1684,15 @@ class SchedulePlanTest(unittest.TestCase):
             1001, "sound", day_from=-1, day_to=1
         )
         plan = self.draft()
+        plan["tasks"] = [
+            {**task, "window": [-1, 1]} for task in plan["tasks"]
+        ]
         plan["slots"]["2026-11-08"] = {"звук": ["Алексей"], "сборка": []}
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=plan["run_id"],
+            dates=plan["dates"], tasks=plan["tasks"], slots=plan["slots"],
+            last_served=plan["last_served"], note=plan.get("note"),
+        )
         people = self.people()
         self.registry.approve_schedule_plan(
             1001, "sound", "2026-11", plan["slots"],
@@ -1666,6 +1709,16 @@ class SchedulePlanTest(unittest.TestCase):
             if offset == 0:
                 self.assertTrue(all(
                     "default_day" not in task for task in changed["tasks"]
+                ))
+                self.assertTrue(all(
+                    "window" not in task and "window_backup" in task
+                    for task in changed["tasks"]
+                ))
+            else:
+                self.assertTrue(all(
+                    task.get("window") == [offset, end]
+                    and "window_backup" not in task
+                    for task in changed["tasks"]
                 ))
             self.assertEqual(
                 schedule_plan.task_moments(

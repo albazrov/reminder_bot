@@ -1639,8 +1639,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             with patch(
-                "bot.handlers.reminder_occurrence",
-                return_value=(date(2026, 10, 25), date(2026, 10, 24)),
+                "bot.handlers.group_reminder_occurrence",
+                return_value=(
+                    date(2026, 10, 25), date(2026, 10, 24), None,
+                ),
             ):
                 await self.callback_handler("on_group_reminder_action")(
                     reminder_callback
@@ -2014,6 +2016,80 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             self.assertEqual(failed_callback.answer.await_count, 1)
             self.context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_reminder_card_remains_editable_when_range_occurrence_conflicts(self):
+        async def run():
+            command = self.message(67890, "/service_notify")
+            await self.admin_router.message.handlers[6].callback(command)
+            service_callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(service_callback)
+            reminders_button = next(
+                button
+                for row in service_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:list:sound:"
+                )
+            )
+            reminders_callback = SimpleNamespace(
+                data=reminders_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                reminders_callback
+            )
+            reminder_button = next(
+                button
+                for row in reminders_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:open:sound:"
+                )
+            )
+            card_callback = SimpleNamespace(
+                data=reminder_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            with patch(
+                "bot.handlers.group_reminder_occurrence",
+                side_effect=ValueError(
+                    "На 30.11 приходятся напоминания разных недель."
+                ),
+            ):
+                await self.callback_handler("on_group_reminder_action")(
+                    card_callback
+                )
+
+            card_text = card_callback.message.answer.await_args.args[0]
+            card_markup = card_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            buttons = [
+                button.text
+                for row in card_markup.inline_keyboard
+                for button in row
+            ]
+            self.assertIn(
+                "На 30.11 приходятся напоминания разных недель.", card_text,
+            )
+            self.assertIn("📅 Срок", buttons)
+            self.assertIn("🗓 Период", buttons)
+            self.assertIn("👁 Предпросмотр", buttons)
 
         asyncio.run(run())
 

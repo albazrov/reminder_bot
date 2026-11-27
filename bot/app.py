@@ -1359,13 +1359,8 @@ async def get_group_reminder_preview(
     if service is None:
         raise ValueError("Служение для напоминания не найдено.")
 
-    range_occurrence = group_reminder_occurrence(
+    occurrence = group_reminder_occurrence(
         datetime.now(tz), reminder, registry, service["id"],
-    )
-    ordinary_occurrence = reminder_occurrence(datetime.now(tz), reminder)
-    occurrence = (
-        range_occurrence if range_occurrence and range_occurrence[2] is not None
-        else (*ordinary_occurrence, None) if ordinary_occurrence else None
     )
     if occurrence is None:
         raise ValueError("Период напоминания завершён.")
@@ -2306,6 +2301,23 @@ async def _process_service_reminder(
     ):
         # Отчёт отдельно от группового сообщения: недоставленный ранее
         # отчёт отправится при следующем запуске, не повторяя группу.
+        if range_week:
+            try:
+                report_assignments = _range_report_assignments(
+                    registry, service_id, event_date,
+                )
+            except Exception:
+                debug_logger.exception(
+                    "Не удалось обновить назначения для отчёта служения %s",
+                    service_id,
+                )
+                await _notify_admin(
+                    bot, credentials.admin_tg_id,
+                    f"Не удалось обновить отчёт «{service['name']}» на "
+                    f"{event_date:%d.%m.%Y}. Проверьте замены и график.",
+                    debug_logger,
+                )
+                return
         reports = (
             [(event_date, report_assignments)] if range_week
             else [(event_date, report_assignments or assignments)]
@@ -2593,27 +2605,58 @@ async def _process_user_reminder_schedule(
                 (plan or {}).get("approved_fixed_days", {})
                 .get(range_source, {}).get(schedule["task"], {})
             )
+            source_day = date.fromisoformat(range_source)
+            people = registry.readiness_people(schedule["service_id"])
+            by_key = {person["key"]: person for person in people}
+            fixed_keys = {
+                key for key, offset in fixed.items()
+                if source_day + timedelta(days=offset) == event_date
+            }
             person_keys = {
-                person["key"] for person in registry.readiness_people(
-                    schedule["service_id"]
-                )
+                person["key"] for person in people
                 if person.get("telegram_id") == schedule["actor_id"]
                 and person["name"] == schedule["name"]
             }
-            if not person_keys.intersection(fixed):
-                source_day = date.fromisoformat(range_source)
+            is_fixed_assignment = bool(person_keys.intersection(fixed_keys))
+            if fixed_keys and not is_fixed_assignment:
+                fixed_names = [
+                    by_key.get(key, {}).get("name", key)
+                    for key in fixed_keys
+                ]
+                replacements = registry.list_replacements(
+                    schedule["service_id"], event_date.isoformat(),
+                    source_sunday=range_source,
+                )
+                effective_fixed_names = apply_replacements(
+                    {schedule["task"]: fixed_names}, replacements,
+                ).get(schedule["task"], [])
+                replacement_ids = {
+                    item["new_name"]: item.get("telegram_id")
+                    for item in replacements
+                    if item["task"] == schedule["task"]
+                }
+                is_fixed_assignment = any(
+                    person["name"] in effective_fixed_names
+                    and person.get("telegram_id") == schedule["actor_id"]
+                    for person in people
+                ) or any(
+                    replacement_ids.get(name) == schedule["actor_id"]
+                    for name in effective_fixed_names
+                )
+            if not is_fixed_assignment:
                 start = source_day + timedelta(days=range_snapshot[0][0])
                 end = source_day + timedelta(days=range_snapshot[0][1])
                 range_label = (
                     f"{start:%d.%m} ({WEEKDAYS[start.weekday()]}) – "
                     f"{end:%d.%m} ({WEEKDAYS[end.weekday()]})"
                 )
+        visible_date = range_label or f"{event_date:%d.%m.%Y}"
         text = template.format_map(
             _TemplateValues(
                 name=display_name(schedule),
                 task=schedule["task"],
                 service_name=schedule["service_name"],
-                sunday_date=event_date.strftime("%d.%m.%Y"),
+                sunday_date=visible_date,
                 telegram_id=str(schedule["actor_id"]),
                 username=schedule["username"],
                 event_notes=(
@@ -2644,7 +2687,6 @@ async def _process_user_reminder_schedule(
         return
     # Заголовок всегда: к чему относятся «Принял» / «Не смогу», даже если
     # текст напоминания свой.
-    visible_date = range_label or f"{event_date:%d.%m.%Y}"
     header = (
         f"🔔 {schedule['service_name']} · {schedule['task']} · "
         f"{visible_date}"
