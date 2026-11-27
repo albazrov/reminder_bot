@@ -7378,6 +7378,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise ValueError(
                         f"Мест нет ({limit}) — сначала уберите кого-нибудь."
                     )
+                await asyncio.to_thread(
+                    schedule_plan.plan_summary, registry, plan, run
+                )
+                require_plan_editor(actor_id, pending, token)
                 person = new_member()
             if action == "pclear":
                 changed = bool(people)
@@ -7409,9 +7413,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else:
                     people.append(person)
                     changed = True
-                    summary = await asyncio.to_thread(
-                        schedule_plan.plan_summary, registry, plan, run
-                    )
+                    if new_member is not None:
+                        # Не отдаём управление между привязкой и сохранением:
+                        # отмена не должна оставить участника без назначения.
+                        summary = schedule_plan.plan_summary(registry, plan, run)
+                    else:
+                        summary = await asyncio.to_thread(
+                            schedule_plan.plan_summary, registry, plan, run
+                        )
                     require_plan_editor(actor_id, pending, token)
                     names = {
                         item["key"]: item["name"] for item in summary.people

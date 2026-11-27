@@ -731,6 +731,93 @@ class ServiceScreensTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_slot_shared_user_rejects_cancel_during_summary(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.plan(
+            {"2026-11-15": {"Микшер": []}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            picker = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pnew:")
+            ))
+            request = picker.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].keyboard[0][0].request_users
+            shared = self.message(text=None)
+            shared.users_shared = SimpleNamespace(
+                request_id=request.request_id,
+                users=[SimpleNamespace(
+                    user_id=3001, first_name="Анна", last_name="", username="",
+                )],
+            )
+            handler = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_users_shared"
+            )
+            cancel = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_cancel_service_command"
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+            original = asyncio.to_thread
+
+            async def delay(func, *args, **kwargs):
+                if func is schedule_plan.plan_summary:
+                    started.set()
+                    await release.wait()
+                return await original(func, *args, **kwargs)
+
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delay):
+                old = asyncio.create_task(handler(shared))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                await cancel(self.message(text="/cancel"))
+                release.set()
+                await old
+            self.assertIn("устарел", shared.answer.await_args.args[0])
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(plan["slots"]["2026-11-15"]["Микшер"], [])
+            self.assertNotIn(
+                "Анна", [p["name"] for p in self.registry.readiness_people("sound")]
+            )
+
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            picker = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pnew:")
+            ))
+            request = picker.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].keyboard[0][0].request_users
+            shared.users_shared.request_id = request.request_id
+            await handler(shared)
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(plan["slots"]["2026-11-15"]["Микшер"], ["Анна"])
+            self.assertIn(
+                "Анна", [p["name"] for p in self.registry.readiness_people("sound")]
+            )
+
+        asyncio.run(run())
+
     def test_bulk_delete_rejects_selection_not_shown_on_pressed_screen(self):
         self.registry.add_service_task(1001, "sound", "Микшер")
         self.plan(
