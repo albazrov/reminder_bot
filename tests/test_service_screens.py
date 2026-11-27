@@ -537,6 +537,287 @@ class ServiceScreensTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_slot_changes_reject_cancel_while_waiting_for_mutation_lock(self):
+        from bot import readiness
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.set_responsible_contact(
+            1001, "sound", "Микшер", "Анна", 3001,
+        )
+        self.registry.set_service_member_day(1001, "sound", "Анна", -3)
+
+        async def run():
+            cancel = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_cancel_service_command"
+            )
+            for action in ("prem", "pclear", "pdset"):
+                with self.subTest(action=action):
+                    self.plan(
+                        {"2026-11-15": {"Микшер": ["Анна"]}},
+                        tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+                    )
+                    dates = await self.press("rdy:pedit:sound:202611")
+                    day = await self.press(next(
+                        b.callback_data for b in self.buttons(dates)
+                        if b.callback_data.startswith("rdy:pdate:")
+                    ))
+                    slot = await self.press(next(
+                        b.callback_data for b in self.buttons(day)
+                        if b.callback_data.startswith("rdy:ptask:")
+                    ))
+                    if action == "pdset":
+                        slot = await self.press(next(
+                            b.callback_data for b in self.buttons(slot)
+                            if b.callback_data.startswith("rdy:pday:")
+                        ))
+                        data = next(
+                            b.callback_data for b in self.buttons(slot)
+                            if b.callback_data.startswith("rdy:pdset:")
+                            and b.callback_data.endswith(".-2")
+                        )
+                    else:
+                        data = next(
+                            b.callback_data for b in self.buttons(slot)
+                            if b.callback_data.startswith(f"rdy:{action}:")
+                        )
+                    before = self.registry.get_schedule_plan("sound", "2026-11")
+                    started, release = asyncio.Event(), asyncio.Event()
+                    original_lock = readiness.service_lock
+                    calls = 0
+
+                    class DelayedLock:
+                        async def __aenter__(self):
+                            started.set()
+                            await release.wait()
+
+                        async def __aexit__(self, exc_type, exc, traceback):
+                            return False
+
+                    def delay_mutation_lock(service_id):
+                        nonlocal calls
+                        calls += 1
+                        return DelayedLock() if calls == 2 else original_lock(service_id)
+
+                    with patch.object(readiness, "service_lock", side_effect=delay_mutation_lock):
+                        old = asyncio.create_task(self.press(data))
+                        await asyncio.wait_for(started.wait(), timeout=2)
+                        await cancel(self.message(text="/cancel"))
+                        release.set()
+                        stale = await old
+                    self.assertIn("устарел", stale.answer.await_args.args[0])
+                    stale.message.answer.assert_not_awaited()
+                    after = self.registry.get_schedule_plan("sound", "2026-11")
+                    self.assertEqual(after["slots"], before["slots"])
+                    self.assertEqual(after["days"], before["days"])
+
+        asyncio.run(run())
+
+    def test_slot_add_rejects_cancel_during_summary(self):
+        from bot.excel_parser import RosterMember
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Анна", ("Микшер",)),
+        ]})
+        self.plan(
+            {"2026-11-15": {"Микшер": []}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            add = next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:padd:")
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+            original = asyncio.to_thread
+
+            async def delay(func, *args, **kwargs):
+                if func is schedule_plan.plan_summary:
+                    started.set()
+                    await release.wait()
+                return await original(func, *args, **kwargs)
+
+            cancel = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_cancel_service_command"
+            )
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delay):
+                old = asyncio.create_task(self.press(add))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                await cancel(self.message(text="/cancel"))
+                release.set()
+                stale = await old
+            self.assertIn("устарел", stale.answer.await_args.args[0])
+            stale.message.answer.assert_not_awaited()
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(plan["slots"]["2026-11-15"]["Микшер"], [])
+
+        asyncio.run(run())
+
+    def test_slot_shared_user_rejects_cancel_while_waiting_for_lock(self):
+        from bot import readiness
+
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.plan(
+            {"2026-11-15": {"Микшер": []}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            picker = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pnew:")
+            ))
+            request = picker.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].keyboard[0][0].request_users
+            shared = self.message(text=None)
+            shared.users_shared = SimpleNamespace(
+                request_id=request.request_id,
+                users=[SimpleNamespace(
+                    user_id=3001, first_name="Анна", last_name="", username="",
+                )],
+            )
+            handler = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_users_shared"
+            )
+            cancel = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_cancel_service_command"
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+
+            class DelayedLock:
+                async def __aenter__(self):
+                    started.set()
+                    await release.wait()
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return False
+
+            with patch.object(readiness, "service_lock", return_value=DelayedLock()):
+                old = asyncio.create_task(handler(shared))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                await cancel(self.message(text="/cancel"))
+                release.set()
+                await old
+            self.assertIn("устарел", shared.answer.await_args.args[0])
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(plan["slots"]["2026-11-15"]["Микшер"], [])
+            self.assertNotIn(
+                "Анна", [p["name"] for p in self.registry.readiness_people("sound")]
+            )
+
+        asyncio.run(run())
+
+    def test_slot_shared_user_rejects_cancel_during_summary(self):
+        self.registry.add_service_task(1001, "sound", "Микшер")
+        self.plan(
+            {"2026-11-15": {"Микшер": []}},
+            tasks=[{"name": "Микшер", "needed": 1, "max": 1}],
+        )
+
+        async def run():
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            picker = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pnew:")
+            ))
+            request = picker.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].keyboard[0][0].request_users
+            shared = self.message(text=None)
+            shared.users_shared = SimpleNamespace(
+                request_id=request.request_id,
+                users=[SimpleNamespace(
+                    user_id=3001, first_name="Анна", last_name="", username="",
+                )],
+            )
+            handler = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_users_shared"
+            )
+            cancel = next(
+                item.callback for item in self.router.message.handlers
+                if item.callback.__name__ == "on_cancel_service_command"
+            )
+            started, release = asyncio.Event(), asyncio.Event()
+            original = asyncio.to_thread
+
+            async def delay(func, *args, **kwargs):
+                if func is schedule_plan.plan_summary:
+                    started.set()
+                    await release.wait()
+                return await original(func, *args, **kwargs)
+
+            with patch("bot.handlers.asyncio.to_thread", side_effect=delay):
+                old = asyncio.create_task(handler(shared))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                await cancel(self.message(text="/cancel"))
+                release.set()
+                await old
+            self.assertIn("устарел", shared.answer.await_args.args[0])
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(plan["slots"]["2026-11-15"]["Микшер"], [])
+            self.assertNotIn(
+                "Анна", [p["name"] for p in self.registry.readiness_people("sound")]
+            )
+
+            dates = await self.press("rdy:pedit:sound:202611")
+            day = await self.press(next(
+                b.callback_data for b in self.buttons(dates)
+                if b.callback_data.startswith("rdy:pdate:")
+            ))
+            slot = await self.press(next(
+                b.callback_data for b in self.buttons(day)
+                if b.callback_data.startswith("rdy:ptask:")
+            ))
+            picker = await self.press(next(
+                b.callback_data for b in self.buttons(slot)
+                if b.callback_data.startswith("rdy:pnew:")
+            ))
+            request = picker.message.answer.await_args.kwargs[
+                "reply_markup"
+            ].keyboard[0][0].request_users
+            shared.users_shared.request_id = request.request_id
+            await handler(shared)
+            plan = self.registry.get_schedule_plan("sound", "2026-11")
+            self.assertEqual(plan["slots"]["2026-11-15"]["Микшер"], ["Анна"])
+            self.assertIn(
+                "Анна", [p["name"] for p in self.registry.readiness_people("sound")]
+            )
+
+        asyncio.run(run())
+
     def test_bulk_delete_rejects_selection_not_shown_on_pressed_screen(self):
         self.registry.add_service_task(1001, "sound", "Микшер")
         self.plan(

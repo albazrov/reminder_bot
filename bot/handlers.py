@@ -7331,9 +7331,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             BufferedInputFile(data, filename=f"{service['id']}-{plan['month']}.xlsx"),
         )
 
+    class PlanEditorStale(Exception):
+        pass
+
+    def require_plan_editor(actor_id: int, pending: dict, token: str) -> None:
+        if pending_inputs.get(actor_id) is not pending or pending.get("token") != token:
+            raise PlanEditorStale
+
     async def change_slot(
         actor_id: int, service_id: str, key: str, pending: dict, action: str,
-        person: str | None, new_member=None,
+        person: str | None, token: str, new_member=None,
     ) -> tuple:
         """Правка задачи даты (padd / prem / pclear) на свежем графике под
         блокировкой; → (опрос, график, № даты, № задачи, пояснение).
@@ -7343,6 +7350,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         day_index, task_index = pending["day_index"], pending["task_index"]
         notice = None
         async with readiness.service_lock(service_id):
+            require_plan_editor(actor_id, pending, token)
             # Свежий график: другой админ мог поправить его только что,
             # а опрос — быть перезапущен.
             run = registry.get_readiness_run(service_id, key)
@@ -7370,6 +7378,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     raise ValueError(
                         f"Мест нет ({limit}) — сначала уберите кого-нибудь."
                     )
+                await asyncio.to_thread(
+                    schedule_plan.plan_summary, registry, plan, run
+                )
+                require_plan_editor(actor_id, pending, token)
                 person = new_member()
             if action == "pclear":
                 changed = bool(people)
@@ -7401,9 +7413,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 else:
                     people.append(person)
                     changed = True
-                    summary = await asyncio.to_thread(
-                        schedule_plan.plan_summary, registry, plan, run
-                    )
+                    if new_member is not None:
+                        # Не отдаём управление между привязкой и сохранением:
+                        # отмена не должна оставить участника без назначения.
+                        summary = schedule_plan.plan_summary(registry, plan, run)
+                    else:
+                        summary = await asyncio.to_thread(
+                            schedule_plan.plan_summary, registry, plan, run
+                        )
+                    require_plan_editor(actor_id, pending, token)
                     names = {
                         item["key"]: item["name"] for item in summary.people
                     }
@@ -7473,6 +7491,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 reply_markup=ReplyKeyboardRemove(), parse_mode=None,
             )
             return
+        token = pending["token"]
         pending["step"] = "readiness_plan"
         user = message.users_shared.users[0]
         username = (getattr(user, "username", None) or "").strip()
@@ -7630,8 +7649,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
 
             run, plan, _, _, notice = await change_slot(
                 actor_id, service_id, pending["month"], pending, "padd", key,
+                token,
                 new_member=add_member if key is None else None,
             )
+        except PlanEditorStale:
+            await message.answer(
+                "⚠️ Этот экран уже устарел. Откройте график заново.",
+                parse_mode=None,
+            )
+            return
         except (PermissionError, ValueError) as exc:
             if pending.get("bulk_editor"):
                 if pending_inputs.get(actor_id) is not pending:
@@ -8313,6 +8339,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             if value != "back":
                 offset = None if value == "n" else int(value)
                 async with readiness.service_lock(service_id):
+                    require_plan_editor(actor_id, pending, parts[0])
                     run = registry.get_readiness_run(service_id, key)
                     plan = registry.get_schedule_plan(service_id, key)
                     if not plan_current(run, plan) or (
@@ -8385,7 +8412,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if 0 <= index < len(pending["keys"]) else None
             )
             run, plan, day_index, task_index, notice = await change_slot(
-                actor_id, service_id, key, pending, action, person
+                actor_id, service_id, key, pending, action, person, parts[0]
             )
             await show_plan_slot(
                 callback.message, actor_id, service, run, plan,
@@ -9572,6 +9599,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 notice = "⚠️ Неизвестное действие"
             await show_readiness(callback.message, service_id, notice)
             await _answer_callback(callback)
+        except PlanEditorStale:
+            await answer_quietly(callback, "⚠️ Этот экран уже устарел.")
         except PermissionError as exc:
             await answer_quietly(callback, _status_text(str(exc), "⚠️"))
         except ValueError as exc:
