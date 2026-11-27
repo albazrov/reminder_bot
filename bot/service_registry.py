@@ -3994,13 +3994,16 @@ class ServiceRegistry:
         active_until: date | None,
         *,
         today: date,
+        period_end_offset: int | None = None,
     ) -> None:
         """Период напоминания по датам воскресений «с — по» (этап 4.2).
 
         today — сегодняшняя дата в часовом поясе бота.
 
         None — без границы. Вне периода напоминание не отправляется,
-        после окончания выключается (disable_expired_group_reminders)."""
+        после окончания выключается (disable_expired_group_reminders).
+        period_end_offset — день события последней недели, если он отличается
+        от дня задачи."""
         _validate_positive_id(actor_id, "actor_id")
         _validate_positive_id(reminder_id, "reminder_id")
         for bound in (active_from, active_until):
@@ -4008,6 +4011,11 @@ class ServiceRegistry:
                 not isinstance(bound, date) or bound.weekday() != 6
             ):
                 raise ValueError("Границы периода — даты воскресений.")
+        if period_end_offset is not None and (
+            type(period_end_offset) is not int
+            or not -6 <= period_end_offset <= 6
+        ):
+            raise ValueError("Смещение окончания периода вне диапазона.")
         if active_from and active_until and active_from > active_until:
             raise ValueError("Начало периода позже окончания.")
         with self._connection() as connection:
@@ -4019,9 +4027,13 @@ class ServiceRegistry:
             if row is None:
                 raise ValueError("Групповое напоминание больше не существует.")
             self._require_service_editor(connection, actor_id, row["service_id"])
-            # Неделя окончания идёт до дня задачи (вс +5 — пятница после).
+            # Неделя окончания может идти до дня задачи или начала диапазона.
+            default_offset = reminder_day_offset(dict(row))
             if active_until is not None and active_until + timedelta(
-                days=reminder_day_offset(dict(row))
+                days=(
+                    default_offset if period_end_offset is None
+                    else period_end_offset
+                )
             ) < today:
                 raise ValueError("Окончание периода уже прошло.")
             values = (
@@ -4052,9 +4064,12 @@ class ServiceRegistry:
                 },
             )
 
-    def disable_expired_group_reminders(self, today: date) -> list[int]:
-        """Выключает напоминания, чей период закончился до today. У задачи
-        со своим днём (вс +1) последняя неделя кончается днём задачи."""
+    def disable_expired_group_reminders(
+        self,
+        today: date,
+        period_end_offsets: dict[int, int] | None = None,
+    ) -> list[int]:
+        """Выключает напоминания после дня события последней недели."""
         with self._connection() as connection:
             ids = [
                 row["id"]
@@ -4064,7 +4079,9 @@ class ServiceRegistry:
                     "AND g.active_until IS NOT NULL",
                 )
                 if date.fromisoformat(row["active_until"]) + timedelta(
-                    days=reminder_day_offset(dict(row))
+                    days=(period_end_offsets or {}).get(
+                        row["id"], reminder_day_offset(dict(row)),
+                    )
                 ) < today
             ]
             connection.executemany(

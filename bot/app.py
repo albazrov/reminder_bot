@@ -96,6 +96,7 @@ if __package__:
         add_service_reminder_jobs,
         build_scheduler,
         group_reminder_occurrence,
+        group_reminder_period_offsets,
         in_reminder_period,
         is_reminder_event_date,
         reminder_occurrence,
@@ -175,6 +176,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         add_service_reminder_jobs,
         build_scheduler,
         group_reminder_occurrence,
+        group_reminder_period_offsets,
         in_reminder_period,
         is_reminder_event_date,
         reminder_occurrence,
@@ -2558,9 +2560,23 @@ async def _process_user_reminder_schedule(
         body=schedule.get("body"),
     )
     try:
-        range_source = source_sunday_for_event(
-            registry, schedule["service_id"], event_date, schedule["task"],
-        )
+        ambiguous_range_source = False
+        try:
+            range_source = source_sunday_for_event(
+                registry,
+                schedule["service_id"],
+                event_date,
+                schedule["task"],
+                telegram_id=schedule["actor_id"],
+            )
+        except EventNoteResolutionError:
+            range_source = None
+            ambiguous_range_source = True
+            debug_logger.warning(
+                "Не удалось однозначно определить неделю личного напоминания "
+                "%s; отправляется дата без подписи диапазона",
+                schedule_id,
+            )
         range_snapshot = (
             approved_range_week(
                 registry, schedule["service_id"],
@@ -2600,12 +2616,17 @@ async def _process_user_reminder_schedule(
                 sunday_date=event_date.strftime("%d.%m.%Y"),
                 telegram_id=str(schedule["actor_id"]),
                 username=schedule["username"],
-                event_notes=resolve_event_note(
-                    registry, schedule["service_id"], event_date,
-                    schedule["task"],
-                    template=template,
-                    public_url=credentials.yandex_public_url if "{event_notes" in template else None,
-                    **({"source_sunday": range_source} if range_source else {}),
+                event_notes=(
+                    ""
+                    if ambiguous_range_source
+                    else resolve_event_note(
+                        registry, schedule["service_id"], event_date,
+                        schedule["task"],
+                        template=template,
+                        public_url=credentials.yandex_public_url
+                        if "{event_notes" in template else None,
+                        **({"source_sunday": range_source} if range_source else {}),
+                    )
                 ),
             )
         )
@@ -3471,8 +3492,19 @@ async def _run_locked(args: CliArgs) -> None:
                 if service_registry is None or scheduler is None:
                     return
                 # Напоминания с завершённым периодом выключаются (этап 4.2).
+                period_end_offsets = {
+                    reminder["id"]: group_reminder_period_offsets(
+                        service_registry, reminder,
+                    )[1]
+                    for service in service_registry.list_services()
+                    for reminder in service_registry.list_group_reminders(
+                        service["id"],
+                    )
+                    if reminder["enabled"] and reminder.get("active_until")
+                }
                 expired = service_registry.disable_expired_group_reminders(
-                    datetime.now(tz).date()
+                    datetime.now(tz).date(),
+                    period_end_offsets=period_end_offsets,
                 )
                 if expired:
                     interaction_logger.info(

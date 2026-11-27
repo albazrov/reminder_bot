@@ -439,9 +439,32 @@ async def refresh_admin_reports(
                 service_id, f"{source_sunday}#range",
             )
             if reports:
+                from .schedule_plan import approved_range_week
+
+                snapshot = approved_range_week(
+                    registry, service_id, date.fromisoformat(source_sunday),
+                )
+                if snapshot is None:
+                    logger.warning(
+                        "Не удалось обновить отчёт служения %s за неделю %s: "
+                        "утверждённый диапазон больше не найден",
+                        service_id, source_sunday,
+                    )
+                    return
+                assignments = {
+                    event_day.isoformat(): {
+                        range_task: {
+                            "names": names,
+                            "is_informational": False,
+                        }
+                        for range_task, names in tasks.items() if names
+                    }
+                    for event_day, tasks in snapshot[2].items()
+                    if tasks
+                }
                 await send_admin_reports(
                     bot, registry, service, date.fromisoformat(source_sunday),
-                    reports[0]["assignments"], admin_actor_id, logger, limit,
+                    assignments, admin_actor_id, logger, limit,
                     source_sunday=source_sunday,
                 )
                 return

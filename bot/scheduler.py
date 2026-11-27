@@ -67,21 +67,67 @@ def periods_overlap(first: dict, second: dict) -> bool:
     )
 
 
-def reminder_period_status(reminder: dict, today: date) -> str | None:
+def reminder_period_status(
+    reminder: dict,
+    today: date,
+    *,
+    start_day_offset: int | None = None,
+    end_day_offset: int | None = None,
+) -> str | None:
     """None — без периода; иначе active / pending / ended. У задачи со
-    своим днём границы — дни задачи первой и последней недели."""
+    своим днём границы — дни задачи первой и последней недели; диапазон может
+    переопределить смещение конца."""
     active_from = _period_bound(reminder.get("active_from"))
     active_until = _period_bound(reminder.get("active_until"))
     if active_from is None and active_until is None:
         return None
-    shift = timedelta(days=reminder_day_offset(reminder))
-    active_from = active_from + shift if active_from else None
-    active_until = active_until + shift if active_until else None
+    default_offset = reminder_day_offset(reminder)
+    if active_from is not None:
+        active_from += timedelta(
+            days=default_offset if start_day_offset is None
+            else start_day_offset
+        )
+    if active_until is not None:
+        active_until += timedelta(
+            days=default_offset if end_day_offset is None else end_day_offset
+        )
     if active_until is not None and active_until < today:
         return "ended"
     if active_from is not None and active_from > today:
         return "pending"
     return "active"
+
+
+def group_reminder_period_offsets(registry, reminder: dict) -> tuple[int, int]:
+    """Return effective start and end offsets for a group-reminder period."""
+    from .schedule_plan import approved_range_week
+
+    default_offset = reminder_day_offset(reminder)
+    end_offset = default_offset
+    active_until = reminder.get("active_until")
+    if active_until is not None:
+        snapshot = approved_range_week(
+            registry,
+            reminder["service_id"],
+            _period_bound(active_until),
+        )
+        if snapshot is not None and (
+            not reminder.get("task") or reminder["task"] == snapshot[1]
+        ):
+            end_offset = snapshot[0][0]
+    return default_offset, end_offset
+
+
+def group_reminder_period_status(
+    registry, reminder: dict, today: date,
+) -> str | None:
+    start_offset, end_offset = group_reminder_period_offsets(registry, reminder)
+    return reminder_period_status(
+        reminder,
+        today,
+        start_day_offset=start_offset,
+        end_day_offset=end_offset,
+    )
 
 
 def reminder_day_offset(reminder: dict) -> int:

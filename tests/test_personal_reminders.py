@@ -496,6 +496,60 @@ class PersonalReminderForecastTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_delivery_survives_ambiguous_range_source_weeks(self):
+        from bot.app import _process_user_reminder_schedule
+        from bot.ui import plain_text
+
+        async def run():
+            rule = self.rule(task="Микшер", days=1)
+            for sunday, window in (
+                ("2026-11-29", [1, 2]),
+                ("2026-12-06", [-6, -5]),
+            ):
+                month = sunday[:7]
+                slots = {sunday: {"Микшер": ["Алексей"]}}
+                self.registry.save_schedule_draft(
+                    "sound", month, run_id=None, dates=[sunday],
+                    tasks=[{
+                        "name": "Микшер", "needed": 1, "max": 1,
+                        "window": window, "default_day": window[0],
+                    }],
+                    slots=slots, last_served={},
+                )
+                self.registry.approve_schedule_plan(
+                    1001, "sound", month, slots,
+                    chat_id=None, message_id=None,
+                    approved_slot_days={
+                        sunday: {"Микшер": {"Алексей": window[0]}},
+                    },
+                )
+            assignments = {"Микшер": ["Алексей"]}
+            bot = SimpleNamespace(send_message=AsyncMock())
+            with patch(
+                "bot.app._has_approved_schedule_for_event", return_value=True,
+            ), patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(return_value=(assignments, True)),
+            ):
+                await _process_user_reminder_schedule(
+                    bot,
+                    SimpleNamespace(admin_tg_id=1001, yandex_public_url="unused"),
+                    Path(self.tmp.name), self.now.tzinfo, self.registry, rule["id"],
+                    MagicMock(), MagicMock(), run_date=date(2026, 11, 29),
+                )
+
+            self.assertTrue(
+                self.registry.is_user_reminder_delivered(
+                    rule["id"], "2026-11-30",
+                )
+            )
+            self.assertIn(
+                "30.11.2026",
+                plain_text(bot.send_message.await_args.args[1]),
+            )
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

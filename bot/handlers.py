@@ -106,6 +106,8 @@ from .service_registry import (
 )
 from .scheduler import (
     group_reminder_occurrence,
+    group_reminder_period_offsets,
+    group_reminder_period_status,
     periods_overlap,
     reminder_day_offset,
     reminder_occurrence,
@@ -270,9 +272,13 @@ PERIOD_STATUS_LABELS = {
 }
 
 
-def period_text(reminder: dict, today: date) -> str:
+def period_text(reminder: dict, today: date, registry=None) -> str:
     """«с 01.11.2026 по 27.12.2026 · 🟢 активно» или «без ограничений»."""
-    status = reminder_period_status(reminder, today)
+    status = (
+        group_reminder_period_status(registry, reminder, today)
+        if registry is not None
+        else reminder_period_status(reminder, today)
+    )
     if status is None:
         return "без ограничений"
     bounds = []
@@ -281,6 +287,19 @@ def period_text(reminder: dict, today: date) -> str:
     if reminder.get("active_until"):
         bounds.append(f"по {date.fromisoformat(reminder['active_until']):%d.%m.%Y}")
     return f"{' '.join(bounds)} · {PERIOD_STATUS_LABELS[status]}"
+
+
+def reminder_period_offsets(
+    registry, reminder: dict, active_from: date | None, active_until: date | None,
+) -> tuple[int, int]:
+    return group_reminder_period_offsets(
+        registry,
+        {
+            **reminder,
+            "active_from": active_from,
+            "active_until": active_until,
+        },
+    )
 
 
 def group_reminder_ttl_text(reminder: dict, service: dict) -> str:
@@ -3751,7 +3770,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             start=page * page_size + 1,
         ):
             period_mark = {"pending": "⏳ ", "ended": "⏸ "}.get(
-                reminder_period_status(reminder, today), ""
+                group_reminder_period_status(registry, reminder, today), ""
             )
             weekday = _WEEKDAYS[
                 (6 + reminder_day_offset(reminder) - reminder["reminder_days"]) % 7
@@ -4029,7 +4048,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             f"📌 Задача: {task_status}\n"
             f"📅 Срок: за {reminder['reminder_days']} дн. до "
             f"{anchor}\n"
-            f"🗓 Период: {period_text(reminder, now.date())}\n"
+            f"🗓 Период: {period_text(reminder, now.date(), registry)}\n"
             f"✉️ Отправка: {send_text}\n"
             + (f"📆 Период работы: {occurrence[3]}\n" if range_mode else "")
             + f"🗑 Удаление в чате: {group_reminder_ttl_text(reminder, service)}\n"
@@ -4340,7 +4359,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         else:
             choices = [first + timedelta(weeks=week) for week in range(9)]
             title = (
-                f"🗓 Период напоминания\nСейчас: {period_text(reminder, today)}"
+                f"🗓 Период напоминания\nСейчас: {period_text(reminder, today, registry)}"
                 "\n\nС какого воскресенья отправлять?"
             )
             open_label = "▶️ Сразу"
@@ -10642,8 +10661,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             await _send_dialog(
                 message,
                 f"⚠️ На «{slot}» уже есть напоминание с периодом "
-                f"{period_text(target, today)}.\n"
-                f"Период этого напоминания: {period_text(period, today)}.\n\n"
+                f"{period_text(target, today, registry)}.\n"
+                f"Период этого напоминания: {period_text(period, today, registry)}.\n\n"
                 "Напоминания с разными периодами не объединяются. Сохраните "
                 "отдельно и задайте периоды в «🗓 Период» так, чтобы они не "
                 "пересекались, — иначе в общие воскресенья уйдут оба.",
@@ -11580,10 +11599,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         pending["reminder_id"], picked, pick_until=True,
                     )
                 else:
+                    reminder = registry.get_group_reminder(
+                        pending["reminder_id"],
+                    )
+                    if reminder is None:
+                        raise ValueError(
+                            "Групповое напоминание больше не существует."
+                        )
+                    offsets = reminder_period_offsets(
+                        registry, reminder, pending.get("period_from"), picked,
+                    )
                     registry.set_group_reminder_period(
                         actor_id, pending["reminder_id"],
                         pending.get("period_from"), picked,
                         today=datetime.now(context.timezone).date(),
+                        period_end_offset=offsets[1],
                     )
                     await refresh_jobs()
                     await enter_group_reminder_card(
@@ -11718,8 +11748,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 if reminder is None or reminder["service_id"] != service_id:
                     raise ValueError("Групповое напоминание больше не существует.")
                 if action == "toggle":
-                    if not reminder["enabled"] and reminder_period_status(
-                        reminder, datetime.now(context.timezone).date()
+                    if not reminder["enabled"] and group_reminder_period_status(
+                        registry, reminder, datetime.now(context.timezone).date()
                     ) == "ended":
                         raise ValueError(
                             "Период напоминания завершён — задайте новый "
@@ -17246,10 +17276,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                             "Ввод устарел. Откройте напоминание заново."
                         )
                     active_from, active_until = _parse_period(text)
+                    reminder = registry.get_group_reminder(
+                        input_info["reminder_id"],
+                    )
+                    if reminder is None:
+                        raise ValueError(
+                            "Групповое напоминание больше не существует."
+                        )
+                    offsets = reminder_period_offsets(
+                        registry, reminder, active_from, active_until,
+                    )
                     registry.set_group_reminder_period(
                         message.from_user.id, input_info["reminder_id"],
                         active_from, active_until,
                         today=datetime.now(context.timezone).date(),
+                        period_end_offset=offsets[1],
                     )
                     pending.pop("group_reminder_input", None)
                     refresh = getattr(

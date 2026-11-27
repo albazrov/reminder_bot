@@ -149,6 +149,31 @@ class EventNotesTest(unittest.TestCase):
             self.registry, "sound", date(2026, 12, 5), "звук",
         ), "2026-11-29")
 
+    def test_personal_event_source_ignores_other_weeks_assignee(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "B", 502,
+        )
+        self.plan("2026-11-29", 1, person="A")
+        self.plan("2026-12-06", -6, person="B")
+        event_day = date(2026, 11, 30)
+
+        with self.assertRaises(EventNoteResolutionError):
+            source_sunday_for_event(
+                self.registry, "sound", event_day, "звук",
+            )
+        self.assertEqual(
+            source_sunday_for_event(
+                self.registry, "sound", event_day, "звук", telegram_id=501,
+            ),
+            "2026-11-29",
+        )
+        self.assertEqual(
+            source_sunday_for_event(
+                self.registry, "sound", event_day, "звук", telegram_id=502,
+            ),
+            "2026-12-06",
+        )
+
     def test_publishing_never_changes_delivery_marks(self):
         reminder = self.registry.list_group_reminders("sound")[0]
         self.registry.mark_group_reminder_delivered(reminder["id"], "2026-11-01", "group:-10002")

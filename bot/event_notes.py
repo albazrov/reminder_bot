@@ -7,7 +7,7 @@ import unicodedata
 from datetime import date, datetime, time, timedelta
 
 from .schedule_plan import task_moments
-from .presentation import format_informational_notes
+from .presentation import apply_replacements, format_informational_notes
 from .group_send import send_to_service_group
 from .ui import plain_text
 
@@ -54,8 +54,14 @@ def validate_event_sunday(value: str | date) -> date:
     return result
 
 
-def source_sunday_for_event(registry, service_id: str, event_day: date,
-                            task: str | None = None) -> str | None:
+def source_sunday_for_event(
+    registry,
+    service_id: str,
+    event_day: date,
+    task: str | None = None,
+    *,
+    telegram_id: int | None = None,
+) -> str | None:
     """Find the approved Sunday whose snapshot places this task on event_day."""
     people = registry.readiness_people(service_id)
     by_key = {person["key"]: person for person in people}
@@ -77,14 +83,40 @@ def source_sunday_for_event(registry, service_id: str, event_day: date,
             "approved_slot_days": plan.get("approved_slot_days") or {},
         }
         for sunday, tasks in approved.items():
-            for name in tasks:
-                if task and name != task:
+            for task_name in tasks:
+                if task and task_name != task:
                     continue
-                moments = task_moments(
-                    published, by_key, sunday, name, approved=True
-                )
-                if any(moment == event_day for moment, _ in moments):
-                    matches.append(sunday)
+                names = []
+                for moment, key in task_moments(
+                    published, by_key, sunday, task_name, approved=True
+                ):
+                    if moment == event_day:
+                        names.append(by_key.get(key, {}).get("name", key))
+                if not names:
+                    continue
+                if telegram_id is not None:
+                    replacements = registry.list_replacements(
+                        service_id, event_day.isoformat(),
+                        source_sunday=sunday,
+                    )
+                    actual_names = apply_replacements(
+                        {task_name: names}, replacements,
+                    ).get(task_name, [])
+                    replacement_ids = {
+                        item["new_name"]: item.get("telegram_id")
+                        for item in replacements
+                        if item["task"] == task_name
+                    }
+                    if not any(
+                        person.get("telegram_id") == telegram_id
+                        for person in people
+                        if person["name"] in actual_names
+                    ) and not any(
+                        replacement_ids.get(name) == telegram_id
+                        for name in actual_names
+                    ):
+                        continue
+                matches.append(sunday)
     if len(set(matches)) > 1:
         raise EventNoteResolutionError(
             "На эту дату приходятся разные воскресные события. "

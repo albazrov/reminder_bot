@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from bot.scheduler import (
+    group_reminder_occurrence,
+    group_reminder_period_offsets,
+    group_reminder_period_status,
     in_reminder_period,
     is_reminder_event_date,
     next_reminder_occurrence,
@@ -205,6 +208,68 @@ class TaskDayProcessingTest(unittest.TestCase):
             self.registry.set_group_reminder_period(
                 SUPER, common, None, date(2026, 11, 1), today=tuesday,
             )
+
+    def test_range_period_stays_active_through_monday_start(self):
+        self.registry.set_responsible_contact(
+            SUPER, "sound", "звук", "Алексей", 501,
+        )
+        sunday = "2026-11-01"
+        slots = {sunday: {"звук": ["Алексей"]}}
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=[sunday],
+            tasks=[{
+                "name": "звук", "needed": 1, "max": 1,
+                "window": [1, 2], "default_day": 1,
+            }],
+            slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", "2026-11", slots,
+            chat_id=None, message_id=None,
+            approved_slot_days={sunday: {"звук": {"Алексей": 1}}},
+        )
+        reminder_id = self.reminder(None)
+        reminder = self.registry.get_group_reminder(reminder_id)
+        period = {
+            **reminder,
+            "active_from": None,
+            "active_until": sunday,
+        }
+        offsets = group_reminder_period_offsets(self.registry, period)
+        self.registry.set_group_reminder_period(
+            SUPER, reminder_id, None, date.fromisoformat(sunday),
+            today=date(2026, 10, 20),
+            period_end_offset=offsets[1],
+        )
+
+        self.assertEqual(offsets, (0, 1))
+        self.assertEqual(
+            group_reminder_period_status(
+                self.registry, self.registry.get_group_reminder(reminder_id),
+                date(2026, 11, 2),
+            ),
+            "active",
+        )
+        self.assertEqual(
+            group_reminder_occurrence(
+                datetime(2026, 11, 2, 9, 0, tzinfo=TZ),
+                self.registry.get_group_reminder(reminder_id),
+                self.registry, "sound",
+            ),
+            (date(2026, 11, 2), date(2026, 11, 2), date(2026, 11, 1)),
+        )
+        self.assertEqual(
+            self.registry.disable_expired_group_reminders(
+                date(2026, 11, 2), {reminder_id: offsets[1]},
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.registry.disable_expired_group_reminders(
+                date(2026, 11, 3), {reminder_id: offsets[1]},
+            ),
+            [reminder_id],
+        )
 
     def test_common_reminder_skips_rehearsal_wednesday(self):
         reminder_id = self.reminder(None)
