@@ -82,6 +82,10 @@ DEFAULT_READINESS_INTRO = (
     "служение в церкви! ❤️\n"
     "👥 {people}"
 )
+DEFAULT_READINESS_RANGE_INTRO = (
+    "График уборки на {month}\n"
+    "Отметьте подходящие дни."
+)
 # Встроенное вступление режима «Наоборот»: отмечают даты, когда НЕ могут.
 DEFAULT_READINESS_INTRO_REVERSE = (
     "🗳 График {service_name} на {month}\n"
@@ -96,6 +100,7 @@ READINESS_CLOSED_FIELDS = frozenset({"service_name", "month"})
 READINESS_QUESTION_FIELDS = frozenset({"service_name", "month", "month_in"})
 DEFAULT_READINESS_QUESTION = "Когда можешь служить в {month_in}?"
 DEFAULT_READINESS_QUESTION_REVERSE = "Когда НЕ можешь служить в {month_in}?"
+DEFAULT_READINESS_RANGE_QUESTION = "Выбери дни уборки в офисе"
 DEFAULT_READINESS_CLOSED = (
     "🗳 Опрос «График {service_name} на {month}» завершён. Спасибо всем, "
     "кто ответил! ❤️ График появится вскоре."
@@ -454,6 +459,7 @@ class ServiceRegistry:
                     -- Фактический сдвиг каждого назначения на момент публикации:
                     -- дата → задача → человек → сдвиг от воскресенья.
                     approved_slot_days_json TEXT,
+                    approved_fixed_days_json TEXT,
                     -- Закреплённая публикация в чате: id всех её частей
                     -- (правится при обновлении) и график первой публикации
                     -- ({"slots", "days"}) — изменения под графиком от него.
@@ -761,7 +767,7 @@ class ServiceRegistry:
                 );
 
                 -- Отправленные отчёты админам служения: редактируются при
-                -- подтверждениях; assignments_json — назначения на дату.
+                -- подтверждениях; диапазонный отчёт хранит назначения по датам.
                 CREATE TABLE IF NOT EXISTS admin_report_messages (
                     service_id TEXT NOT NULL REFERENCES services(id)
                         ON DELETE CASCADE,
@@ -769,6 +775,7 @@ class ServiceRegistry:
                     admin_id INTEGER NOT NULL CHECK (admin_id > 0),
                     message_id INTEGER NOT NULL,
                     assignments_json TEXT NOT NULL,
+                    source_sunday TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (service_id, event_date, admin_id)
                 );
@@ -1096,11 +1103,13 @@ class ServiceRegistry:
                 ("schedule_plans", "served_offsets_json", "TEXT"),
                 ("schedule_plans", "approved_tasks_json", "TEXT"),
                 ("schedule_plans", "approved_slot_days_json", "TEXT"),
+                ("schedule_plans", "approved_fixed_days_json", "TEXT"),
                 ("schedule_plans", "approval_warnings_json", "TEXT"),
                 ("schedule_plans", "message_ids_json", "TEXT"),
                 ("schedule_plans", "baseline_json", "TEXT"),
                 ("schedule_plans", "thread_id", "INTEGER"),
                 ("schedule_plans", "target_thread_id", "INTEGER"),
+                ("admin_report_messages", "source_sunday", "TEXT"),
                 ("service_members", "tasks_manual",
                  "INTEGER NOT NULL DEFAULT 0"),
                 ("readiness_runs", "poll_stopped", "INTEGER NOT NULL DEFAULT 0"),
@@ -3202,22 +3211,28 @@ class ServiceRegistry:
         admin_id: int,
         message_id: int,
         assignments: dict,
+        *,
+        source_sunday: str | None = None,
     ) -> None:
+        if source_sunday is not None:
+            source_sunday = self._event_note_sunday(source_sunday)
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO admin_report_messages (
                     service_id, event_date, admin_id, message_id,
-                    assignments_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    assignments_json, source_sunday, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(service_id, event_date, admin_id) DO UPDATE SET
                     message_id = excluded.message_id,
                     assignments_json = excluded.assignments_json,
+                    source_sunday = excluded.source_sunday,
                     updated_at = excluded.updated_at
                 """,
                 (
                     service_id, event_date, admin_id, message_id,
                     json.dumps(assignments, ensure_ascii=False, sort_keys=True),
+                    source_sunday,
                     _utc_now(),
                 ),
             )
@@ -3235,7 +3250,7 @@ class ServiceRegistry:
     def list_admin_reports(self, service_id: str, event_date: str) -> list[dict]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT admin_id, message_id, assignments_json "
+                "SELECT admin_id, message_id, assignments_json, source_sunday "
                 "FROM admin_report_messages "
                 "WHERE service_id = ? AND event_date = ? ORDER BY admin_id",
                 (service_id, event_date),
@@ -3245,6 +3260,8 @@ class ServiceRegistry:
                 "admin_id": row["admin_id"],
                 "message_id": row["message_id"],
                 "assignments": json.loads(row["assignments_json"]),
+                **({"source_sunday": row["source_sunday"]}
+                   if row["source_sunday"] is not None else {}),
             }
             for row in rows
         ]
@@ -7061,6 +7078,11 @@ class ServiceRegistry:
                 for plan in plans:
                     tasks = json.loads(plan["tasks_json"])
                     for task in tasks:
+                        if "window" in task:
+                            if (new["day_from"], new["day_to"]) == (0, 0):
+                                task.pop("window")
+                            else:
+                                task["window"] = [new["day_from"], new["day_to"]]
                         if new["day_from"]:
                             task["default_day"] = new["day_from"]
                         else:
@@ -7410,6 +7432,10 @@ class ServiceRegistry:
         approved_slot_days = plan.pop("approved_slot_days_json", None)
         plan["approved_slot_days"] = (
             json.loads(approved_slot_days) if approved_slot_days else {}
+        )
+        approved_fixed_days = plan.pop("approved_fixed_days_json", None)
+        plan["approved_fixed_days"] = (
+            json.loads(approved_fixed_days) if approved_fixed_days else {}
         )
         plan["approval_warnings"] = json.loads(
             plan.pop("approval_warnings_json", None) or "[]"
@@ -7800,6 +7826,7 @@ class ServiceRegistry:
                 "served_offsets_json = excluded.served_offsets_json, "
                 "approved_tasks_json = excluded.approved_tasks_json, "
                 "approved_slot_days_json = excluded.approved_slot_days_json, "
+                "approved_fixed_days_json = NULL, "
                 "approval_warnings_json = excluded.approval_warnings_json, "
                 "updated_at = excluded.updated_at",
                 (
@@ -7839,6 +7866,7 @@ class ServiceRegistry:
                 "approved_by = NULL, approved_at = NULL, "
                 "approved_days_json = NULL, approved_tasks_json = NULL, "
                 "served_offsets_json = NULL, approved_slot_days_json = NULL, "
+                "approved_fixed_days_json = NULL, "
                 "approval_warnings_json = NULL, "
                 "baseline_json = NULL, "
                 # Загруженный из Excel перестаёт быть итоговым: дальше
@@ -7866,6 +7894,7 @@ class ServiceRegistry:
         days: dict | None = None,
         served_offsets: dict | None = None,
         approved_slot_days: dict | None = None,
+        approved_fixed_days: dict | None = None,
         message_ids: list[int] | None = None,
         baseline: dict | None = None,
         thread_id: int | None = None,
@@ -7896,6 +7925,7 @@ class ServiceRegistry:
                 "baseline_json = COALESCE(?, baseline_json), "
                 "approved_days_json = ?, served_offsets_json = ?, "
                 "approved_slot_days_json = ?, "
+                "approved_fixed_days_json = ?, "
                 "approval_warnings_json = ?, "
                 "republish = CASE WHEN ? IS NULL OR updated_at = ? THEN 0 "
                 "ELSE republish END "
@@ -7910,6 +7940,7 @@ class ServiceRegistry:
                     json.dumps(days or {}, ensure_ascii=False),
                     json.dumps(served_offsets or {}, ensure_ascii=False),
                     json.dumps(approved_slot_days or {}, ensure_ascii=False),
+                    json.dumps(approved_fixed_days or {}, ensure_ascii=False),
                     json.dumps(warnings, ensure_ascii=False),
                     updated_at, updated_at, service_id, month,
                 ),

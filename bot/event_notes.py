@@ -96,11 +96,14 @@ def source_sunday_for_event(registry, service_id: str, event_day: date,
 def resolve_event_note(registry, service_id: str, event_day: date,
                        task: str | None = None, *, template: str | None = None,
                        public_url: str | None = None,
-                       include_scheduled: bool = True) -> str:
+                       include_scheduled: bool = True,
+                       source_sunday: str | None = None) -> str:
     if template is not None and "{event_notes" not in template:
         return ""
-    source_sunday = source_sunday_for_event(
-        registry, service_id, event_day, task
+    source_sunday = (
+        validate_event_sunday(source_sunday).isoformat()
+        if source_sunday is not None
+        else source_sunday_for_event(registry, service_id, event_day, task)
     )
     if source_sunday is None:
         return ""

@@ -7248,6 +7248,34 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text = preview.message.answer.await_args.args[0]
             self.assertIn(f"• {first_sunday:%d.%m} — звук\n", text)
             self.assertIn("всем вашим задачам", text)
+            self.registry.set_service_task_enabled(67890, "sound", "сборка", False)
+            preview = await press("rdy:overview:sound")
+            text = preview.message.answer.await_args.args[0]
+            self.assertIn(f"• {first_sunday:%d.%m}\n", text)
+            self.assertNotIn(f"• {first_sunday:%d.%m} — звук", text)
+            self.assertNotIn("Одна дата относится", text)
+            self.context.bot.send_poll.assert_not_awaited()
+            self.registry.set_readiness_settings(
+                67890, "sound", day_from=-3, day_to=1,
+            )
+            card = await press("rdy:open:sound")
+            self.assertIn("📋 Варианты: диапазоны", card.message.answer.await_args.args[0])
+            formats = await press("rdy:format:sound")
+            self.assertIn("периоды автоматически", formats.message.answer.await_args.args[0])
+            format_buttons = [
+                button.callback_data
+                for row in formats.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+            ]
+            self.assertEqual(format_buttons, ["rdy:days:sound", "rdy:open:sound"])
+            stale = await press("rdy:fmt:sound:tasks")
+            self.assertIn("Формат изменился", stale.answer.await_args.args[0])
+            self.assertTrue(self.registry.get_readiness_settings("sound")["dates_only"])
+            self.registry.set_readiness_settings(
+                67890, "sound", day_from=0, day_to=0,
+            )
+            self.registry.set_service_task_enabled(67890, "sound", "сборка", True)
             await press("rdy:fmt:sound:tasks")
 
             self.registry.sync_service_rosters({"sound": [

@@ -44,8 +44,10 @@ from .service_registry import (  # noqa: F401 — шаблоны для экра
     READINESS_PHRASES,
     DEFAULT_READINESS_QUESTION,
     DEFAULT_READINESS_QUESTION_REVERSE,
+    DEFAULT_READINESS_RANGE_QUESTION,
     DEFAULT_READINESS_INTRO,
     DEFAULT_READINESS_INTRO_REVERSE,
+    DEFAULT_READINESS_RANGE_INTRO,
     DEFAULT_READINESS_REMINDER,
 )
 from .ui import send_telegram_screen, user_link, visible_units
@@ -218,6 +220,14 @@ def option_weeks(
     return by_option, by_date
 
 
+def option_windows(options: list[dict]) -> dict[str, tuple[int, int]]:
+    return {
+        week: tuple(option["window"])
+        for option in options if "window" in option
+        for week in option.get("weeks", ())
+    }
+
+
 def answer_dates(
     option_ids, options, *, reverse_poll: bool = False,
     all_dates_option: bool | None = None,
@@ -269,6 +279,7 @@ class Summary:
     bundles: dict = field(default_factory=dict)
     reverse_poll: bool = False
     date_options: bool = False
+    range_slots: frozenset[tuple[str, str]] = frozenset()
 
 
 def week_bundles(registry, service_id: str,
@@ -300,6 +311,7 @@ def slot_availability(available: dict[str, list[str]],
     week_set = set(weeks)
     options_by_date: dict[str, set[tuple[date, str]]] = {}
     date_only = {option["date"] for option in options if option.get("date_only")}
+    range_dates = {option["date"] for option in options if "window" in option}
     for option in options:
         day = option["date"]
         options_by_date.setdefault(day, set()).update(option_slots(option))
@@ -316,9 +328,14 @@ def slot_availability(available: dict[str, list[str]],
                 for week, task_name in options_by_date.get(day, ()):
                     if (
                         task_name in people[key]["tasks"]
-                        and slot_dates.get((week, task_name, key), week) == actual_date
+                        and (
+                            day in range_dates
+                            or slot_dates.get((week, task_name, key), week) == actual_date
+                        )
                     ):
-                        allowed.add((actual_date, task_name))
+                        allowed.add((
+                            slot_dates.get((week, task_name, key), week), task_name,
+                        ))
             elif actual_date in week_set:
                 for task_name in people[key]["tasks"]:
                     allowed.add((
@@ -376,6 +393,11 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
     summary.reverse_poll = bool(run.get("reverse_poll"))
     options = run.get("options") or []
     summary.date_options = bool(options)
+    summary.range_slots = frozenset(
+        (week.isoformat(), task)
+        for option in options if "window" in option
+        for week, task in option_slots(option)
+    )
     option_week_map, date_week_map = option_weeks(options)
     option_dates = run_option_dates(run)
     options_by_date: dict[str, set[str]] = {}
@@ -464,6 +486,7 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
             else settings["allocation_priority"]
         )
         by_person = {person["key"]: person for person in people}
+        range_windows = option_windows(options)
         slot_dates = {}
         for sunday in week_dates:
             for task in catalog:
@@ -474,7 +497,9 @@ def summarize(registry, run: dict, *, with_plan: bool = True,
                     if offset is None:
                         offset = person["day_offset"]
                     if offset is None:
-                        offset = settings["day_from"]
+                        offset = range_windows.get(
+                            sunday.isoformat(), (settings["day_from"], settings["day_to"])
+                        )[0]
                     slot_dates[(sunday, task["name"], person["key"])] = (
                         sunday + timedelta(days=offset)
                     )
@@ -699,12 +724,44 @@ def option_label(day: str, window: tuple[int, int] = (0, 0)) -> str:
     )
 
 
+def uses_window_options(tasks: list[dict], settings: dict) -> bool:
+    return (
+        len(tasks) == 1 and tasks[0]["day"] is None
+        and (settings["day_from"], settings["day_to"]) != (0, 0)
+    )
+
+
 def poll_options(registry, service_id: str, year: int, month: int,
                  *, validate_limit: bool = True) -> list[dict]:
     """Доступность по фактическим датам, с задачами или без них."""
     settings = registry.get_readiness_settings(service_id)
     tasks = registry.plan_tasks(service_id)
     people = registry.readiness_people(service_id)
+    window = (settings["day_from"], settings["day_to"])
+    if uses_window_options(tasks, settings):
+        task = tasks[0]["name"]
+        weekdays = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+        items = []
+        if any(task in person["tasks"] for person in people):
+            for sunday in month_sundays(year, month):
+                start = sunday + timedelta(days=window[0])
+                end = sunday + timedelta(days=window[1])
+                items.append({
+                    "date": sunday.isoformat(), "date_only": True,
+                    "tasks": [task], "weeks": [sunday.isoformat()],
+                    "task_weeks": {task: [sunday.isoformat()]},
+                    "window": list(window),
+                    "label": (
+                        f"{start:%d.%m} ({weekdays[start.weekday()]}) – "
+                        f"{end:%d.%m} ({weekdays[end.weekday()]})"
+                    ),
+                })
+        if validate_limit and len(items) + 2 > 12:
+            raise ValueError(
+                "Опрос не запущен: Telegram допускает не более 12 вариантов, "
+                "а для выбранных дат задач их получилось больше."
+            )
+        return items
     by_day_task: dict[tuple[date, str], dict] = {}
     for sunday in month_sundays(year, month):
         for task in tasks:
@@ -744,7 +801,11 @@ def poll_options(registry, service_id: str, year: int, month: int,
     result = []
     for item in sorted(items, key=lambda item: (item["date"], item.get("task", ""))):
         actual_day = date.fromisoformat(item["date"])
-        label = f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
+        label = (
+            f"{actual_day:%d.%m}"
+            if item.get("date_only") and len(tasks) == 1
+            else f"{actual_day:%d.%m} — {', '.join(item['tasks'])}"
+        )
         if item.get("date_only") and visible_units(label) > 100:
             prefix = f"{actual_day:%d.%m} — "
             included = []
@@ -769,8 +830,15 @@ def poll_options(registry, service_id: str, year: int, month: int,
 
 
 def grouped_options_note(options: list[dict]) -> str:
-    grouped = [item for item in options if item.get("date_only")]
+    grouped = [
+        item for item in options if item.get("date_only") and "window" not in item
+    ]
     if not grouped:
+        return ""
+    if all(
+        item["label"] == f"{date.fromisoformat(item['date']):%d.%m}"
+        for item in grouped
+    ):
         return ""
     lines = [
         "Одна дата относится ко всем вашим задачам в этот день.",
@@ -841,17 +909,26 @@ def own_days_note(people: list[dict], title: str | None = None) -> str:
 def intro_text(service: dict, people: list[dict], year: int, month: int,
                deadline: datetime, tz, template: str | None = None,
                own_days_label: str | None = None,
-               reverse_poll: bool = False) -> str:
+               reverse_poll: bool = False, *,
+               range_poll: bool = False) -> str:
     mentions = [
         user_link(person["telegram_id"], person["name"])
         if person["telegram_id"] else person["name"]
         for person in people if person["tasks"]
     ]
+    default = (
+        DEFAULT_READINESS_INTRO_REVERSE if reverse_poll
+        else DEFAULT_READINESS_INTRO
+    )
+    selected_template = template
+    if (
+        range_poll and not reverse_poll
+        and service.get("id") == "office_cleaning"
+        and template in (None, DEFAULT_READINESS_INTRO)
+    ):
+        selected_template = DEFAULT_READINESS_RANGE_INTRO
     text = render_template(
-        template or (
-            DEFAULT_READINESS_INTRO_REVERSE if reverse_poll
-            else DEFAULT_READINESS_INTRO
-        ),
+        selected_template or default,
         service_name=service["name"],
         month=month_title(year, month),
         deadline=local_text(deadline, tz),
@@ -872,7 +949,8 @@ def intro_text(service: dict, people: list[dict], year: int, month: int,
 
 def question_text(service: dict, year: int, month: int,
                   template: str | None = None,
-                  reverse_poll: bool = False) -> str:
+                  reverse_poll: bool = False, *,
+                  range_poll: bool = False) -> str:
     """Вопрос Telegram-опроса над вариантами (не длиннее 300 символов —
     предел Telegram)."""
     values = dict(
@@ -884,7 +962,14 @@ def question_text(service: dict, year: int, month: int,
         DEFAULT_READINESS_QUESTION_REVERSE if reverse_poll
         else DEFAULT_READINESS_QUESTION
     )
-    text = render_template(template or default, **values)
+    selected_template = template
+    if (
+        range_poll and not reverse_poll
+        and service.get("id") == "office_cleaning"
+        and template in (None, DEFAULT_READINESS_QUESTION)
+    ):
+        selected_template = DEFAULT_READINESS_RANGE_QUESTION
+    text = render_template(selected_template or default, **values)
     if not text.strip():
         # Пустой вопрос Telegram не примет — опрос не запустился бы.
         text = render_template(default, **values)
@@ -978,6 +1063,7 @@ async def launch_run(
             service, people, year, month, deadline, tz,
             settings.get("intro_template"), phrase(settings, "own_days"),
             settings["reverse_poll"],
+            range_poll=any("window" in option for option in options),
         )
         note = grouped_options_note(options)
         if note:
@@ -993,6 +1079,7 @@ async def launch_run(
             question_text(
                 service, year, month, settings.get("question_template"),
                 settings["reverse_poll"],
+                range_poll=any("window" in option for option in options),
             ),
             service, registry=registry, logger=logger,
             options=[
@@ -1299,6 +1386,7 @@ def free_days(registry, run: dict, summary: Summary) -> list[str]:
     weeks = tuple(date.fromisoformat(day) for day in run["dates"])
     options = run.get("options") or []
     option_week_map, date_week_map = option_weeks(options)
+    range_windows = option_windows(options)
     free = {
         key: frozenset(
             week for day in days
@@ -1319,7 +1407,9 @@ def free_days(registry, run: dict, summary: Summary) -> list[str]:
                 if offset is None:
                     offset = person["day_offset"]
                 if offset is None:
-                    offset = settings["day_from"]
+                    offset = range_windows.get(
+                        sunday.isoformat(), (settings["day_from"], settings["day_to"])
+                    )[0]
                 slot_dates[(sunday, task["name"], key)] = (
                     sunday + timedelta(days=offset)
                 )

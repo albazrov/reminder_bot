@@ -105,6 +105,7 @@ from .service_registry import (
     validate_notification_template,
 )
 from .scheduler import (
+    group_reminder_occurrence,
     periods_overlap,
     reminder_day_offset,
     reminder_occurrence,
@@ -1274,17 +1275,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         upcoming = [
             (*occurrence, item)
             for item in enabled_reminders
-            if (occurrence := reminder_occurrence(now, item)) is not None
+            if (occurrence := upcoming_group_reminder(registry, item, now)) is not None
         ]
         if upcoming:
-            event_date, send_date, reminder = min(
+            event_date, send_date, source_sunday, period_label, reminder = min(
                 upcoming,
-                key=lambda entry: (entry[1], entry[2]["reminder_time"]),
+                    key=lambda entry: (entry[1], entry[4]["reminder_time"]),
             )
-            schedule = (
-                f"{send_date:%d.%m.%Y} в {reminder['reminder_time']} "
-                f"(собрание {event_date:%d.%m.%Y})"
-            )
+            schedule = f"{send_date:%d.%m.%Y} в {reminder['reminder_time']}"
+            if period_label is None:
+                schedule += f" (собрание {event_date:%d.%m.%Y})"
             if not service["enabled"]:
                 lines.append(
                     f"⚠️ Отправка не выполняется: служение выключено "
@@ -1297,6 +1297,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 )
             else:
                 lines.append(f"✉️ Ближайшая отправка · {schedule}")
+            if period_label is not None:
+                lines.append(f"📆 Период · {period_label}")
         personal_templates = service["personal_templates"]
         admins_count = len(registry.list_service_admins(service_id))
         lines.extend(
@@ -2644,6 +2646,35 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             return f"дня задачи — {member_day_label(offset)}"
         return "воскресенья"
 
+    def upcoming_group_reminder(registry, reminder: dict, now: datetime):
+        range_occurrence = group_reminder_occurrence(
+            now, reminder, registry, reminder["service_id"],
+        )
+        if range_occurrence is not None and range_occurrence[2] is not None:
+            event_date, send_date, source_sunday = range_occurrence
+        else:
+            occurrence = reminder_occurrence(now, reminder)
+            if occurrence is None:
+                return None
+            event_date, send_date = occurrence
+            source_sunday = None
+        snapshot = (
+            schedule_plan.approved_range_week(
+                registry, reminder["service_id"], source_sunday,
+            )
+            if source_sunday is not None else None
+        )
+        period_label = None
+        if snapshot is not None:
+            window = snapshot[0]
+            start = source_sunday + timedelta(days=window[0])
+            end = source_sunday + timedelta(days=window[1])
+            period_label = (
+                f"{start:%d.%m} ({schedule_plan.WEEKDAYS[start.weekday()]}) – "
+                f"{end:%d.%m} ({schedule_plan.WEEKDAYS[end.weekday()]})"
+            )
+        return event_date, send_date, source_sunday, period_label
+
     # Лимит служений в месяц (решение 12): готовые диапазоны и «Вручную» —
     # минимум, затем максимум кнопками.
     LIMIT_PRESETS = ((0, 2), (1, 2), (1, 3))
@@ -3973,11 +4004,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         pending["step"] = "group_reminder_card"
         pending["reminder_id"] = reminder_id
         now = datetime.now(context.timezone)
-        occurrence = reminder_occurrence(now, reminder)
+        occurrence = upcoming_group_reminder(registry, reminder, now)
         send_text = (
             f"{occurrence[1]:%d.%m.%Y} в {reminder['reminder_time']}"
             if occurrence else "— (период завершён)"
         )
+        range_mode = bool(occurrence and occurrence[3])
         body_status = (
             "собственный" if reminder["body"] else
             "используется шаблон по умолчанию"
@@ -3986,16 +4018,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             reminder, service
         )
         task_status = (
-            f"«{reminder['task']}»" if reminder.get("task") else "все задачи"
+            f"«{reminder['task']}»" if reminder.get("task")
+            else "всего задач 1" if range_mode else "все задачи"
+        )
+        anchor = (
+            "начала периода" if range_mode else reminder_anchor_text(reminder)
         )
         text = (
             f"📝 Напоминание · {service_label(service)}\n\n"
             f"📌 Задача: {task_status}\n"
             f"📅 Срок: за {reminder['reminder_days']} дн. до "
-            f"{reminder_anchor_text(reminder)}\n"
+            f"{anchor}\n"
             f"🗓 Период: {period_text(reminder, now.date())}\n"
             f"✉️ Отправка: {send_text}\n"
-            f"🗑 Удаление в чате: {group_reminder_ttl_text(reminder, service)}\n"
+            + (f"📆 Период работы: {occurrence[3]}\n" if range_mode else "")
+            + f"🗑 Удаление в чате: {group_reminder_ttl_text(reminder, service)}\n"
             f"📝 Текст: {body_status}\n"
             f"🔔 Статус: {'включено' if reminder['enabled'] else 'выключено'}"
             f"\n\nТекущий текст напоминания:\n{current_text}"
@@ -4186,8 +4223,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         result = None
         current = registry.get_group_reminder(reminder_id) if registry else None
         snapshot = send_now_snapshot(current)
-        period_ended = current is not None and reminder_occurrence(
-            datetime.now(context.timezone), current
+        period_ended = current is not None and upcoming_group_reminder(
+            registry, current, datetime.now(context.timezone)
         ) is None
         if callable(loader) and not period_ended:
             try:
@@ -4235,6 +4272,8 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "reminder_id": reminder_id, "text": result["text"],
                 "snapshot": snapshot,
                 "event_date": result.get("event_date"),
+                "source_sunday": result.get("source_sunday"),
+                "period": result.get("period"),
                 "ttl_hours": ttl_hours,
                 "schedule_state": result.get("schedule_state"),
                 "assignment_state": result.get("assignment_state"),
@@ -4242,9 +4281,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 "task": reminder.get("task"),
             }
             text = (
-                f"📤 Отправить сейчас в чат служения? Так оно будет "
-                f"выглядеть на {result['date']}:\n\n"
-                f"🗑 Удаление в чате: "
+                f"📤 Отправить сейчас в чат служения?\n\n"
+                + (
+                    f"📆 Период: {result['period']}\n\n"
+                    if result.get("period")
+                    else f"📅 Собрание: {result['date']}\n\n"
+                )
+                + f"🗑 Удаление в чате: "
                 f"{group_reminder_ttl_text(reminder, service)}.\n\n"
                 "──────────────────\n\n"
                 f"{result['text']}\n\n"
@@ -5849,6 +5892,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
     DAY_WINDOWS = {
         (0, 0): "только вс", (-1, 0): "сб–вс", (0, 1): "вс–пн",
         (-1, 1): "сб–пн", (-2, 0): "пт–вс", (-2, 1): "пт–пн",
+        (-3, 1): "чт–пн",
     }
     READINESS_TIMES = ("09:00", "10:00", "12:00", "18:00", "19:00", "20:00")
     READINESS_DEADLINES = ("12:00", "18:00", "20:00", "21:00", "22:00", "23:00")
@@ -6122,6 +6166,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         if free_plan is not None:
             lines.append(plan_status(free_plan))
         window = (settings["day_from"], settings["day_to"])
+        range_options = readiness.uses_window_options(
+            registry.plan_tasks(service_id), settings
+        )
+        next_format = (
+            "диапазоны" if range_options else
+            "только даты" if settings["dates_only"] else "даты и задачи"
+        )
         lines.append("📆 Дни служения: " + DAY_WINDOWS.get(window, "свои"))
         lines.append(
             "🔢 Служений в месяц: "
@@ -6135,6 +6186,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         )
         if run is not None and run["status"] == "open":
             current_options = run.get("options") or []
+            current_range = any("window" in option for option in current_options)
             current_dates_only = any(
                 option.get("date_only") for option in current_options
             )
@@ -6147,13 +6199,14 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             lines.append(
                 "📋 Варианты текущего опроса: "
-                + ("только даты" if current_dates_only else "даты и задачи")
+                + ("диапазоны" if current_range else
+                   "только даты" if current_dates_only else "даты и задачи")
             )
             lines.append(
                 "⚙️ Следующий опрос: «Наоборот» "
                 + ("включён" if settings["reverse_poll"] else "выключен")
                 + ", варианты — "
-                + ("только даты" if settings["dates_only"] else "даты и задачи")
+                + next_format
             )
         else:
             lines.append(
@@ -6165,7 +6218,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             )
             lines.append(
                 "📋 Варианты: "
-                + ("только даты" if settings["dates_only"] else "даты и задачи")
+                + next_format
             )
         current_key = f"{now.year:04d}-{now.month:02d}"
         current_plan = registry.get_schedule_plan(service_id, current_key)
@@ -6289,18 +6342,21 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         deadline = readiness.preview_deadline(
             run, settings, year, month, now,
         )
+        options = readiness.poll_options(
+            registry, service_id, year, month,
+            validate_limit=False,
+        )
+        range_poll = any("window" in option for option in options)
         intro = readiness.intro_text(
             service, registry.readiness_people(service_id), year, month,
             deadline, context.timezone, settings.get("intro_template"),
             readiness.phrase(settings, "own_days"), settings["reverse_poll"],
+            range_poll=range_poll,
         )
         question = readiness.question_text(
             service, year, month, settings.get("question_template"),
             settings["reverse_poll"],
-        )
-        options = readiness.poll_options(
-            registry, service_id, year, month,
-            validate_limit=False,
+            range_poll=range_poll,
         )
         note = readiness.grouped_options_note(options)
         if note:
@@ -7320,7 +7376,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
             schedule_plan.excel_text(registry, service, plan, people),
             limit=TELEGRAM_TEXT_LIMIT,
         )
-        if not schedule_plan.has_sheet_columns(registry, service["id"]):
+        if (
+            not schedule_plan.has_sheet_columns(registry, service["id"])
+            or schedule_plan.has_unresolved_range(plan, people)
+        ):
             # У служения нет колонки на листе графика — файл не нужен.
             return
         data = await asyncio.to_thread(
@@ -8836,6 +8895,23 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             elif action == "format":
+                if readiness.uses_window_options(
+                    registry.plan_tasks(service_id), settings
+                ):
+                    await _send_dialog(
+                        callback.message,
+                        f"📋 {service_label(service)} › График › Опрос › Варианты\n\n"
+                        "Для служения с одной задачей и диапазоном дней опрос "
+                        "показывает периоды автоматически.\n\n"
+                        "Чтобы вернуться к вариантам по датам, измените дни служения.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [readiness_button("📆 Дни служения", "days", service_id)],
+                            [readiness_button("⬅️ К опросу", "open", service_id)],
+                        ]),
+                        _dialog_text_limit=TELEGRAM_TEXT_LIMIT,
+                    )
+                    await _answer_callback(callback)
+                    return
                 await _send_dialog(
                     callback.message,
                     f"📋 {service_label(service)} › График › Опрос › Варианты\n\n"
@@ -8862,6 +8938,11 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 await _answer_callback(callback)
                 return
             elif action == "fmt":
+                if readiness.uses_window_options(
+                    registry.plan_tasks(service_id), settings
+                ):
+                    await _answer_callback(callback, "⚠️ Формат изменился — откройте варианты заново")
+                    return
                 if arg not in {"dates", "tasks"}:
                     await _answer_callback(callback, "⚠️ Неизвестный формат")
                     return
@@ -9518,9 +9599,13 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     )
                     where = "в чате служения перед опросом"
                 elif arg == "q":
+                    range_poll = readiness.uses_window_options(
+                        registry.plan_tasks(service_id), settings,
+                    )
                     body = readiness.question_text(
                         service, year, month, settings["question_template"],
                         settings["reverse_poll"],
+                        range_poll=range_poll,
                     )
                     where = "вопрос над вариантами опроса"
                 elif arg in {"rem", "chat"}:
@@ -10971,7 +11056,10 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     check_state = getattr(context, "group_preview_state", None)
                     if check_state is not None and (
                         prepared.get("event_date") is None
-                        or check_state(service_id, prepared["event_date"])
+                        or check_state(
+                            service_id, prepared["event_date"],
+                            prepared.get("source_sunday"),
+                        )
                         != prepared.get("schedule_state")
                     ):
                         await _answer_callback(
@@ -10983,6 +11071,7 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                         if field_state is None or field_state(
                             service_id, prepared["event_date"],
                             prepared["template"], prepared["task"],
+                            prepared.get("source_sunday"),
                         ) != prepared["assignment_state"]:
                             await _answer_callback(
                                 callback,
@@ -11092,16 +11181,25 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 service = registry.get_service(service_id)
                 if service is None:
                     raise ValueError("Служение не найдено.")
-                occurrence = reminder_occurrence(
-                    datetime.now(context.timezone), reminder
+                occurrence = upcoming_group_reminder(
+                    registry, reminder, datetime.now(context.timezone)
                 )
                 if occurrence is None:
                     raise ValueError("Период напоминания завершён.")
-                event_date, send_date = occurrence
+                event_date, send_date, source_sunday, period_label = occurrence
                 preview_dates = {
-                    "date": event_date.strftime("%d.%m.%Y"),
+                    "date": period_label or event_date.strftime("%d.%m.%Y"),
                     "send_date": send_date.strftime("%d.%m.%Y"),
                     "time": reminder["reminder_time"],
+                    "period": period_label,
+                    "event_date": (
+                        source_sunday.isoformat()
+                        if source_sunday is not None else event_date.isoformat()
+                    ),
+                    "source_sunday": (
+                        source_sunday.isoformat()
+                        if source_sunday is not None else None
+                    ),
                 }
                 preview_request_id = secrets.token_urlsafe(12)
                 pending["preview_request_id"] = preview_request_id
@@ -11196,8 +11294,12 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                 preview_date = result.get("date", "")
                 header = (
                     f"👁 Предпросмотр · {service_label(service)}\n\n"
-                    f"📅 Собрание: {preview_date}\n"
-                    f"✉️ Отправка: {result.get('send_date', '—')} "
+                    + (
+                        f"📆 Период: {preview_date}\n"
+                        if result.get("period") else
+                        f"📅 Собрание: {preview_date}\n"
+                    )
+                    + f"✉️ Отправка: {result.get('send_date', '—')} "
                     f"в {result['time']}\n\n"
                     "──────────────────\n\n"
                 )
@@ -17870,13 +17972,17 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                                 )
                     except Exception:  # noqa: BLE001
                         debug.exception("Не удалось запустить поиск замены")
-            try:
-                await refresh_admin_reports(
-                    context.bot, registry, service_id, event_date,
-                    context.admin_id, debug, TELEGRAM_TEXT_LIMIT,
-                )
-            except Exception:  # noqa: BLE001
-                debug.exception("Не удалось обновить отчёт админам")
+            for answered_task, _, answer_changed in answers:
+                if not answer_changed:
+                    continue
+                try:
+                    await refresh_admin_reports(
+                        context.bot, registry, service_id, event_date,
+                        context.admin_id, debug, TELEGRAM_TEXT_LIMIT,
+                        task=answered_task,
+                    )
+                except Exception:  # noqa: BLE001
+                    debug.exception("Не удалось обновить отчёт админам")
         await _answer_callback(
             cb, "✅ Спасибо!" if status == "confirmed" else "Ответ сохранён"
         )
@@ -17991,7 +18097,7 @@ async def _confirm_locked(
                     await refresh_admin_reports(
                         context.bot, registry, participant["service_id"],
                         date.fromisoformat(sunday_iso), context.admin_id,
-                        debug, TELEGRAM_TEXT_LIMIT,
+                        debug, TELEGRAM_TEXT_LIMIT, task=participant["task"],
                     )
         except Exception:  # noqa: BLE001
             debug.exception("Не удалось записать подтверждение в реестр")

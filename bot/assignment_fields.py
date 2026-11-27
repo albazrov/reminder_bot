@@ -46,8 +46,9 @@ class AssignmentFields:
 def resolve_assignment_fields(
     registry: ServiceRegistry, service_id: str, event_day: date, template: str, cutoff: date,
     task: str | None = None,
+    *, source_sunday: str | None = None,
 ) -> AssignmentFields:
-    from .event_notes import source_sunday_for_event
+    from .event_notes import source_sunday_for_event, validate_event_sunday
     from .presentation import display_name, person_label, task_emoji
     from .schedule_plan import _effective_plan_assignments
     from .excel_parser import is_informational_name
@@ -62,7 +63,11 @@ def resolve_assignment_fields(
     result = AssignmentFields()
     if "week_task_assignments" not in fields and not references:
         return result
-    sunday = source_sunday_for_event(registry, service_id, event_day, task)
+    sunday = (
+        validate_event_sunday(source_sunday).isoformat()
+        if source_sunday is not None
+        else source_sunday_for_event(registry, service_id, event_day, task)
+    )
     if sunday is None:
         raise AssignmentFieldResolutionError(
             "Не найдено воскресное событие утверждённого графика."

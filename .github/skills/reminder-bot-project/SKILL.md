@@ -122,6 +122,11 @@ Raspberry Pi specifics:
 
 ## UI principles (every screen you add or change)
 
+- **Sketch and agree first.** Before implementing any new or changed screen
+  or menu, add a clearly marked proposal to a project document, show it to
+  the user and wait for explicit approval. Keep the existing approved sketches
+  distinct from proposals; after approval, update the applicable sketches
+  and guides alongside the implementation.
 - **Friendly to the user.** Users are service admins and church members, not
   engineers: plain words («за день до воскресенья», not «offset»/«дн.»), each
   screen says what it is and what to do next, errors give the reason and the

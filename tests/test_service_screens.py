@@ -94,6 +94,40 @@ class ServiceScreensTest(unittest.TestCase):
             self.registry, 1001, "sound", self.now.date(),
         ))
 
+    def test_poll_card_keeps_current_range_after_settings_change(self):
+        from bot import readiness
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Анна", ("звук",)),
+        ]})
+        self.registry.set_readiness_settings(
+            1001, "sound", day_from=-3, day_to=1,
+        )
+        self.context.bot.send_message.return_value = SimpleNamespace(message_id=11)
+        self.context.bot.send_poll = AsyncMock(return_value=SimpleNamespace(
+            message_id=12, poll=SimpleNamespace(id="range-poll"),
+        ))
+
+        async def run():
+            await readiness.launch_run(
+                self.context.bot, self.registry, self.registry.get_service("sound"),
+                2026, 12, self.now, self.now.tzinfo,
+                self.context.debug_logger, 4096,
+            )
+            self.registry.set_readiness_settings(
+                1001, "sound", day_from=0, day_to=0,
+            )
+            card = await self.press("rdy:open:sound")
+            text = self.text(card)
+            self.assertIn("Варианты текущего опроса: диапазоны", text)
+            self.assertIn("варианты — даты и задачи", text)
+            formats = await self.press("rdy:format:sound")
+            self.assertIn("Даты и задачи", self.text(formats))
+
+        asyncio.run(run())
+
     def test_graph_uses_approved_copy_replacements_and_no_excel(self):
         async def run():
             self.registry.set_responsible_contact(
@@ -325,7 +359,8 @@ class ServiceScreensTest(unittest.TestCase):
                              ["Алексей", "Борис"])
             self.assertEqual(current["approved"], approved)
             self.assertTrue(current["dirty"])
-            self.assertIn("Микшер", saved.answer.await_args.args[0])
+            self.assertNotIn("Микшер", saved.answer.await_args.args[0])
+            self.assertIn("Борис", saved.answer.await_args.args[0])
 
         asyncio.run(run())
 

@@ -95,6 +95,15 @@ class AssignmentFieldsTest(unittest.TestCase):
         for name in ("звук", "сборка", "спевка"):
             self.assertIn(name, text)
 
+    def test_explicit_source_week_resolves_without_event_on_anchor(self):
+        result = resolve_assignment_fields(
+            self.registry, "sound", date(2026, 12, 30),
+            "{week_task_assignments}", date(2026, 12, 30),
+            source_sunday=SUNDAY.isoformat(),
+        )
+        self.assertIn("звук — A", plain_text(result.week))
+        self.assertIn("спевка — 31.12 — C", plain_text(result.week))
+
     def test_approved_snapshot_ignores_draft_and_changed_personal_day(self):
         expected = self.resolve()
         self.plan("sound", {"звук": ["B"], "спевка": []}, approve=False)

@@ -144,6 +144,94 @@ def reminder_occurrence(now: datetime, reminder: dict) -> tuple[date, date] | No
     )
 
 
+def group_reminder_occurrence(
+    now: datetime, reminder: dict, registry, service_id: str,
+) -> tuple[date, date, date | None] | None:
+    """Ближайшее напоминание: начало утверждённого окна или обычный день."""
+    from .schedule_plan import approved_range_week
+
+    days = reminder["reminder_days"]
+    target = now.date() + timedelta(days=days)
+    start = target - timedelta(days=6)
+    sunday = start + timedelta(days=(6 - start.weekday()) % 7)
+    active_from = _period_bound(reminder.get("active_from"))
+    active_until = _period_bound(reminder.get("active_until"))
+    ordinary = next_reminder_occurrence(
+        now, days, reminder["reminder_time"],
+        active_from=reminder.get("active_from"),
+        active_until=reminder.get("active_until"),
+        day_offset=reminder_day_offset(reminder),
+    )
+    while ordinary is not None:
+        ordinary_event, _ = ordinary
+        ordinary_sunday = ordinary_event - timedelta(
+            days=reminder_day_offset(reminder)
+        )
+        ordinary_range = approved_range_week(
+            registry, service_id, ordinary_sunday,
+        )
+        if ordinary_range is None or (
+            reminder.get("task")
+            and reminder["task"] != ordinary_range[1]
+        ):
+            break
+        cursor = reminder_send_datetime(
+            ordinary_event, days, reminder["reminder_time"], now.tzinfo,
+        ) + timedelta(seconds=1)
+        ordinary = next_reminder_occurrence(
+            cursor, days, reminder["reminder_time"],
+            active_from=reminder.get("active_from"),
+            active_until=reminder.get("active_until"),
+            day_offset=reminder_day_offset(reminder),
+        )
+    best: tuple[datetime, date, date | None] | None = None
+    if ordinary is not None:
+        ordinary_event, _ = ordinary
+        best = (
+            reminder_send_datetime(
+                ordinary_event, days, reminder["reminder_time"], now.tzinfo,
+            ),
+            ordinary_event,
+            None,
+        )
+        # A window can begin up to six days before its source Sunday and
+        # up to six days after it. Later Sundays cannot beat this occurrence.
+        latest_sunday = ordinary_event + timedelta(days=6)
+    elif active_until is not None:
+        latest_sunday = active_until
+    else:
+        return None
+    if active_from is not None and sunday < active_from:
+        sunday = active_from
+    while sunday <= latest_sunday and (
+        active_until is None or sunday <= active_until
+    ):
+        snapshot = approved_range_week(registry, service_id, sunday)
+        use_range = snapshot is not None and (
+            not reminder.get("task") or reminder["task"] == snapshot[1]
+        )
+        offset = snapshot[0][0] if use_range else reminder_day_offset(reminder)
+        event_date = sunday + timedelta(days=offset)
+        sent_at = reminder_send_datetime(
+            event_date, days, reminder["reminder_time"], now.tzinfo,
+        )
+        if sent_at >= now:
+            candidate = (sent_at, event_date, sunday if use_range else None)
+            if best is None or sent_at < best[0]:
+                best = candidate
+            elif sent_at == best[0] and event_date == best[1]:
+                if use_range and best[2] is None:
+                    best = candidate
+                elif use_range and best[2] != sunday:
+                    raise ValueError(
+                        "На один день приходятся напоминания разных недель."
+                    )
+        sunday += timedelta(days=7)
+    if best is None:
+        return None
+    return best[1], best[0].date(), best[2]
+
+
 def scheduled_reminder_date(now: datetime, reminder_time: str) -> date:
     """Recover yesterday's cron date when execution is delayed past midnight."""
     scheduled_time = time(

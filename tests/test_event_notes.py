@@ -130,6 +130,16 @@ class EventNotesTest(unittest.TestCase):
         self.registry.set_service_member_day(1001, "sound", "A", 2)
         self.assertEqual(source_sunday_for_event(self.registry, "sound", moment, "звук"), "2027-01-03")
 
+    def test_explicit_source_week_resolves_note_without_event_on_anchor(self):
+        self.note("2027-01-03")
+        self.registry.publish_event_note(1001, "2027-01-03")
+        self.plan("2027-01-03", -3)
+        anchor = date(2026, 12, 30)
+        self.assertEqual(resolve_event_note(self.registry, "sound", anchor), "")
+        self.assertIn("После собрания", resolve_event_note(
+            self.registry, "sound", anchor, source_sunday="2027-01-03",
+        ))
+
     def test_ambiguous_event_is_reported_instead_of_guessing(self):
         self.plan("2026-11-29", 6)
         self.plan("2026-12-06", -1, "сборка")

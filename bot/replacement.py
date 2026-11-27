@@ -509,7 +509,7 @@ async def _announce_replacement(
     try:
         await refresh_admin_reports(
             bot, registry, service["id"], event_date, admin_actor_id, logger,
-            report_limit,
+            report_limit, task=task,
         )
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось обновить отчёт админам после замены")

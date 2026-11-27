@@ -1321,6 +1321,289 @@ class SchedulePlanTest(unittest.TestCase):
         self.registry.set_service_member_day(1001, "sound", "Борис", 0)
         self.assertTrue(self.registry.get_schedule_plan("sound", "2026-11")["dirty"])
 
+    def test_range_graph_uses_individual_days_or_window(self):
+        plan = {
+            "tasks": [{"name": "уборка", "needed": 1, "window": [-3, 1]}],
+            "slots": {"2026-12-20": {"уборка": ["Анна"]}},
+            "days": {},
+        }
+        people = {
+            "Анна": {"key": "Анна", "day_offset": -5},
+            "Борис": {"key": "Борис", "day_offset": None},
+        }
+        mark = lambda *_: ""
+        names = {key: key for key in people}
+        lines = schedule_plan.plan_day_lines(
+            plan, "2026-12-20", people, names, (-3, 1), mark,
+        )
+        self.assertEqual(lines, ["🗓 15.12 (вт)", "   • Анна"])
+        plan["slots"]["2026-12-20"]["уборка"] = ["Борис"]
+        lines = schedule_plan.plan_day_lines(
+            plan, "2026-12-20", people, names, (-3, 1), mark,
+        )
+        self.assertEqual(lines, [
+            "🗓 17.12 (чт) – 21.12 (пн)", "   • Борис",
+        ])
+        plan["slots"]["2026-12-20"]["уборка"] = ["Анна", "Борис"]
+        lines = schedule_plan.plan_day_lines(
+            plan, "2026-12-20", people, names, (-3, 1), mark,
+        )
+        self.assertEqual(lines, [
+            "🗓 К воскресенью 20.12",
+            "   • Анна — 15.12 (вт)",
+            "   • Борис — 17.12 (чт) – 21.12 (пн)",
+        ])
+
+    def test_published_fixed_day_snapshot_survives_member_changes(self):
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": []}
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", plan["slots"],
+            chat_id=None, message_id=None, days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -2)
+        published = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertEqual(
+            published["approved_fixed_days"]["2026-11-01"]["звук"]["Алексей"],
+            -3,
+        )
+
+    def test_fixed_day_snapshot_is_cleared_on_cancel_and_excel_import(self):
+        self.registry.set_service_member_day(1001, "sound", "Алексей", 0)
+        plan = self.draft()
+        plan["slots"]["2026-11-01"] = {"звук": ["Алексей"], "сборка": []}
+        people = self.people()
+        fixed_days = schedule_plan.approved_fixed_days(plan, people)
+        self.assertEqual(fixed_days["2026-11-01"]["звук"]["Алексей"], 0)
+
+        def approve():
+            return self.registry.approve_schedule_plan(
+                1001, "sound", "2026-11", plan["slots"],
+                chat_id=None, message_id=None, days=plan["days"],
+                approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+                approved_fixed_days=fixed_days,
+            )
+
+        approve()
+        self.registry.cancel_schedule_approval("sound", "2026-11")
+        cancelled = self.registry.get_schedule_plan("sound", "2026-11")
+        self.assertIsNone(cancelled["approved"])
+        self.assertEqual(cancelled["approved_fixed_days"], {})
+
+        approve()
+        imported = schedule_plan.excel_plan(
+            self.registry, "sound", 2026, 11,
+            [event(date(2026, 11, 8), ("звук", "Борис"))],
+        )
+        result = self.registry.import_excel_plan(
+            1001, "sound", "2026-11",
+            dates=imported["dates"], tasks=imported["tasks"],
+            slots=imported["slots"], days=imported["days"],
+            served_offsets=schedule_plan.served_offsets(imported, people),
+            approved_slot_days=schedule_plan.approved_slot_days(imported, people),
+        )
+        self.assertEqual(result["approved_fixed_days"], {})
+        self.assertEqual(result["approved"], imported["slots"])
+
+    def test_month_overview_uses_published_range_and_fixed_day(self):
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -5)
+        run = schedule_plan.free_run("sound", 2026, 11)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, run, None, LOG,
+        ))
+        slots = {day: {"звук": []} for day in plan["dates"]}
+        slots["2026-11-01"]["звук"] = ["Алексей"]
+        slots["2026-11-08"]["звук"] = ["Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", plan["slots"],
+            chat_id=None, message_id=None, days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -2)
+        text = schedule_plan.month_overview(
+            self.registry, 1001, "sound", date(2026, 11, 1),
+        )
+        self.assertIn("🗓 27.10 (вт)", text)
+        self.assertIn("🗓 05.11 (чт) – 09.11 (пн)", text)
+        self.assertNotIn("🎚️ звук", text)
+
+    def test_range_excel_requires_real_dates_and_uses_approved_snapshot(self):
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -5)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("sound", 2026, 11), None, LOG,
+        ))
+        slots = {day: {"звук": []} for day in plan["dates"]}
+        slots["2026-11-01"]["звук"] = ["Алексей"]
+        slots["2026-11-08"]["звук"] = ["Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        people = self.people()
+        plan = self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -2)
+        people = self.people()
+        text = schedule_plan.excel_text(self.registry, self.service(), plan, people)
+        self.assertIn("27.10 (вт)", text)
+        self.assertIn("05.11 (чт) – 09.11 (пн)", text)
+        self.assertIn("Файл Excel не создан", text)
+        with self.assertRaisesRegex(ValueError, "точные даты"):
+            schedule_plan.excel_file(self.registry, self.service(), plan, people)
+
+        self.registry.set_schedule_day(
+            1001, "sound", "2026-11", "2026-11-08", "Борис", -2,
+        )
+        working = self.registry.get_schedule_plan("sound", "2026-11")
+        # Неутверждённая правка не превращает опубликованный диапазон в дату.
+        self.assertTrue(schedule_plan.has_unresolved_range(working, people))
+        plan = self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", working["slots"],
+            chat_id=None, message_id=None, days=working["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(working, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(working, people),
+        )
+        self.assertFalse(schedule_plan.has_unresolved_range(plan, people))
+        text = schedule_plan.excel_text(self.registry, self.service(), plan, people)
+        self.assertIn("06.11 (пт)", text)
+        self.assertNotIn("Файл Excel не создан", text)
+        self.assertTrue(schedule_plan.excel_file(self.registry, self.service(), plan, people))
+
+    def test_approved_range_week_keeps_offsets_and_replacements(self):
+        from bot.app import _range_reminder_week
+
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -5)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("sound", 2026, 11), None, LOG,
+        ))
+        slots = {day: {"звук": []} for day in plan["dates"]}
+        slots["2026-11-01"]["звук"] = ["Алексей", "Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        people = self.people()
+        self.assertIsNone(schedule_plan.approved_range_week(
+            self.registry, "sound", date(2026, 11, 1),
+        ))
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -2)
+        self.registry.set_replacement(
+            "sound", "2026-10-27", "звук", "Алексей", "Борис",
+            502, "", "admin", 1001,
+        )
+        window, task, assignments = schedule_plan.approved_range_week(
+            self.registry, "sound", date(2026, 11, 1),
+        )
+        self.assertEqual(window, (-3, 1))
+        self.assertEqual(task, "звук")
+        self.assertEqual(assignments[date(2026, 10, 27)]["звук"], ["Борис"])
+        self.assertEqual(assignments[date(2026, 10, 29)]["звук"], ["Борис"])
+        self.assertNotIn(date(2026, 10, 30), assignments)
+        resolved = _range_reminder_week(
+            self.registry, "sound", {"task": None}, date(2026, 10, 29),
+        )
+        self.assertEqual(resolved[0], date(2026, 11, 1))
+        self.assertEqual(resolved[1], (window, task, assignments))
+        self.assertIsNone(_range_reminder_week(
+            self.registry, "sound", {"task": "сборка"}, date(2026, 10, 29),
+        ))
+        self.assertIsNone(_range_reminder_week(
+            self.registry, "sound", {"task": None}, date(2026, 11, 1),
+        ))
+        self.assertIsNone(schedule_plan.approved_range_week(
+            self.registry, "sound", date(2026, 12, 6),
+        ))
+
+    def test_range_reminder_anchor_rejects_overlapping_week_starts(self):
+        from bot.app import _range_reminder_week
+        from bot.scheduler import group_reminder_occurrence
+        from bot.service_registry import ReplacementResolutionError
+
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        later = {"2026-12-06": {"звук": ["Борис"]}}
+        self.registry.save_schedule_draft(
+            "sound", "2026-12", run_id=None, dates=list(later),
+            tasks=[{"name": "звук", "needed": 1, "max": 1, "window": [-6, -5],
+                    "default_day": -6}],
+            slots=later, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-12", later, chat_id=None, message_id=None,
+        )
+        earlier = {"2026-11-29": {"звук": ["Алексей"]}}
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=list(earlier),
+            tasks=[{"name": "звук", "needed": 1, "max": 1, "window": [1, 2],
+                    "default_day": 1}],
+            slots=earlier, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", earlier, chat_id=None, message_id=None,
+        )
+        with self.assertRaisesRegex(ReplacementResolutionError, "двух недель"):
+            _range_reminder_week(
+                self.registry, "sound", {"task": None}, date(2026, 11, 30),
+            )
+        with self.assertRaisesRegex(ValueError, "разных недель"):
+            group_reminder_occurrence(
+                datetime(2026, 11, 29, 12, 0, tzinfo=TZ),
+                {"task": None, "reminder_days": 0, "reminder_time": "18:00"},
+                self.registry, "sound",
+            )
+
+    def test_group_occurrence_uses_approved_range_not_current_settings(self):
+        from bot.scheduler import group_reminder_occurrence
+
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("sound", 2026, 11), None, LOG,
+        ))
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", plan["slots"],
+            chat_id=None, message_id=None,
+        )
+        self.registry.set_readiness_settings(1001, "sound", day_from=0, day_to=0)
+        reminder = {
+            "task": None, "reminder_days": 1, "reminder_time": "18:00",
+            "active_from": "2026-11-01", "active_until": "2026-11-08",
+        }
+        self.assertEqual(
+            group_reminder_occurrence(
+                datetime(2026, 10, 28, 12, 0, tzinfo=TZ), reminder,
+                self.registry, "sound",
+            ),
+            (date(2026, 10, 29), date(2026, 10, 28), date(2026, 11, 1)),
+        )
+        self.assertEqual(
+            group_reminder_occurrence(
+                datetime(2026, 10, 28, 19, 0, tzinfo=TZ), reminder,
+                self.registry, "sound",
+            ),
+            (date(2026, 11, 5), date(2026, 11, 4), date(2026, 11, 8)),
+        )
+        self.assertIsNone(group_reminder_occurrence(
+            datetime(2026, 11, 4, 19, 0, tzinfo=TZ), reminder,
+            self.registry, "sound",
+        ))
+
     def test_saved_fallback_day_matches_reminder_and_excel_dates(self):
         self.registry.set_readiness_settings(
             1001, "sound", day_from=-1, day_to=1
