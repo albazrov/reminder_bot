@@ -174,6 +174,25 @@ class EventNotesTest(unittest.TestCase):
             "2026-12-06",
         )
 
+    def test_personal_event_source_keeps_assignment_key_for_namesakes(self):
+        self.plan("2026-11-01")
+        people = [
+            {"key": "A", "name": "A", "telegram_id": 501, "tasks": ["звук"]},
+            {"key": "A-copy", "name": "A", "telegram_id": 502, "tasks": ["звук"]},
+        ]
+        with patch.object(self.registry, "readiness_people", return_value=people):
+            self.assertEqual(
+                source_sunday_for_event(
+                    self.registry, "sound", date(2026, 11, 1), "звук",
+                    telegram_id=501,
+                ),
+                "2026-11-01",
+            )
+            self.assertIsNone(source_sunday_for_event(
+                self.registry, "sound", date(2026, 11, 1), "звук",
+                telegram_id=502,
+            ))
+
     def test_personal_reminders_resolve_overlapping_ranges_per_participant(self):
         self.registry.set_responsible_contact(
             1001, "sound", "звук", "B", 502,
@@ -300,6 +319,63 @@ class EventNotesTest(unittest.TestCase):
             "<b>🔔 Звук · звук · 29.10 (чт) – 02.11 (пн)</b>\n"
             "29.10 (чт) – 02.11 (пн)",
             messages[1],
+        )
+
+    def test_flexible_replacement_does_not_make_personal_assignment_fixed(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "B", 502,
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "C", 503,
+        )
+        self.registry.set_user_notifications_enabled(503, "sound", True)
+        sunday = "2026-11-01"
+        slots = {sunday: {"звук": ["A", "B"]}}
+        tasks = [{
+            "name": "звук", "needed": 1, "max": 1,
+            "window": [-5, 1], "default_day": -5,
+        }]
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=[sunday],
+            tasks=tasks, slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            approved_slot_days={sunday: {"звук": {"A": -5, "B": -5}}},
+            approved_fixed_days={sunday: {"звук": {"A": -5}}},
+        )
+        self.registry.set_replacement(
+            "sound", "2026-10-27", "звук", "B", "C",
+            503, "", "admin", 1001,
+        )
+        text_id = self.registry.ensure_user_text(503, "sound", "звук")
+        rule = self.registry.add_schedule(
+            text_id, 0, "10:00", origin="user", body="{sunday_date}",
+        )
+        bot = SimpleNamespace(send_message=AsyncMock())
+        credentials = SimpleNamespace(
+            admin_tg_id=1001, yandex_public_url="unused",
+        )
+
+        async def run():
+            with patch(
+                "bot.app._load_service_task_assignments",
+                new=AsyncMock(return_value=({"звук": ["C"]}, True)),
+            ):
+                await app._process_user_reminder_schedule(
+                    bot, credentials, self.path, ZoneInfo("UTC"),
+                    self.registry, rule["id"], LOG, LOG,
+                    run_date=date(2026, 10, 27),
+                )
+
+        asyncio.run(run())
+        message = next(
+            call.args[1] for call in bot.send_message.await_args_list
+            if call.args[0] == 503
+        )
+        self.assertIn(
+            "<b>🔔 Звук · звук · 27.10 (вт) – 02.11 (пн)</b>",
+            message,
         )
 
     def test_publishing_never_changes_delivery_marks(self):

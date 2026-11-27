@@ -26,7 +26,7 @@ from . import task_rules
 from .month_summary import month_end, month_key, month_title
 from .presentation import (
     apply_replacements, display_name, format_task_assignments,
-    task_assignment_names, task_emoji,
+    replacements_for_assignments, task_assignment_names, task_emoji,
 )
 from .readiness import (
     DEFAULT_PLAN_TITLE,
@@ -1442,6 +1442,7 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                                 draft: bool = False, keyed: bool = False,
                                 source_sunday: str | None = None,
                                 replacement_people: dict[str, dict] | None = None,
+                                replacement_sources: dict[str, list[str]] | None = None,
                                 ) -> dict[date, dict[str, list[str]]]:
     if draft:
         plan = {
@@ -1500,6 +1501,10 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
             plan["service_id"], event.event_date.isoformat(),
             **({"source_sunday": source_sunday} if source_sunday is not None else {}),
         )
+        if replacement_sources is not None:
+            replacements = replacements_for_assignments(
+                replacement_sources, replacements,
+            )
         current = _apply_assignment_replacements(
             event_tasks, replacements, people, keyed=keyed,
             other_assignments=(
@@ -1612,8 +1617,6 @@ def month_overview(
                         source_day + timedelta(days=window[0]),
                         source_day + timedelta(days=window[1]),
                     )
-                    if end < first or start > last:
-                        continue
                     people_by_key = {
                         person["key"]: {**person, "day_offset": None}
                         for person in people
@@ -1634,12 +1637,16 @@ def month_overview(
                             if not draft else plan.get("days") or {}
                         ),
                     }
-                    for index, (moment, original_key) in enumerate(
-                        task_moments(
-                            source_plan, source_people_by_key, sunday, task,
-                            approved=not draft,
-                        )
+                    moments = task_moments(
+                        source_plan, source_people_by_key, sunday, task,
+                        approved=not draft,
+                    )
+                    if (end < first or start > last) and not any(
+                        original_key in explicit and first <= moment <= last
+                        for moment, original_key in moments
                     ):
+                        continue
+                    for index, (moment, original_key) in enumerate(moments):
                         original_person = people_by_key.get(
                             original_key,
                             {"key": original_key, "name": original_key},
@@ -1647,6 +1654,9 @@ def month_overview(
                         replacements = [] if draft else registry.list_replacements(
                             plan["service_id"], moment.isoformat(),
                             source_sunday=sunday,
+                        )
+                        replacements = replacements_for_assignments(
+                            {task: [original_person["name"]]}, replacements,
                         )
                         final_names = apply_replacements(
                             {task: [original_person["name"]]}, replacements,

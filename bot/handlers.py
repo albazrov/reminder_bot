@@ -4368,6 +4368,16 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
         # днём (вс +5) — до дня задачи.
         start = today - timedelta(days=reminder_day_offset(reminder))
         first = start + timedelta(days=(6 - start.weekday()) % 7)
+        current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+        current_range = schedule_plan.approved_range_week(
+            registry, service_id, current_sunday,
+        )
+        if (
+            current_range is not None
+            and (not reminder.get("task") or reminder["task"] == current_range[1])
+            and current_sunday + timedelta(days=current_range[0][1]) >= today
+        ):
+            first = min(first, current_sunday)
         if pick_until:
             start = max(first, active_from or first)
             choices = [start + timedelta(weeks=week) for week in range(12)]
@@ -9630,11 +9640,15 @@ def register(dispatcher: Dispatcher, context: Any) -> None:
                     run, settings, year, month, now
                 )
                 if arg == "intro":
+                    range_poll = readiness.uses_window_options(
+                        registry.plan_tasks(service_id), settings,
+                    )
                     body = readiness.intro_text(
                         service, registry.readiness_people(service_id),
                         year, month, deadline, tz, settings["intro_template"],
                         readiness.phrase(settings, "own_days"),
                         settings["reverse_poll"],
+                        range_poll=range_poll,
                     )
                     where = "в чате служения перед опросом"
                 elif arg == "q":

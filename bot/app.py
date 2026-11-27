@@ -81,6 +81,7 @@ if __package__:
         format_task_assignments,
         format_task_responsibles,
         person_label,
+        replacements_for_assignments,
         task_assignment_names,
         task_is_informational,
     )
@@ -2626,6 +2627,9 @@ async def _process_user_reminder_schedule(
                 replacements = registry.list_replacements(
                     schedule["service_id"], event_date.isoformat(),
                     source_sunday=range_source,
+                )
+                replacements = replacements_for_assignments(
+                    {schedule["task"]: fixed_names}, replacements,
                 )
                 effective_fixed_names = apply_replacements(
                     {schedule["task"]: fixed_names}, replacements,

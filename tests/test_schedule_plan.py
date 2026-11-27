@@ -1441,7 +1441,10 @@ class SchedulePlanTest(unittest.TestCase):
 
         self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
         self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
-        self.registry.set_service_member_day(1001, "sound", "Алексей", -5)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "Виктор", 504,
+        )
         plan = asyncio.run(schedule_plan.build_draft(
             self.registry, schedule_plan.free_run("sound", 2026, 11), None, LOG,
         ))
@@ -1456,17 +1459,44 @@ class SchedulePlanTest(unittest.TestCase):
             approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
         )
         self.registry.set_replacement(
-            "sound", "2026-10-27", "звук", "Алексей", "Борис",
-            502, "", "admin", 1001,
+            "sound", "2026-10-29", "звук", "Алексей", "Виктор",
+            504, "", "admin", 1001,
         )
 
         text = plain_text(schedule_plan.month_overview(
             self.registry, 1001, "sound", date(2026, 10, 1),
         ))
 
-        self.assertIn("27.10 (вт)", text)
+        self.assertIn("29.10 (чт)", text)
         self.assertIn("29.10 (чт) – 02.11 (пн)", text)
-        self.assertGreaterEqual(text.count("Борис"), 2)
+        self.assertEqual(text.count("Виктор"), 1)
+        self.assertEqual(text.count("Борис"), 1)
+
+    def test_month_overview_includes_fixed_date_outside_task_window(self):
+        from bot.ui import plain_text
+
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(1001, "sound", day_from=-1, day_to=0)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", 2)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("sound", 2026, 11), None, LOG,
+        ))
+        slots = {day: {"звук": []} for day in plan["dates"]}
+        slots["2026-11-29"]["звук"] = ["Алексей"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", plan["slots"],
+            chat_id=None, message_id=None, days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+
+        text = plain_text(schedule_plan.month_overview(
+            self.registry, 1001, "sound", date(2026, 12, 1),
+        ))
+
+        self.assertIn("01.12 (вт)", text)
 
     def test_range_excel_requires_real_dates_and_uses_approved_snapshot(self):
         self.registry.set_service_task_enabled(1001, "sound", "сборка", False)

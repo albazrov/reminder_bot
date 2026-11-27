@@ -135,6 +135,43 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertIn("A", text)
         self.assertNotIn("B", text)
 
+    def test_flexible_replacement_does_not_become_a_fixed_assignment(self):
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "B", 506,
+        )
+        self.registry.set_responsible_contact(
+            1001, "sound", "звук", "C", 507,
+        )
+        sunday = "2026-11-01"
+        slots = {sunday: {"звук": ["A", "B"]}}
+        tasks = [{
+            "name": "звук", "needed": 1, "max": 1,
+            "window": [-3, 1], "default_day": -3,
+        }]
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=[sunday],
+            tasks=tasks, slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            approved_slot_days={sunday: {"звук": {"A": -3, "B": -3}}},
+            approved_fixed_days={sunday: {"звук": {"A": -3}}},
+        )
+        self.registry.set_replacement(
+            "sound", "2026-10-29", "звук", "B", "C",
+            507, "", "admin", 1001,
+        )
+
+        result = resolve_assignment_fields(
+            self.registry, "sound", date(2026, 10, 29),
+            "{week_task_assignments}", date(2026, 10, 29),
+            source_sunday=sunday,
+        )
+        text = plain_text(result.week)
+
+        self.assertIn("звук — 29.10 — A", text)
+        self.assertIn("звук — 29.10 (чт) – 02.11 (пн) — C", text)
+
     def test_approved_snapshot_ignores_draft_and_changed_personal_day(self):
         expected = self.resolve()
         self.plan("sound", {"звук": ["B"], "спевка": []}, approve=False)

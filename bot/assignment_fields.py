@@ -131,6 +131,13 @@ def resolve_assignment_fields(
                 if keys
             }
             if fixed_slots:
+                fixed_sources = {
+                    task_name: [
+                        by_key.get(key, {}).get("name", key)
+                        for key in keys
+                    ]
+                    for task_name, keys in fixed_slots.items()
+                }
                 fixed_plan = {
                     **plan,
                     "approved": {sunday: fixed_slots},
@@ -139,6 +146,7 @@ def resolve_assignment_fields(
                     registry, fixed_plan, people, keyed=True,
                     source_sunday=sunday,
                     replacement_people=replacement_people,
+                    replacement_sources=fixed_sources,
                 )
         fixed_records = {
             (day.isoformat(), task_name, key)

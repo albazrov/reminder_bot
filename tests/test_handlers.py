@@ -3197,6 +3197,37 @@ class ServiceManagementHandlerTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_period_picker_includes_current_week_when_approved_range_is_active(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            card = await self._click(
+                menu.message,
+                lambda button: button.callback_data.startswith(
+                    "group_reminder:open:sound:"
+                ),
+            )
+            with patch("bot.handlers.datetime") as clock, patch(
+                "bot.handlers.schedule_plan.approved_range_week",
+                return_value=((-3, 1), "звук", {}),
+            ):
+                clock.now.return_value = datetime(
+                    2026, 11, 30, 12, 0, tzinfo=ZoneInfo("UTC"),
+                )
+                period = await self._click(
+                    card.message, lambda button: button.text == "🗓 Период",
+                )
+
+            buttons = [
+                button
+                for row in period.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertIn("🗓 29.11", [button.text for button in buttons])
+
+        asyncio.run(run())
+
     def test_merge_is_not_offered_without_schedule_preview(self):
         async def run():
             self.context.get_group_reminder_preview = AsyncMock(
@@ -7101,7 +7132,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Используется встроенный текст",
                 text_screen.message.answer.await_args.args[0],
             )
-            preview = await press("rdy:tplprev:sound:intro")
+            with patch(
+                "bot.handlers.readiness.uses_window_options",
+                return_value=True,
+            ), patch(
+                "bot.handlers.readiness.intro_text",
+                wraps=readiness.intro_text,
+            ) as intro_renderer:
+                preview = await press("rdy:tplprev:sound:intro")
+            self.assertTrue(intro_renderer.call_args.kwargs["range_poll"])
             self.assertIn(
                 "Спасибо за твое служение",
                 preview.message.answer.await_args.args[0],

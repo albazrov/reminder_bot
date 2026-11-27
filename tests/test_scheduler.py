@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -8,12 +8,31 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot.scheduler import (
     add_service_reminder_jobs,
+    group_reminder_period_offsets,
     refresh_user_reminder_jobs,
     scheduled_reminder_date,
 )
 
 
 class ServiceReminderSchedulerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_range_period_offsets_use_both_window_boundaries(self):
+        registry = MagicMock()
+        reminder = {
+            "service_id": "sound",
+            "task": "звук",
+            "task_day": 0,
+            "active_from": None,
+            "active_until": "2026-11-29",
+        }
+        with patch(
+            "bot.schedule_plan.approved_range_week",
+            return_value=((-3, -1), "звук", {}),
+        ):
+            self.assertEqual(
+                group_reminder_period_offsets(registry, reminder),
+                (-3, -1),
+            )
+
     async def test_registers_each_reminder_and_preserves_unchanged_jobs(self):
         scheduler = AsyncIOScheduler(timezone=ZoneInfo("UTC"))
         callback = AsyncMock()

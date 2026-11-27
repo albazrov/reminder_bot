@@ -7,7 +7,9 @@ import unicodedata
 from datetime import date, datetime, time, timedelta
 
 from .schedule_plan import task_moments
-from .presentation import apply_replacements, format_informational_notes
+from .presentation import (
+    replacements_for_assignments, format_informational_notes,
+)
 from .group_send import send_to_service_group
 from .ui import plain_text
 
@@ -86,35 +88,46 @@ def source_sunday_for_event(
             for task_name in tasks:
                 if task and task_name != task:
                     continue
-                names = []
+                assignments = []
                 for moment, key in task_moments(
                     published, by_key, sunday, task_name, approved=True
                 ):
                     if moment == event_day:
-                        names.append(by_key.get(key, {}).get("name", key))
-                if not names:
+                        assignments.append(
+                            (key, by_key.get(key, {}).get("name", key))
+                        )
+                if not assignments:
                     continue
                 if telegram_id is not None:
                     replacements = registry.list_replacements(
                         service_id, event_day.isoformat(),
                         source_sunday=sunday,
                     )
-                    actual_names = apply_replacements(
-                        {task_name: names}, replacements,
-                    ).get(task_name, [])
-                    replacement_ids = {
-                        item["new_name"]: item.get("telegram_id")
-                        for item in replacements
-                        if item["task"] == task_name
-                    }
-                    if not any(
-                        person.get("telegram_id") == telegram_id
-                        for person in people
-                        if person["name"] in actual_names
-                    ) and not any(
-                        replacement_ids.get(name) == telegram_id
-                        for name in actual_names
-                    ):
+                    is_assigned = False
+                    for key, name in assignments:
+                        person = by_key.get(key, {})
+                        chain = replacements_for_assignments(
+                            {task_name: [name]}, replacements,
+                        )
+                        current_name = name
+                        current_id = person.get("telegram_id")
+                        for item in chain:
+                            if item["old_name"] != current_name:
+                                continue
+                            current_name = item["new_name"]
+                            current_id = item.get("telegram_id")
+                        if current_id is None:
+                            candidates = [
+                                member for member in people
+                                if member["name"] == current_name
+                                and task_name in member["tasks"]
+                            ]
+                            if len(candidates) == 1:
+                                current_id = candidates[0].get("telegram_id")
+                        if current_id == telegram_id:
+                            is_assigned = True
+                            break
+                    if not is_assigned:
                         continue
                 matches.append(sunday)
     if len(set(matches)) > 1:

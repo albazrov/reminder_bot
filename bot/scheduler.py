@@ -103,19 +103,31 @@ def group_reminder_period_offsets(registry, reminder: dict) -> tuple[int, int]:
     from .schedule_plan import approved_range_week
 
     default_offset = reminder_day_offset(reminder)
-    end_offset = default_offset
-    active_until = reminder.get("active_until")
-    if active_until is not None:
-        snapshot = approved_range_week(
-            registry,
-            reminder["service_id"],
-            _period_bound(active_until),
+    windows = []
+    for boundary in (reminder.get("active_from"), reminder.get("active_until")):
+        snapshot = (
+            approved_range_week(
+                registry, reminder["service_id"], _period_bound(boundary),
+            )
+            if boundary is not None else None
         )
-        if snapshot is not None and (
-            not reminder.get("task") or reminder["task"] == snapshot[1]
+        if snapshot is None or (
+            reminder.get("task") and reminder["task"] != snapshot[1]
         ):
-            end_offset = snapshot[0][1]
-    return default_offset, end_offset
+            windows.append(None)
+        else:
+            windows.append(snapshot[0])
+
+    end_window = windows[1]
+    end_offset = end_window[1] if end_window else default_offset
+    start_offset = default_offset
+    if (
+        reminder.get("active_until") is not None
+        and start_offset > end_offset
+        and end_window is not None
+    ):
+        start_offset = end_window[0]
+    return start_offset, end_offset
 
 
 def group_reminder_period_status(

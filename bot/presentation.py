@@ -187,6 +187,24 @@ def apply_replacements(assignments: dict, replacements: list[dict]) -> dict:
     return result
 
 
+def replacements_for_assignments(assignments: dict[str, list[str]],
+                                 replacements: list[dict]) -> list[dict]:
+    """Keep only replacement chains rooted in the supplied assignments."""
+    current = {
+        task: set(names)
+        for task, names in assignments.items()
+    }
+    selected = []
+    for item in replacements:
+        names = current.get(item["task"])
+        if names is None or item["old_name"] not in names:
+            continue
+        selected.append(item)
+        names.remove(item["old_name"])
+        names.add(item["new_name"])
+    return selected
+
+
 def is_replaced(replacements: list[dict], task: str, name: str) -> bool:
     """Человек уже заменён на эту дату (отказ из старого напоминания).
     Если любая замена вернула его в задачу (А→Б→А или В→А), он снова в
