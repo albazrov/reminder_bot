@@ -172,6 +172,44 @@ class AssignmentFieldsTest(unittest.TestCase):
         self.assertIn("звук — 29.10 — A", text)
         self.assertIn("звук — 29.10 (чт) – 02.11 (пн) — C", text)
 
+    def test_fixed_replacement_into_flexible_assignee_preserves_both_dates(self):
+        self.registry.set_responsible_contact(1001, "sound", "звук", "B", 506)
+        sunday = "2026-11-01"
+        slots = {sunday: {"звук": ["A", "B"]}}
+        tasks = [{
+            "name": "звук", "needed": 1, "max": 2,
+            "window": [-3, 1], "default_day": -3,
+        }]
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=[sunday],
+            tasks=tasks, slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            approved_slot_days={sunday: {"звук": {"A": -3, "B": -3}}},
+            approved_fixed_days={sunday: {"звук": {"A": -3}}},
+        )
+        self.registry.set_replacement(
+            "sound", "2026-10-29", "звук", "A", "B", 506, "", "admin", 1001,
+        )
+        before_cutoff = resolve_assignment_fields(
+            self.registry, "sound", date(2026, 10, 29),
+            "{week_task_assignments}", date(2026, 10, 29),
+            source_sunday=sunday,
+        )
+        self.assertIn("звук — 29.10 — B", plain_text(before_cutoff.week))
+        self.assertIn(
+            "звук — 29.10 (чт) – 02.11 (пн) — B", plain_text(before_cutoff.week),
+        )
+        result = resolve_assignment_fields(
+            self.registry, "sound", date(2026, 10, 29),
+            "{week_task_assignments}", date(2026, 10, 30),
+            source_sunday=sunday,
+        )
+        text = plain_text(result.week)
+        self.assertIn("звук — 29.10 (чт) – 02.11 (пн) — B", text)
+        self.assertNotIn("звук — 29.10 — B", text)
+
     def test_approved_snapshot_ignores_draft_and_changed_personal_day(self):
         expected = self.resolve()
         self.plan("sound", {"звук": ["B"], "спевка": []}, approve=False)

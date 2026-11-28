@@ -1498,6 +1498,48 @@ class SchedulePlanTest(unittest.TestCase):
 
         self.assertIn("01.12 (вт)", text)
 
+    def test_range_overview_includes_unowned_active_replacement_once(self):
+        from bot.ui import plain_text
+
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)
+        self.registry.set_responsible_contact(1001, "sound", "звук", "Виктор", 504)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("sound", 2026, 11), None, LOG,
+        ))
+        slots = {day: {"звук": []} for day in plan["dates"]}
+        slots["2026-11-01"]["звук"] = ["Борис"]
+        plan = self.registry.set_schedule_slots(1001, "sound", "2026-11", slots)
+        people = self.people()
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        self.registry.set_replacement(
+            "sound", "2026-10-29", "звук", "Алексей", "Виктор",
+            504, "", "admin", 1001,
+        )
+        text = plain_text(schedule_plan.month_overview(
+            self.registry, 1001, "sound", date(2026, 11, 1),
+        ))
+        self.assertEqual(text.count("Борис"), 1)
+        self.assertEqual(text.count("Виктор"), 1)
+        self.assertIn("LINK:504:", schedule_plan.month_overview(
+            self.registry, 1001, "sound", date(2026, 11, 1),
+        ))
+        self.registry.approve_schedule_plan(
+            1001, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        text = plain_text(schedule_plan.month_overview(
+            self.registry, 1001, "sound", date(2026, 11, 1),
+        ))
+        self.assertNotIn("Виктор", text)
+
     def test_range_excel_requires_real_dates_and_uses_approved_snapshot(self):
         self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
         self.registry.set_readiness_settings(1001, "sound", day_from=-3, day_to=1)

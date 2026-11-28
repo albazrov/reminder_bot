@@ -121,6 +121,7 @@ def resolve_assignment_fields(
             if "window" in item
         } if own else {}
         fixed_assignments = {}
+        flexible_assignments = {}
         if own:
             fixed_slots = {
                 task_name: list(keys)
@@ -148,9 +149,34 @@ def resolve_assignment_fields(
                     replacement_people=replacement_people,
                     replacement_sources=fixed_sources,
                 )
+                flexible_slots = {
+                    task_name: [
+                        key for key in keys
+                        if key not in fixed_slots.get(task_name, ())
+                    ]
+                    for task_name, keys in plan["approved"].get(sunday, {}).items()
+                    if task_name in windows
+                }
+                flexible_sources = {
+                    task_name: [by_key.get(key, {}).get("name", key) for key in keys]
+                    for task_name, keys in flexible_slots.items()
+                }
+                flexible_assignments = _effective_plan_assignments(
+                    registry, {**plan, "approved": {sunday: flexible_slots}},
+                    people, keyed=True, source_sunday=sunday,
+                    replacement_people=replacement_people,
+                    replacement_sources=flexible_sources,
+                )
+                by_key.update(replacement_people)
         fixed_records = {
             (day.isoformat(), task_name, key)
             for day, tasks in fixed_assignments.items()
+            for task_name, keys in tasks.items()
+            for key in keys
+        }
+        flexible_records = {
+            (day.isoformat(), task_name, key)
+            for day, tasks in flexible_assignments.items()
             for task_name, keys in tasks.items()
             for key in keys
         }
@@ -165,32 +191,36 @@ def resolve_assignment_fields(
                 for key in dict.fromkeys(keys):
                     if not key:
                         continue
-                    is_fixed = (day.isoformat(), name, key) in fixed_records
-                    window = windows.get(name)
-                    if day < cutoff and not (
-                        own and window and not is_fixed
-                        and source_day + timedelta(days=window[1]) >= cutoff
-                    ):
-                        continue
-                    person = by_key.get(key)
-                    label = (
-                        person_label(name, key, {(name, key): person})
-                        if own and person else display_name(person, key)
-                    )
-                    if own and window and not is_fixed:
-                        start = source_day + timedelta(days=window[0])
-                        end = source_day + timedelta(days=window[1])
-                        day_label = (
-                            f" — {start:%d.%m} ({WEEKDAYS[start.weekday()]}) – "
-                            f"{end:%d.%m} ({WEEKDAYS[end.weekday()]})"
+                    record = (day.isoformat(), name, key)
+                    kinds = [record in fixed_records]
+                    if kinds[0] and record in flexible_records:
+                        kinds.append(False)
+                    for is_fixed in kinds:
+                        window = windows.get(name)
+                        if day < cutoff and not (
+                            own and window and not is_fixed
+                            and source_day + timedelta(days=window[1]) >= cutoff
+                        ):
+                            continue
+                        person = by_key.get(key)
+                        label = (
+                            person_label(name, key, {(name, key): person})
+                            if own and person else display_name(person, key)
                         )
-                    else:
-                        day_label = (
-                            f" — {day:%d.%m}"
-                            if own and day.isoformat() != sunday else ""
-                        )
-                    lines.append(f"{task_emoji(name)} {name}{day_label} — {label}")
-                    rows.append((day.isoformat(), name, key, label))
+                        if own and window and not is_fixed:
+                            start = source_day + timedelta(days=window[0])
+                            end = source_day + timedelta(days=window[1])
+                            day_label = (
+                                f" — {start:%d.%m} ({WEEKDAYS[start.weekday()]}) – "
+                                f"{end:%d.%m} ({WEEKDAYS[end.weekday()]})"
+                            )
+                        else:
+                            day_label = (
+                                f" — {day:%d.%m}"
+                                if own and day.isoformat() != sunday else ""
+                            )
+                        lines.append(f"{task_emoji(name)} {name}{day_label} — {label}")
+                        rows.append((day.isoformat(), name, key, label, day_label))
         value = "\n".join(lines)
         states.append((cache_key, "approved", tuple(rows)))
         cache[cache_key] = value

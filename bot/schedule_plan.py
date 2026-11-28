@@ -1628,6 +1628,7 @@ def month_overview(
                     explicit = fixed.get(sunday, {}).get(task, {})
                     keys: list[str] = []
                     days = {}
+                    represented: dict[date, set[tuple]] = {}
                     source_plan = {
                         **plan,
                         "slots": original_slots,
@@ -1709,9 +1710,44 @@ def month_overview(
                         people_by_key[key] = {
                             **final_person, "key": key, "day_offset": None,
                         }
+                        identity = (
+                            ("telegram", final_person["telegram_id"])
+                            if final_person.get("telegram_id")
+                            else ("key", final_person["key"])
+                        )
+                        represented.setdefault(moment, set()).add(identity)
                         offset = explicit.get(original_key)
                         if offset is not None:
                             days[task_day_key(str(key), task)] = offset
+                    if not draft:
+                        replacement_people: dict[str, dict] = {}
+                        effective = _effective_plan_assignments(
+                            registry, plan, people, keyed=True,
+                            source_sunday=sunday,
+                            replacement_people=replacement_people,
+                        )
+                        effective_people = {
+                            **source_people_by_key, **replacement_people,
+                        }
+                        for moment, assignments_on_day in effective.items():
+                            for person_key in assignments_on_day.get(task, []):
+                                person = effective_people.get(
+                                    person_key, {"key": person_key, "name": person_key},
+                                )
+                                identity = (
+                                    ("telegram", person["telegram_id"])
+                                    if person.get("telegram_id")
+                                    else ("key", person_key)
+                                )
+                                if identity in represented.get(moment, set()):
+                                    continue
+                                represented.setdefault(moment, set()).add(identity)
+                                key = f"\x1foverview:{sunday}:{task}:{len(keys)}"
+                                keys.append(key)
+                                people_by_key[key] = {
+                                    **person, "key": key, "day_offset": None,
+                                }
+                                days[task_day_key(key, task)] = (moment - source_day).days
                     view_plan = {
                         **plan, "tasks": shown_tasks,
                         "slots": {sunday: {task: keys}},
