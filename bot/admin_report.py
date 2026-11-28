@@ -1,15 +1,14 @@
 """Отчёт администраторам служения о напоминании (этап 3.2).
 
 Отчёт уходит в личные чаты админов служения после группового напоминания
-и редактируется, когда участники отвечают «Принял» / «Не смогу». Один
-отчёт на админа и дату события: повторные напоминания той же даты
-обновляют его, а не присылают новый.
+и редактируется, когда участники отвечают «Принял» / «Не смогу». Для
+обычных графиков отчёт один на дату, для диапазонного — на неделю.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 
 from aiogram.types import LinkPreviewOptions
 
@@ -36,6 +35,21 @@ _CONFIRMATION_LABELS = {
     "confirmed": "✅ подтвердил(а)",
     "declined": "🚫 не сможет",
 }
+
+
+def _is_range_assignments(assignments: dict) -> bool:
+    return bool(assignments) and all(
+        isinstance(day, str) and len(day) == 10 and day[4] == "-"
+        and day[7] == "-" and isinstance(day_assignments, dict)
+        for day, day_assignments in assignments.items()
+    )
+
+
+def _report_storage_key(event_date: date, source_sunday: str | None,
+                        assignments: dict) -> str:
+    if source_sunday is not None and _is_range_assignments(assignments):
+        return f"{source_sunday}#range"
+    return event_date.isoformat()
 
 
 class _Values(dict):
@@ -67,34 +81,67 @@ def build_report_text(
     *,
     display_names: dict[str, str] | None = None,
     service_id: str | None = None,
+    range_entries: list[tuple[date, str, bool, dict, dict]] | None = None,
 ) -> str:
     """confirmations — {(задача, Telegram ID): status}: ответ принадлежит
     аккаунту, а не имени, поэтому перепривязка имени не переносит чужой
     ответ. С limit длинный отчёт сокращается так, чтобы ответы
     участников оставались видны: сначала сворачиваются статусы доставки,
     затем список назначений."""
-    people = _people(assignments, service_id)
     delivery = []
     answers = []
-    for task, name in people:
-        contact = contacts_by_name.get((task, name))
-        shown_name = (display_names or {}).get(name) or display_name(contact, name)
-        telegram_id = contact.get("telegram_id") if contact else None
-        if not telegram_id:
-            delivery.append(f"⚪ {shown_name} ({task}) — тг аккаунт к боту не подключен")
-        elif not notifications_enabled(telegram_id):
-            delivery.append(f"🔕 {shown_name} ({task}) — уведомления выключены")
-        else:
-            delivery.append(f"✅ {shown_name} ({task}) — уведомления включены")
-        status = confirmations.get((task, telegram_id)) if telegram_id else None
-        label = _CONFIRMATION_LABELS.get(status, "⏳ нет ответа")
-        answers.append(f"{label} — {shown_name} ({task})")
+    if range_entries is None:
+        entries = [(event_date, "", False, assignments, confirmations)]
+    else:
+        entries = range_entries
+    task_assignment_lines = []
+    for day, day_label, is_range, day_assignments, day_confirmations in entries:
+        people = _people(day_assignments, service_id)
+        if range_entries is not None:
+            icon = "📆" if is_range else "📅"
+            heading = f"{icon} {day_label}"
+            task_assignment_lines.extend([
+                heading,
+                format_task_assignments(
+                    day_assignments, contacts_by_name, mark_unlinked=True,
+                    display_names=display_names, service_id=service_id,
+                ),
+            ])
+            delivery.append(heading)
+            answers.append(heading)
+        for task, name in people:
+            contact = contacts_by_name.get((task, name))
+            shown_name = (
+                (display_names or {}).get(name) or display_name(contact, name)
+            )
+            telegram_id = contact.get("telegram_id") if contact else None
+            if not telegram_id:
+                delivery.append(
+                    f"⚪ {shown_name} ({task}) — тг аккаунт к боту не подключен"
+                )
+            elif not notifications_enabled(telegram_id):
+                delivery.append(
+                    f"🔕 {shown_name} ({task}) — уведомления выключены"
+                )
+            else:
+                delivery.append(
+                    f"✅ {shown_name} ({task}) — уведомления включены"
+                )
+            status = (
+                day_confirmations.get((task, telegram_id))
+                if telegram_id else None
+            )
+            label = _CONFIRMATION_LABELS.get(status, "⏳ нет ответа")
+            answers.append(f"{label} — {shown_name} ({task})")
     values = {
         "service_name": service_name,
         "sunday_date": f"{event_date:%d.%m.%Y}",
-        "task_assignments": format_task_assignments(
-            assignments, contacts_by_name, mark_unlinked=True, display_names=display_names,
-            service_id=service_id,
+        "task_assignments": (
+            "\n".join(task_assignment_lines)
+            if range_entries is not None else format_task_assignments(
+                assignments, contacts_by_name, mark_unlinked=True,
+                display_names=display_names, service_id=service_id,
+            )
         ),
         "delivery_status": "\n".join(delivery) or "⚪ нет назначений",
         "confirmation_status": "\n".join(answers) or "⚪ нет назначений",
@@ -144,27 +191,135 @@ def report_recipients(registry, service_id: str, fallback_admin_id: int) -> list
 
 def report_text(registry, service: dict, event_date: date, assignments: dict,
                 admin_actor_id: int, limit: int,
-                template: str | None = None) -> str:
+                template: str | None = None, *,
+                source_sunday: str | None = None) -> str:
     """template — шаблон отчёта (черновик для предпросмотра); None —
     встроенный."""
     contacts = registry.list_responsible_contacts(admin_actor_id, service["id"])
-    # Замены на дату (этап 3.3) главнее назначений из графика.
-    assignments = apply_replacements(
-        assignments,
-        registry.list_replacements(service["id"], event_date.isoformat()),
-    )
+    contacts_by_name = {
+        (item["task"], item["name"]): item for item in contacts
+    }
+    range_entries = None
+    if source_sunday is not None and _is_range_assignments(assignments):
+        from .event_notes import validate_event_sunday
+
+        source_day = validate_event_sunday(source_sunday)
+        from .schedule_plan import approved_range_week
+
+        snapshot = approved_range_week(registry, service["id"], source_day)
+        if snapshot is None:
+            raise ValueError("Утверждённый диапазон изменился.")
+        plan = registry.get_schedule_plan(
+            service["id"], source_day.strftime("%Y-%m"),
+        )
+        task = snapshot[1]
+        fixed_names_by_day: dict[date, set[str]] = {}
+        people_by_key = {
+            person["key"]: person
+            for person in registry.readiness_people(service["id"])
+        }
+        fixed = (
+            (plan or {}).get("approved_fixed_days", {})
+            .get(source_day.isoformat(), {}).get(task, {})
+        )
+        for key, offset in fixed.items():
+            person = people_by_key.get(key)
+            if person is not None:
+                fixed_names_by_day.setdefault(
+                    source_day + timedelta(days=offset), set(),
+                ).add(person["name"])
+        range_start = source_day + timedelta(days=snapshot[0][0])
+        range_end = source_day + timedelta(days=snapshot[0][1])
+        weekdays = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+        range_label = (
+            f"{range_start:%d.%m} ({weekdays[range_start.weekday()]}) – "
+            f"{range_end:%d.%m} ({weekdays[range_end.weekday()]})"
+        )
+        grouped: dict[tuple[date, str, bool], dict] = {}
+        for day_text, day_assignments in sorted(assignments.items()):
+            actual_day = date.fromisoformat(day_text)
+            replacements = registry.list_replacements(
+                service["id"], day_text, source_sunday=source_day.isoformat(),
+            )
+            for replacement in replacements:
+                if replacement.get("telegram_id"):
+                    contacts_by_name.setdefault(
+                        (replacement["task"], replacement["new_name"]),
+                        {
+                            "name": replacement["new_name"],
+                            "telegram_id": replacement["telegram_id"],
+                            "username": replacement.get("username") or "",
+                        },
+                    )
+                names = fixed_names_by_day.get(actual_day, set())
+                if (
+                    replacement["task"] == task
+                    and replacement["old_name"] in names
+                ):
+                    names.discard(replacement["old_name"])
+                    names.add(replacement["new_name"])
+            for task_name, task_info in day_assignments.items():
+                for name in task_assignment_names(task_info):
+                    is_fixed = name in fixed_names_by_day.get(actual_day, set())
+                    label = (
+                        f"{actual_day:%d.%m} "
+                        f"({weekdays[actual_day.weekday()]})"
+                        if is_fixed else range_label
+                    )
+                    key = (actual_day, label, not is_fixed)
+                    entry = grouped.setdefault(
+                        key, {"assignments": {}, "confirmations": {}},
+                    )
+                    item = entry["assignments"].setdefault(
+                        task_name, {"names": [], "is_informational": False},
+                    )
+                    if name not in item["names"]:
+                        item["names"].append(name)
+                    contact = contacts_by_name.get((task_name, name))
+                    telegram_id = contact.get("telegram_id") if contact else None
+                    if telegram_id:
+                        entry["confirmations"].update(
+                            registry.list_confirmations(
+                                service["id"], day_text,
+                            )
+                        )
+        range_entries = [
+            (
+                day, label, is_range, value["assignments"],
+                value["confirmations"],
+            )
+            for (day, label, is_range), value in sorted(
+                grouped.items(), key=lambda item: (item[0][0], item[0][2]),
+            )
+        ]
+        assignments = {}
+        confirmations = {}
+    else:
+        # Замены на дату (этап 3.3) главнее назначений из графика.
+        assignments = apply_replacements(
+            assignments,
+            registry.list_replacements(
+                service["id"], event_date.isoformat(),
+                **({"source_sunday": source_sunday}
+                   if source_sunday is not None else {}),
+            ),
+        )
+        confirmations = registry.list_confirmations(
+            service["id"], event_date.isoformat(),
+        )
     return build_report_text(
         template,
         service["name"],
         event_date,
         assignments,
-        {(item["task"], item["name"]): item for item in contacts},
+        contacts_by_name,
         lambda telegram_id: registry.is_user_notifications_enabled(
             telegram_id, service["id"]
         ),
-        registry.list_confirmations(service["id"], event_date.isoformat()),
+        confirmations,
         limit=limit, display_names=registry.service_display_names(service["id"]),
         service_id=service["id"],
+        range_entries=range_entries,
     )
 
 
@@ -177,19 +332,29 @@ async def send_admin_reports(
     admin_actor_id: int,
     logger: logging.Logger,
     limit: int,
+    *,
+    source_sunday: str | None = None,
 ) -> None:
-    """Отчёт текущим админам служения: отправленный на эту дату
+    """Отчёт текущим админам служения: отправленный за дату или неделю
     редактируется, недоставленный или удалённый — отправляется заново.
     Снятые с служения админы обновлений больше не получают."""
-    event_iso = event_date.isoformat()
-    text = report_text(
-        registry, service, event_date, assignments, admin_actor_id, limit,
-        service.get("admin_report_template"),
-    )
+    if source_sunday is not None:
+        from .event_notes import validate_event_sunday
+
+        source_sunday = validate_event_sunday(source_sunday).isoformat()
+    event_iso = _report_storage_key(event_date, source_sunday, assignments)
     stored = {
         report["admin_id"]: report
         for report in registry.list_admin_reports(service["id"], event_iso)
     }
+    if any(report.get("source_sunday") != source_sunday for report in stored.values()):
+        raise ValueError(
+            "На эту дату уже есть отчёт другой недели; проверьте график."
+        )
+    text = report_text(
+        registry, service, event_date, assignments, admin_actor_id, limit,
+        service.get("admin_report_template"), source_sunday=source_sunday,
+    )
     recipients = report_recipients(registry, service["id"], admin_actor_id)
     for admin_id in set(stored) - set(recipients):
         registry.delete_admin_report(service["id"], event_iso, admin_id)
@@ -226,6 +391,7 @@ async def send_admin_reports(
                     registry.save_admin_report(
                         service["id"], event_iso, admin_id,
                         report["message_id"], assignments,
+                        source_sunday=source_sunday,
                     )
                 continue
         try:
@@ -242,6 +408,7 @@ async def send_admin_reports(
         if message_id is not None:
             registry.save_admin_report(
                 service["id"], event_iso, admin_id, message_id, assignments,
+                source_sunday=source_sunday,
             )
 
 
@@ -253,16 +420,61 @@ async def refresh_admin_reports(
     admin_actor_id: int,
     logger: logging.Logger,
     limit: int,
+    *,
+    task: str | None = None,
 ) -> None:
     """Перестраивает отчёты после ответа участника (если отчёт на эту дату
     уже отправлялся — до группового напоминания отчёта нет)."""
     service = registry.get_service(service_id)
+    if service is None:
+        return
+    if task is not None:
+        from .event_notes import source_sunday_for_event
+
+        source_sunday = source_sunday_for_event(
+            registry, service_id, event_date, task,
+        )
+        if source_sunday is not None:
+            reports = registry.list_admin_reports(
+                service_id, f"{source_sunday}#range",
+            )
+            if reports:
+                from .schedule_plan import approved_range_week
+
+                snapshot = approved_range_week(
+                    registry, service_id, date.fromisoformat(source_sunday),
+                )
+                if snapshot is None:
+                    logger.warning(
+                        "Не удалось обновить отчёт служения %s за неделю %s: "
+                        "утверждённый диапазон больше не найден",
+                        service_id, source_sunday,
+                    )
+                    return
+                assignments = {
+                    event_day.isoformat(): {
+                        range_task: {
+                            "names": names,
+                            "is_informational": False,
+                        }
+                        for range_task, names in tasks.items() if names
+                    }
+                    for event_day, tasks in snapshot[2].items()
+                    if tasks
+                }
+                await send_admin_reports(
+                    bot, registry, service, date.fromisoformat(source_sunday),
+                    assignments, admin_actor_id, logger, limit,
+                    source_sunday=source_sunday,
+                )
+                return
     reports = registry.list_admin_reports(service_id, event_date.isoformat())
     if service is None or not reports:
         return
     await send_admin_reports(
         bot, registry, service, event_date, reports[0]["assignments"],
         admin_actor_id, logger, limit,
+        source_sunday=reports[0].get("source_sunday"),
     )
 
 

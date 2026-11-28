@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from bot.scheduler import (
+    group_reminder_occurrence,
+    group_reminder_period_offsets,
+    group_reminder_period_status,
     in_reminder_period,
     is_reminder_event_date,
     next_reminder_occurrence,
@@ -206,6 +209,87 @@ class TaskDayProcessingTest(unittest.TestCase):
                 SUPER, common, None, date(2026, 11, 1), today=tuesday,
             )
 
+    def test_range_period_stays_active_through_the_approved_window(self):
+        self.registry.set_responsible_contact(
+            SUPER, "sound", "звук", "Алексей", 501,
+        )
+        sunday = "2026-11-01"
+        slots = {sunday: {"звук": ["Алексей"]}}
+        self.registry.save_schedule_draft(
+            "sound", "2026-11", run_id=None, dates=[sunday],
+            tasks=[{
+                "name": "звук", "needed": 1, "max": 1,
+                "window": [1, 2], "default_day": 1,
+            }],
+            slots=slots, last_served={},
+        )
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", "2026-11", slots,
+            chat_id=None, message_id=None,
+            approved_slot_days={sunday: {"звук": {"Алексей": 1}}},
+        )
+        reminder_id = self.reminder(None)
+        reminder = self.registry.get_group_reminder(reminder_id)
+        period = {
+            **reminder,
+            "active_from": None,
+            "active_until": sunday,
+        }
+        offsets = group_reminder_period_offsets(self.registry, period)
+        self.registry.set_group_reminder_period(
+            SUPER, reminder_id, None, date.fromisoformat(sunday),
+            today=date(2026, 10, 20),
+            period_end_offset=offsets[1],
+        )
+
+        self.assertEqual(offsets, (0, 2))
+        self.assertEqual(
+            group_reminder_period_status(
+                self.registry, self.registry.get_group_reminder(reminder_id),
+                date(2026, 11, 3),
+            ),
+            "active",
+        )
+        self.assertEqual(
+            group_reminder_occurrence(
+                datetime(2026, 11, 2, 9, 0, tzinfo=TZ),
+                self.registry.get_group_reminder(reminder_id),
+                self.registry, "sound",
+            ),
+            (date(2026, 11, 2), date(2026, 11, 2), date(2026, 11, 1)),
+        )
+        self.assertEqual(
+            self.registry.disable_expired_group_reminders(
+                date(2026, 11, 3), {reminder_id: offsets[1]},
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.registry.disable_expired_group_reminders(
+                date(2026, 11, 4), {reminder_id: offsets[1]},
+            ),
+            [reminder_id],
+        )
+
+    def test_preview_does_not_restore_suppressed_ordinary_occurrence(self):
+        from bot import app
+
+        reminder_id = self.reminder(None)
+        credentials = SimpleNamespace(
+            admin_tg_id=SUPER, yandex_public_url="unused",
+        )
+        with patch(
+            "bot.app.group_reminder_occurrence", return_value=None,
+        ), patch(
+            "bot.app.reminder_occurrence",
+            side_effect=AssertionError("ordinary fallback was called"),
+        ):
+            with self.assertRaisesRegex(ValueError, "Период напоминания завершён"):
+                asyncio.run(app.get_group_reminder_preview(
+                    reminder_id, credentials, self.tmp, TZ, self.registry,
+                    MagicMock(),
+                ))
+
     def test_common_reminder_skips_rehearsal_wednesday(self):
         reminder_id = self.reminder(None)
         bot, load, notify = self.process(
@@ -219,6 +303,156 @@ class TaskDayProcessingTest(unittest.TestCase):
         )
         self.assertEqual(load.await_args.kwargs["only_date"], SUNDAY)
         bot.send_message.assert_awaited()
+
+    def test_range_group_report_separates_window_and_fixed_day(self):
+        from bot import app, schedule_plan
+        from bot.excel_parser import RosterMember
+
+        self.registry.set_service_task_enabled(SUPER, "sound", "спевка", False)
+        self.registry.set_service_task_enabled(SUPER, "sound", "сборка", False)
+        self.registry.sync_service_rosters({"sound": [
+            RosterMember("Анна", ("звук",)),
+            RosterMember("Борис", ("звук",)),
+            RosterMember("Виктор", ("звук",)),
+        ]})
+        for name, user_id in (("Анна", 501), ("Борис", 502), ("Виктор", 503)):
+            self.registry.set_responsible_contact(SUPER, "sound", "звук", name, user_id)
+        self.registry.set_service_member_day(SUPER, "sound", "Анна", -5)
+        self.registry.set_readiness_settings(SUPER, "sound", day_from=-3, day_to=1)
+        plan = asyncio.run(schedule_plan.build_draft(
+            self.registry, schedule_plan.free_run("sound", 2026, 11),
+            None, MagicMock(),
+        ))
+        slots = {day: {"звук": []} for day in plan["dates"]}
+        slots["2026-11-01"]["звук"] = ["Анна", "Борис"]
+        plan = self.registry.set_schedule_slots(SUPER, "sound", "2026-11", slots)
+        people = self.registry.readiness_people("sound")
+        self.registry.approve_schedule_plan(
+            SUPER, "sound", "2026-11", slots, chat_id=None, message_id=None,
+            days=plan["days"],
+            approved_slot_days=schedule_plan.approved_slot_days(plan, people),
+            approved_fixed_days=schedule_plan.approved_fixed_days(plan, people),
+        )
+        reminder_id = self.reminder(None, days=1)
+        self.registry.update_group_reminder(
+            SUPER, reminder_id, body="{sunday_date}\n{task_assignments}",
+        )
+        credentials = SimpleNamespace(
+            admin_tg_id=SUPER,
+            yandex_public_url="https://example.invalid/schedule",
+        )
+        with patch("bot.app.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 10, 28, 9, tzinfo=TZ)
+            preview = asyncio.run(app.get_group_reminder_preview(
+                reminder_id, credentials, self.tmp, TZ, self.registry,
+                MagicMock(),
+            ))
+        self.assertTrue(preview["has_data"], preview.get("error"))
+        self.assertEqual(preview["period"], "29.10 (чт) – 02.11 (пн)")
+        from bot.ui import plain_text
+        preview_text = plain_text(preview["text"])
+        self.assertIn("Анна — 27.10 (вт)", preview_text)
+        self.assertIn("Борис — 29.10 (чт) – 02.11 (пн)", preview_text)
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=99)),
+            edit_message_text=AsyncMock(),
+        )
+        logger = MagicMock()
+        replacement_applied = False
+
+        async def send_group_then_replace(send, chat_id, text, service, **kwargs):
+            nonlocal replacement_applied
+            await send(chat_id, text, **kwargs)
+            if not replacement_applied:
+                replacement_applied = True
+                self.registry.set_replacement(
+                    "sound", "2026-10-29", "звук", "Борис", "Виктор",
+                    503, "", "admin", SUPER,
+                )
+
+        async def run():
+            with patch.object(
+                app, "send_to_service_group", side_effect=send_group_then_replace,
+            ), patch.object(
+                app, "_notify_admin", new=AsyncMock(),
+            ) as notify:
+                for day in (date(2026, 10, 28), date(2026, 10, 28), date(2026, 10, 31)):
+                    await app._process_service_reminder(
+                        bot, SimpleNamespace(admin_tg_id=SUPER), self.tmp, TZ,
+                        self.registry, "sound", reminder_id, logger, logger,
+                        run_date=day,
+                    )
+                bot.send_message.assert_awaited()
+                self.assertEqual(bot.send_message.await_count, 2)
+                group_text = bot.send_message.await_args_list[0].args[1]
+                report_text = plain_text(bot.send_message.await_args_list[1].args[1])
+                self.assertIn(">Анна</a> — 27.10 (вт)", group_text)
+                self.assertIn(">Борис</a> — 29.10 (чт) – 02.11 (пн)", group_text)
+                self.assertNotIn("Виктор", group_text)
+                self.assertIn("📅 27.10 (вт)", report_text)
+                self.assertIn("📆 29.10 (чт) – 02.11 (пн)", report_text)
+                self.assertIn("Анна (звук)", report_text)
+                self.assertIn("Виктор (звук)", report_text)
+                self.assertNotIn("Борис", report_text)
+                self.assertEqual(bot.edit_message_text.await_count, 1)
+                saved = self.registry.list_admin_reports(
+                    "sound", "2026-11-01#range",
+                )
+                self.assertEqual(saved[0]["source_sunday"], "2026-11-01")
+                self.assertEqual(
+                    set(saved[0]["assignments"]),
+                    {"2026-10-27", "2026-10-29"},
+                )
+                self.registry.set_confirmation(
+                    "sound", "2026-10-29", "звук", 503, "confirmed",
+                )
+                from bot.admin_report import refresh_admin_reports
+                await refresh_admin_reports(
+                    bot, self.registry, "sound", date(2026, 10, 29),
+                    SUPER, logger, 4096, task="звук",
+                )
+                self.assertEqual(bot.edit_message_text.await_count, 2)
+                self.assertIn(
+                    "подтвердил(а)",
+                    plain_text(bot.edit_message_text.await_args.args[0]),
+                )
+                notify.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_empty_range_does_not_send_group_reminder(self):
+        from bot import app
+
+        reminder_id = self.reminder(None)
+        snapshot = ((-3, 1), "звук", {date(2026, 10, 29): {"звук": []}})
+        bot = SimpleNamespace(send_message=AsyncMock())
+        logger = MagicMock()
+
+        async def run():
+            with patch.object(
+                app, "_range_reminder_week",
+                return_value=(SUNDAY, snapshot),
+            ), patch.object(
+                app, "approved_range_week", return_value=snapshot,
+            ), patch.object(
+                app, "_has_approved_schedule_for_event", return_value=True,
+            ), patch.object(
+                app, "_range_report_assignments", return_value={},
+            ), patch.object(
+                app, "_notify_admin", new=AsyncMock(return_value=True),
+            ) as notify, patch.object(
+                app, "send_admin_reports", new=AsyncMock(),
+            ) as reports:
+                await app._process_service_reminder(
+                    bot, SimpleNamespace(admin_tg_id=SUPER), self.tmp, TZ,
+                    self.registry, "sound", reminder_id, logger, logger,
+                    run_date=date(2026, 10, 29),
+                )
+                bot.send_message.assert_not_awaited()
+                reports.assert_not_awaited()
+                notify.assert_awaited_once()
+
+        asyncio.run(run())
 
     def test_sunday_task_reminder_no_warning_on_wednesday(self):
         reminder_id = self.reminder("звук")

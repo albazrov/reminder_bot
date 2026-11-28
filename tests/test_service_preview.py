@@ -51,9 +51,13 @@ class ServicePreviewTest(unittest.TestCase):
             self.assertNotIn("Алексей Полный", plain_text(unbound["text"]))
 
     @staticmethod
-    def _fixed_occurrence(_now, reminder):
+    def _fixed_occurrence(_now, reminder, *_args):
         event_date = date(2026, 10, 25)
-        return event_date, event_date - timedelta(days=reminder["reminder_days"])
+        return (
+            event_date,
+            event_date - timedelta(days=reminder["reminder_days"]),
+            None,
+        )
 
     def _group_reminder_preview(
         self, registry, temp_dir, assignments, body=None
@@ -66,7 +70,7 @@ class ServicePreviewTest(unittest.TestCase):
 
         async def run():
             with patch(
-                "bot.app.reminder_occurrence",
+                "bot.app.group_reminder_occurrence",
                 side_effect=self._fixed_occurrence,
             ), patch(
                 "bot.app._load_service_task_assignments",
@@ -236,7 +240,7 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app.reminder_occurrence",
+                    "bot.app.group_reminder_occurrence",
                     side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",
@@ -391,7 +395,7 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app.reminder_occurrence",
+                    "bot.app.group_reminder_occurrence",
                     side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",
@@ -424,7 +428,7 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app.reminder_occurrence",
+                    "bot.app.group_reminder_occurrence",
                     side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",
@@ -467,7 +471,7 @@ class ServicePreviewTest(unittest.TestCase):
 
             async def run():
                 with patch(
-                    "bot.app.reminder_occurrence",
+                    "bot.app.group_reminder_occurrence",
                     side_effect=self._fixed_occurrence,
                 ), patch(
                     "bot.app._load_service_task_assignments",

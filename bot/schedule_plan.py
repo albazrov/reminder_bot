@@ -26,7 +26,7 @@ from . import task_rules
 from .month_summary import month_end, month_key, month_title
 from .presentation import (
     apply_replacements, display_name, format_task_assignments,
-    task_assignment_names, task_emoji,
+    replacements_for_assignments, task_assignment_names, task_emoji,
 )
 from .readiness import (
     DEFAULT_PLAN_TITLE,
@@ -237,6 +237,18 @@ async def prepare_draft(
     )
     tasks = plan_tasks(registry, run["service_id"], catalog=catalog)
     default_day = settings["day_from"]
+    range_option = next(
+        (option for option in run.get("options", ()) if "window" in option), None
+    )
+    window = (
+        tuple(range_option["window"]) if range_option is not None
+        else (settings["day_from"], settings["day_to"])
+        if run["id"] is None and len(tasks) == 1 and tasks[0]["day"] is None
+        else (0, 0)
+    )
+    if window != (0, 0) and len(tasks) == 1:
+        tasks = [{**tasks[0], "window": list(window)}]
+        default_day = window[0]
     if default_day:
         tasks = [{**task, "default_day": default_day} for task in tasks]
     slots = {
@@ -372,10 +384,9 @@ def task_days(plan: dict) -> dict[str, int]:
     }
 
 
-def slot_offset(plan: dict, person: dict | None, day: str,
-                task: str) -> int | None:
-    """День человека в задаче на дату: разовый для задачи, разовый в
-    графике, иначе день задачи, иначе личный."""
+def specified_slot_offset(plan: dict, person: dict | None, day: str,
+                          task: str) -> int | None:
+    """Explicit assignment, task or personal day, without a window fallback."""
     key = (person or {}).get("key")
     overrides = plan.get("days", {}).get(day, {})
     task_key = task_day_key(str(key), task)
@@ -392,6 +403,15 @@ def slot_offset(plan: dict, person: dict | None, day: str,
     personal = (person or {}).get("day_offset")
     if personal is not None:
         return personal
+    return None
+
+
+def slot_offset(plan: dict, person: dict | None, day: str,
+                task: str) -> int | None:
+    """День человека: заданный день или начало окна служения."""
+    explicit = specified_slot_offset(plan, person, day, task)
+    if explicit is not None:
+        return explicit
     return next(
         (
             item.get("default_day") for item in plan["tasks"]
@@ -407,6 +427,7 @@ def _selected_slot(summary: Summary, key: str, day: str, task: str,
     return (
         option_key(service_day.isoformat(), task) in available
         or service_day.isoformat() in available
+        or ((day, task) in summary.range_slots and day in available)
         or (not summary.date_options and day in available)
     )
 
@@ -446,6 +467,20 @@ def approved_slot_days(plan: dict, people: list[dict]) -> dict:
         }
         for day, tasks in plan["slots"].items()
     }
+
+
+def approved_fixed_days(plan: dict, people: list[dict]) -> dict:
+    by_key = {person["key"]: person for person in people}
+    result: dict = {}
+    for day, tasks in plan["slots"].items():
+        for task, keys in tasks.items():
+            for key in keys:
+                offset = specified_slot_offset(
+                    plan, by_key.get(key) or {"key": key}, day, task,
+                )
+                if offset is not None:
+                    result.setdefault(day, {}).setdefault(task, {})[key] = offset
+    return result
 
 
 def served_days(plan: dict, people: list[dict]) -> dict[str, set[date]]:
@@ -630,7 +665,41 @@ def window_of(registry, service_id: str) -> tuple[int, int]:
 
 
 def plan_day_lines(plan: dict, day: str, by_key: dict, names: dict,
-                   window: tuple[int, int], mark) -> list[str]:
+                   window: tuple[int, int], mark, *,
+                   empty: str = "⚠️ никого") -> list[str]:
+    if len(plan["tasks"]) == 1 and "window" in plan["tasks"][0]:
+        task = plan["tasks"][0]
+        keys = plan["slots"].get(day, {}).get(task["name"], [])
+        start, end = task["window"]
+        sunday = date.fromisoformat(day)
+        weekdays = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+        def date_text(moment: date) -> str:
+            return f"{moment:%d.%m} ({weekdays[moment.weekday()]})"
+
+        interval = (
+            f"{date_text(sunday + timedelta(days=start))} – "
+            f"{date_text(sunday + timedelta(days=end))}"
+        )
+        def label(key: str) -> str:
+            offset = specified_slot_offset(
+                plan, by_key.get(key) or {"key": key}, day, task["name"],
+            )
+            return interval if offset is None else date_text(
+                sunday + timedelta(days=offset)
+            )
+
+        header = label(keys[0]) if len(keys) == 1 else (
+            f"К воскресенью {sunday:%d.%m}" if keys else interval
+        )
+        names_with_days = [
+            names.get(key, key) + mark(key, day, task["name"])
+            + (f" — {label(key)}" if len(keys) > 1 else "")
+            for key in keys
+        ]
+        return [f"🗓 {header}", *task_lines(
+            task["name"], task["needed"], names_with_days, empty, bare=True,
+        )]
     weekly = bool(task_days(plan)) or any(
         task.get("default_day") is not None for task in plan["tasks"]
     )
@@ -652,6 +721,7 @@ def plan_day_lines(plan: dict, day: str, by_key: dict, names: dict,
                             )
                             for person in people
                         ],
+                        bare=len(plan["tasks"]) == 1,
                     )
                 ]
         return lines
@@ -668,7 +738,7 @@ def plan_day_lines(plan: dict, day: str, by_key: dict, names: dict,
                 ))
                 for person in people
             ],
-            bare=implicit_plan(plan),
+            bare=len(plan["tasks"]) == 1,
         )
     return lines
 
@@ -1039,6 +1109,12 @@ def publication_text(service: dict, plan: dict, people: list[dict],
         task.get("default_day") is not None for task in plan["tasks"]
     )
     for day in plan["dates"]:
+        if len(plan["tasks"]) == 1 and "window" in plan["tasks"][0]:
+            links = {key: link(key) for key in by_key}
+            lines += ["", *plan_day_lines(
+                plan, day, by_key, links, window, lambda *_: "", empty=empty,
+            )]
+            continue
         if weekly:
             # У задач свои дни (спевка — ср): неделя, под ней дни и задачи.
             title, groups = week_groups(plan, day, window)
@@ -1047,6 +1123,19 @@ def publication_text(service: dict, plan: dict, people: list[dict],
                 lines.append(f"  {label}")
                 for task in tasks:
                     name = task["name"]
+                    if len(plan["tasks"]) == 1:
+                        keys = plan["slots"].get(day, {}).get(name, [])
+                        lines += (
+                            [
+                                f"    • {link(key)}"
+                                + week_person_day(
+                                    plan, by_key.get(key) or {"key": key}, day,
+                                    name, offset,
+                                )
+                                for key in keys
+                            ] or [f"    {empty}"]
+                        )
+                        continue
                     lines += _people_lines(
                         f"    {task_emoji(name)} {name}",
                         plan["slots"].get(day, {}).get(name, []),
@@ -1070,7 +1159,7 @@ def publication_text(service: dict, plan: dict, people: list[dict],
 
         for task in display_tasks(plan):
             keys = plan["slots"].get(day, {}).get(task["name"], [])
-            if implicit_plan(plan):
+            if len(plan["tasks"]) == 1:
                 lines += (
                     [f"  • {mention(key, task['name'])}" for key in keys] or [f"  {empty}"]
                 )
@@ -1353,6 +1442,7 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                                 draft: bool = False, keyed: bool = False,
                                 source_sunday: str | None = None,
                                 replacement_people: dict[str, dict] | None = None,
+                                replacement_sources: dict[str, list[str]] | None = None,
                                 ) -> dict[date, dict[str, list[str]]]:
     if draft:
         plan = {
@@ -1411,6 +1501,10 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
             plan["service_id"], event.event_date.isoformat(),
             **({"source_sunday": source_sunday} if source_sunday is not None else {}),
         )
+        if replacement_sources is not None:
+            replacements = replacements_for_assignments(
+                replacement_sources, replacements,
+            )
         current = _apply_assignment_replacements(
             event_tasks, replacements, people, keyed=keyed,
             other_assignments=(
@@ -1432,6 +1526,30 @@ def _effective_plan_assignments(registry, plan: dict, people: list[dict], *,
                 if name not in names:
                     names.append(name)
     return assignments
+
+
+def approved_range_week(registry, service_id: str, sunday: date) -> tuple | None:
+    """Снимок диапазона и назначений одной утверждённой недели с заменами."""
+    plan = registry.get_schedule_plan(service_id, sunday.strftime("%Y-%m"))
+    if plan is None or plan.get("approved") is None:
+        return None
+    tasks = plan.get("approved_tasks") or []
+    if len(tasks) != 1 or "window" not in tasks[0]:
+        return None
+    if sunday.isoformat() not in plan["approved"]:
+        return None
+    window = tasks[0]["window"]
+    if (
+        not isinstance(window, (list, tuple)) or len(window) != 2
+        or any(type(day) is not int or not -6 <= day <= 6 for day in window)
+        or window[0] > window[1]
+    ):
+        raise ValueError("Некорректный диапазон утверждённого графика.")
+    people = registry.readiness_people(service_id)
+    assignments = _effective_plan_assignments(
+        registry, plan, people, source_sunday=sunday.isoformat(),
+    )
+    return tuple(window), tasks[0]["name"], assignments
 
 
 def month_overview(
@@ -1464,6 +1582,7 @@ def month_overview(
                 selected["approval_warnings"]
             )
     assignments: dict[date, dict[str, list[str]]] = {}
+    range_entries: list[tuple[date, list[str]]] = []
     load: dict[str, set[date]] = {}
     cursor = (first - timedelta(days=7)).replace(day=1)
     while cursor <= last + timedelta(days=7):
@@ -1480,6 +1599,176 @@ def month_overview(
                         for keys in current.values():
                             for key in keys:
                                 load.setdefault(key, set()).add(moment)
+            shown_tasks = plan["tasks"] if draft else plan.get("approved_tasks") or []
+            if (
+                len(shown_tasks) == 1
+                and "window" in shown_tasks[0]
+            ):
+                task = shown_tasks[0]["name"]
+                window = tuple(shown_tasks[0]["window"])
+                original_slots = plan["slots"] if draft else plan["approved"]
+                fixed = (
+                    approved_fixed_days(plan, people) if draft
+                    else plan.get("approved_fixed_days") or {}
+                )
+                for sunday in plan["dates"]:
+                    source_day = date.fromisoformat(sunday)
+                    start, end = (
+                        source_day + timedelta(days=window[0]),
+                        source_day + timedelta(days=window[1]),
+                    )
+                    people_by_key = {
+                        person["key"]: {**person, "day_offset": None}
+                        for person in people
+                    }
+                    source_people_by_key = {
+                        person["key"]: person for person in people
+                    }
+                    original = original_slots.get(sunday, {}).get(task, [])
+                    explicit = fixed.get(sunday, {}).get(task, {})
+                    keys: list[str] = []
+                    days = {}
+                    represented: dict[date, set[tuple]] = {}
+                    source_plan = {
+                        **plan,
+                        "slots": original_slots,
+                        "tasks": shown_tasks,
+                        "days": (
+                            plan.get("approved_days") or {}
+                            if not draft else plan.get("days") or {}
+                        ),
+                    }
+                    moments = task_moments(
+                        source_plan, source_people_by_key, sunday, task,
+                        approved=not draft,
+                    )
+                    if (end < first or start > last) and not any(
+                        original_key in explicit and first <= moment <= last
+                        for moment, original_key in moments
+                    ):
+                        continue
+                    for index, (moment, original_key) in enumerate(moments):
+                        original_person = people_by_key.get(
+                            original_key,
+                            {"key": original_key, "name": original_key},
+                        )
+                        replacements = [] if draft else registry.list_replacements(
+                            plan["service_id"], moment.isoformat(),
+                            source_sunday=sunday,
+                        )
+                        replacements = replacements_for_assignments(
+                            {task: [original_person["name"]]}, replacements,
+                        )
+                        final_names = apply_replacements(
+                            {task: [original_person["name"]]}, replacements,
+                        ).get(task, [])
+                        if len(final_names) != 1:
+                            raise ValueError(
+                                "Не удалось определить участника после замены. "
+                                "Проверьте замены в графике."
+                            )
+                        final_name = final_names[0]
+                        replacement_id = next(
+                            (
+                                item.get("telegram_id")
+                                for item in reversed(replacements)
+                                if item["task"] == task
+                                and item["new_name"] == final_name
+                                and item.get("telegram_id")
+                            ),
+                            None,
+                        )
+                        matches = [
+                            person for person in people
+                            if replacement_id
+                            and person.get("telegram_id") == replacement_id
+                        ]
+                        if not matches and final_name == original_person["name"]:
+                            final_person = original_person
+                        else:
+                            if not matches:
+                                matches = [
+                                    person for person in people
+                                    if person["name"] == final_name
+                                    and task in person["tasks"]
+                                ]
+                            if len(matches) > 1:
+                                raise ValueError(
+                                    "Не удалось однозначно определить участника "
+                                    "после замены. Проверьте состав служения."
+                                )
+                            final_person = (
+                                matches[0] if matches else {
+                                    "key": final_name,
+                                    "name": final_name,
+                                    "telegram_id": replacement_id,
+                                    "username": "",
+                                }
+                            )
+                        key = f"\x1foverview:{sunday}:{task}:{index}"
+                        keys.append(key)
+                        people_by_key[key] = {
+                            **final_person, "key": key, "day_offset": None,
+                        }
+                        identity = (
+                            ("telegram", final_person["telegram_id"])
+                            if final_person.get("telegram_id")
+                            else ("key", final_person["key"])
+                        )
+                        represented.setdefault(moment, set()).add(identity)
+                        offset = explicit.get(original_key)
+                        if offset is not None:
+                            days[task_day_key(str(key), task)] = offset
+                    if not draft:
+                        replacement_people: dict[str, dict] = {}
+                        effective = _effective_plan_assignments(
+                            registry, plan, people, keyed=True,
+                            source_sunday=sunday,
+                            replacement_people=replacement_people,
+                        )
+                        effective_people = {
+                            **source_people_by_key, **replacement_people,
+                        }
+                        for moment, assignments_on_day in effective.items():
+                            for person_key in assignments_on_day.get(task, []):
+                                person = effective_people.get(
+                                    person_key, {"key": person_key, "name": person_key},
+                                )
+                                identity = (
+                                    ("telegram", person["telegram_id"])
+                                    if person.get("telegram_id")
+                                    else ("key", person_key)
+                                )
+                                if identity in represented.get(moment, set()):
+                                    continue
+                                represented.setdefault(moment, set()).add(identity)
+                                key = f"\x1foverview:{sunday}:{task}:{len(keys)}"
+                                keys.append(key)
+                                people_by_key[key] = {
+                                    **person, "key": key, "day_offset": None,
+                                }
+                                days[task_day_key(key, task)] = (moment - source_day).days
+                    view_plan = {
+                        **plan, "tasks": shown_tasks,
+                        "slots": {sunday: {task: keys}},
+                        "days": {sunday: days},
+                    }
+                    names = {
+                        key: user_link(
+                            person.get("telegram_id"), display_name(person),
+                        )
+                        for key, person in people_by_key.items()
+                        if key in keys
+                    }
+                    range_entries.append((
+                        source_day,
+                        plan_day_lines(
+                            view_plan, sunday, people_by_key, names,
+                            window, lambda *_: "",
+                        ),
+                    ))
+                cursor = (cursor + timedelta(days=32)).replace(day=1)
+                continue
             for moment, current in _effective_plan_assignments(
                 registry, plan, people, draft=draft,
             ).items():
@@ -1495,17 +1784,19 @@ def month_overview(
     lines = [status]
     if assignments and selected is None:
         lines.append("Ниже — даты соседних утверждённых графиков, попавшие в этот месяц.")
-    for day, current in sorted(assignments.items()):
-        lines += [
-            "", f"🗓 {day:%d.%m.%Y}",
+    entries = [
+        (day, [
+            f"🗓 {day:%d.%m.%Y}",
             format_task_assignments(
                 current, contacts, display_names=display_names,
                 service_id=service_id,
             ),
-        ]
-        if not any(current.values()):
-            lines.append("Назначений нет.")
-    if not assignments and selected is not None:
+        ] + (["Назначений нет."] if not any(current.values()) else []))
+        for day, current in assignments.items()
+    ]
+    for _, block in sorted(entries + range_entries, key=lambda entry: entry[0]):
+        lines += ["", *block]
+    if not assignments and not range_entries and selected is not None:
         lines += ["", "На этот месяц назначений нет."]
     if include_load:
         previous: dict[str, str] = {}
@@ -1571,6 +1862,42 @@ def member_month_assignments(registry, service_id: str, month: date, people: lis
     return selected, dates, previous
 
 
+def excel_range_view(plan: dict, people: list[dict]) -> tuple[dict, list[dict]]:
+    tasks = plan.get("approved_tasks") if plan.get("approved") is not None else None
+    tasks = tasks or plan["tasks"]
+    if len(tasks) != 1 or "window" not in tasks[0]:
+        return plan, people
+    if plan.get("approved") is None:
+        return plan, people
+    fixed = plan.get("approved_fixed_days") or {}
+    days = {
+        day: {
+            task_day_key(key, task): offset
+            for task, offsets in tasks_by_day.items()
+            for key, offset in offsets.items()
+        }
+        for day, tasks_by_day in fixed.items()
+    }
+    return (
+        {**plan, "tasks": tasks, "slots": plan["approved"], "days": days},
+        [{**person, "day_offset": None} for person in people],
+    )
+
+
+def has_unresolved_range(plan: dict, people: list[dict]) -> bool:
+    plan, people = excel_range_view(plan, people)
+    if len(plan["tasks"]) != 1 or "window" not in plan["tasks"][0]:
+        return False
+    task = plan["tasks"][0]["name"]
+    by_key = {person["key"]: person for person in people}
+    return any(
+        specified_slot_offset(plan, by_key.get(key) or {"key": key}, day, task)
+        is None
+        for day, tasks in plan["slots"].items()
+        for key in tasks.get(task, ())
+    )
+
+
 def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     """Лист как в графике: строка заголовков колонок служения, затем блок
     каждой даты — дата в первой ячейке колонки, ниже назначения. Задача со
@@ -1578,6 +1905,9 @@ def excel_rows(registry, plan: dict, people: list[dict]) -> list[list]:
     со своей задачей («Слайды») — только её люди, остальные задачи — в
     основной колонке; у «задача | имя» следующий человек задачи — без
     повтора задачи."""
+    if has_unresolved_range(plan, people):
+        raise ValueError("Для выгрузки Excel необходимо указать точные даты.")
+    plan, people = excel_range_view(plan, people)
     names = _names(people)
     columns = _columns(registry, plan["service_id"])
     own = {
@@ -1640,7 +1970,40 @@ def has_sheet_columns(registry, service_id: str) -> bool:
 
 def excel_text(registry, service: dict, plan: dict, people: list[dict]) -> str:
     year, month = map(int, plan["month"].split("-"))
+    plan, people = excel_range_view(plan, people)
     names = _names(people)
+    if len(plan["tasks"]) == 1 and "window" in plan["tasks"][0]:
+        by_key = {person["key"]: person for person in people}
+        lines = [
+            f"📋 Для Excel · {service['name']} · лист "
+            f"«{_schedule_sheet_name(date(year, month, 1))}»",
+        ]
+        for day in plan["dates"]:
+            lines += ["", *plan_day_lines(
+                plan, day, by_key, names, tuple(plan["tasks"][0]["window"]),
+                lambda *_: "", empty="пусто",
+            )]
+        outside = [
+            (moment, task["name"], names.get(key, key))
+            for day in plan["dates"]
+            for task in display_tasks(plan)
+            for moment, key in task_moments(plan, by_key, day, task["name"])
+            if (moment.year, moment.month) != (year, month)
+        ]
+        if has_unresolved_range(plan, people):
+            lines += [
+                "",
+                "⚠️ Файл Excel не создан: для некоторых участников известен только "
+                "диапазон, а не точная дата. Перенесите график вручную после уточнения дня.",
+            ]
+        elif not has_sheet_columns(registry, service["id"]):
+            lines += ["", "У служения нет колонки на листе графика — только текст."]
+        for moment, task, name in outside:
+            lines += [
+                f"⚠️ {_weekday_date(moment)} {task} — {name}: это лист "
+                f"«{_schedule_sheet_name(moment)}», на листе этого месяца её нет."
+            ]
+        return "\n".join(lines)
     lines = [
         f"📋 Для Excel · {service['name']} · лист "
         f"«{_schedule_sheet_name(date(year, month, 1))}»",
@@ -1879,6 +2242,7 @@ async def publish(
                 updated_at=plan["updated_at"], days=plan.get("days", {}),
                 served_offsets=served_offsets(plan, people),
                 approved_slot_days=approved_slot_days(plan, people),
+                approved_fixed_days=approved_fixed_days(plan, people),
                 acknowledged_warnings=warnings,
             )
             break

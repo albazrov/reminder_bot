@@ -1639,8 +1639,10 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 answer=AsyncMock(),
             )
             with patch(
-                "bot.handlers.reminder_occurrence",
-                return_value=(date(2026, 10, 25), date(2026, 10, 24)),
+                "bot.handlers.group_reminder_occurrence",
+                return_value=(
+                    date(2026, 10, 25), date(2026, 10, 24), None,
+                ),
             ):
                 await self.callback_handler("on_group_reminder_action")(
                     reminder_callback
@@ -2014,6 +2016,80 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             )
             self.assertEqual(failed_callback.answer.await_count, 1)
             self.context.bot.send_message.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_reminder_card_remains_editable_when_range_occurrence_conflicts(self):
+        async def run():
+            command = self.message(67890, "/service_notify")
+            await self.admin_router.message.handlers[6].callback(command)
+            service_callback = SimpleNamespace(
+                data="service:service_notify:sound",
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_service_selected")(service_callback)
+            reminders_button = next(
+                button
+                for row in service_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:list:sound:"
+                )
+            )
+            reminders_callback = SimpleNamespace(
+                data=reminders_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            await self.callback_handler("on_group_reminder_action")(
+                reminders_callback
+            )
+            reminder_button = next(
+                button
+                for row in reminders_callback.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+                if button.callback_data.startswith(
+                    "group_reminder:open:sound:"
+                )
+            )
+            card_callback = SimpleNamespace(
+                data=reminder_button.callback_data,
+                from_user=SimpleNamespace(id=67890),
+                message=self.message(67890, ""),
+                answer=AsyncMock(),
+            )
+            with patch(
+                "bot.handlers.group_reminder_occurrence",
+                side_effect=ValueError(
+                    "На 30.11 приходятся напоминания разных недель."
+                ),
+            ):
+                await self.callback_handler("on_group_reminder_action")(
+                    card_callback
+                )
+
+            card_text = card_callback.message.answer.await_args.args[0]
+            card_markup = card_callback.message.answer.await_args.kwargs[
+                "reply_markup"
+            ]
+            buttons = [
+                button.text
+                for row in card_markup.inline_keyboard
+                for button in row
+            ]
+            self.assertIn(
+                "На 30.11 приходятся напоминания разных недель.", card_text,
+            )
+            self.assertIn("📅 Срок", buttons)
+            self.assertIn("🗓 Период", buttons)
+            self.assertIn("👁 Предпросмотр", buttons)
 
         asyncio.run(run())
 
@@ -3118,6 +3194,37 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             self.assertEqual(
                 self.registry.get_group_reminder(other_id)["reminder_days"], 1
             )
+
+        asyncio.run(run())
+
+    def test_period_picker_includes_current_week_when_approved_range_is_active(self):
+        async def run():
+            menu = await self._open_sound_reminders()
+            card = await self._click(
+                menu.message,
+                lambda button: button.callback_data.startswith(
+                    "group_reminder:open:sound:"
+                ),
+            )
+            with patch("bot.handlers.datetime") as clock, patch(
+                "bot.handlers.schedule_plan.approved_range_week",
+                return_value=((-3, 1), "звук", {}),
+            ):
+                clock.now.return_value = datetime(
+                    2026, 11, 30, 12, 0, tzinfo=ZoneInfo("UTC"),
+                )
+                period = await self._click(
+                    card.message, lambda button: button.text == "🗓 Период",
+                )
+
+            buttons = [
+                button
+                for row in period.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            ]
+            self.assertIn("🗓 29.11", [button.text for button in buttons])
 
         asyncio.run(run())
 
@@ -7025,7 +7132,15 @@ class ServiceManagementHandlerTest(unittest.TestCase):
                 "Используется встроенный текст",
                 text_screen.message.answer.await_args.args[0],
             )
-            preview = await press("rdy:tplprev:sound:intro")
+            with patch(
+                "bot.handlers.readiness.uses_window_options",
+                return_value=True,
+            ), patch(
+                "bot.handlers.readiness.intro_text",
+                wraps=readiness.intro_text,
+            ) as intro_renderer:
+                preview = await press("rdy:tplprev:sound:intro")
+            self.assertTrue(intro_renderer.call_args.kwargs["range_poll"])
             self.assertIn(
                 "Спасибо за твое служение",
                 preview.message.answer.await_args.args[0],
@@ -7248,6 +7363,34 @@ class ServiceManagementHandlerTest(unittest.TestCase):
             text = preview.message.answer.await_args.args[0]
             self.assertIn(f"• {first_sunday:%d.%m} — звук\n", text)
             self.assertIn("всем вашим задачам", text)
+            self.registry.set_service_task_enabled(67890, "sound", "сборка", False)
+            preview = await press("rdy:overview:sound")
+            text = preview.message.answer.await_args.args[0]
+            self.assertIn(f"• {first_sunday:%d.%m}\n", text)
+            self.assertNotIn(f"• {first_sunday:%d.%m} — звук", text)
+            self.assertNotIn("Одна дата относится", text)
+            self.context.bot.send_poll.assert_not_awaited()
+            self.registry.set_readiness_settings(
+                67890, "sound", day_from=-3, day_to=1,
+            )
+            card = await press("rdy:open:sound")
+            self.assertIn("📋 Варианты: диапазоны", card.message.answer.await_args.args[0])
+            formats = await press("rdy:format:sound")
+            self.assertIn("периоды автоматически", formats.message.answer.await_args.args[0])
+            format_buttons = [
+                button.callback_data
+                for row in formats.message.answer.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard for button in row
+            ]
+            self.assertEqual(format_buttons, ["rdy:days:sound", "rdy:open:sound"])
+            stale = await press("rdy:fmt:sound:tasks")
+            self.assertIn("Формат изменился", stale.answer.await_args.args[0])
+            self.assertTrue(self.registry.get_readiness_settings("sound")["dates_only"])
+            self.registry.set_readiness_settings(
+                67890, "sound", day_from=0, day_to=0,
+            )
+            self.registry.set_service_task_enabled(67890, "sound", "сборка", True)
             await press("rdy:fmt:sound:tasks")
 
             self.registry.sync_service_rosters({"sound": [

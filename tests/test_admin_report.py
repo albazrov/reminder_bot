@@ -5,9 +5,10 @@ import unittest
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from bot import schedule_plan
 from bot.admin_report import (
     build_report_text,
     fit_one_screen,
@@ -38,6 +39,23 @@ class RegistryTestCase(unittest.TestCase):
 
 
 class ConfirmationRegistryTest(RegistryTestCase):
+    def test_existing_reports_survive_source_week_migration(self):
+        iso = FUTURE.isoformat()
+        self.registry.save_admin_report("sound", iso, SUPER, 5, ASSIGNMENTS)
+        with self.registry._connection() as connection:
+            connection.execute("ALTER TABLE admin_report_messages DROP COLUMN source_sunday")
+        self.registry.initialize(SUPER, -100)
+        self.assertEqual(self.registry.list_admin_reports("sound", iso), [
+            {"admin_id": SUPER, "message_id": 5, "assignments": ASSIGNMENTS},
+        ])
+        self.registry.save_admin_report(
+            "sound", iso, SUPER, 5, ASSIGNMENTS, source_sunday="2026-11-01",
+        )
+        self.assertEqual(
+            self.registry.list_admin_reports("sound", iso)[0]["source_sunday"],
+            "2026-11-01",
+        )
+
     def test_answer_is_stored_and_change_detected(self):
         iso = FUTURE.isoformat()
         self.assertEqual(
@@ -178,6 +196,117 @@ class FitOneScreenTest(unittest.TestCase):
 
 
 class ReportDeliveryTest(RegistryTestCase):
+    def test_range_report_preserves_source_week_on_refresh(self):
+        async def run():
+            bot = SimpleNamespace(
+                send_message=AsyncMock(return_value=SimpleNamespace(message_id=5)),
+                edit_message_text=AsyncMock(),
+            )
+            service = self.registry.get_service("sound")
+            day = date(2026, 10, 29)
+            with self.assertRaisesRegex(ValueError, "воскресеньем"):
+                await send_admin_reports(
+                    bot, self.registry, service, day, ASSIGNMENTS, SUPER,
+                    MagicMock(), 4096, source_sunday="2026-10-29",
+                )
+            bot.send_message.assert_not_awaited()
+            with patch.object(
+                self.registry, "list_replacements",
+                wraps=self.registry.list_replacements,
+            ) as replacements:
+                await send_admin_reports(
+                    bot, self.registry, service, day, ASSIGNMENTS, SUPER,
+                    MagicMock(), 4096, source_sunday="2026-11-01",
+                )
+                self.assertEqual(
+                    self.registry.list_admin_reports("sound", day.isoformat())[0][
+                        "source_sunday"
+                    ],
+                    "2026-11-01",
+                )
+                self.registry.set_confirmation(
+                    "sound", day.isoformat(), "звук", MEMBER, "confirmed"
+                )
+                await refresh_admin_reports(
+                    bot, self.registry, "sound", day, SUPER, MagicMock(), 4096,
+                )
+                self.assertEqual(
+                    replacements.call_args.kwargs["source_sunday"], "2026-11-01"
+                )
+                self.assertIn("подтвердил(а) — Алексей", bot.edit_message_text.await_args.args[0])
+                with self.assertRaisesRegex(ValueError, "другой недели"):
+                    await send_admin_reports(
+                        bot, self.registry, service, day, ASSIGNMENTS, SUPER,
+                        MagicMock(), 4096, source_sunday="2026-10-25",
+                    )
+                self.assertEqual(bot.send_message.await_count, 1)
+
+        asyncio.run(run())
+
+    def test_range_report_refresh_uses_current_replacements(self):
+        async def run():
+            self.registry.set_responsible_contact(
+                SUPER, "sound", "звук", "Борис", 4005,
+            )
+            sunday = "2026-11-01"
+            slots = {sunday: {"звук": ["Алексей"]}}
+            self.registry.save_schedule_draft(
+                "sound", "2026-11", run_id=None, dates=[sunday],
+                tasks=[{
+                    "name": "звук", "needed": 1, "max": 1,
+                    "window": [1, 2], "default_day": 1,
+                }],
+                slots=slots, last_served={},
+            )
+            self.registry.approve_schedule_plan(
+                SUPER, "sound", "2026-11", slots,
+                chat_id=None, message_id=None,
+                approved_slot_days={sunday: {"звук": {"Алексей": 1}}},
+            )
+            snapshot = schedule_plan.approved_range_week(
+                self.registry, "sound", date.fromisoformat(sunday),
+            )
+            assignments = {
+                event_day.isoformat(): {
+                    task: {"names": names, "is_informational": False}
+                    for task, names in tasks.items()
+                }
+                for event_day, tasks in snapshot[2].items()
+            }
+            bot = SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(message_id=5),
+                ),
+                edit_message_text=AsyncMock(),
+            )
+            service = self.registry.get_service("sound")
+            await send_admin_reports(
+                bot, self.registry, service, date.fromisoformat(sunday),
+                assignments, SUPER, MagicMock(), 4096,
+                source_sunday=sunday,
+            )
+            self.registry.set_replacement(
+                "sound", "2026-11-02", "звук", "Алексей", "Борис",
+                4005, "", "admin", SUPER,
+            )
+
+            await refresh_admin_reports(
+                bot, self.registry, "sound", date(2026, 11, 2), SUPER,
+                MagicMock(), 4096, task="звук",
+            )
+
+            updated_text = bot.edit_message_text.await_args.args[0]
+            self.assertIn("Борис", updated_text)
+            self.assertNotIn("Алексей", updated_text)
+            saved = self.registry.list_admin_reports(
+                "sound", f"{sunday}#range",
+            )[0]["assignments"]
+            self.assertEqual(
+                saved["2026-11-02"]["звук"]["names"], ["Борис"],
+            )
+
+        asyncio.run(run())
+
     def test_report_sent_once_then_edited(self):
         async def run():
             self.registry.add_service_admin(SUPER, "sound", ADMIN)

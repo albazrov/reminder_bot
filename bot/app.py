@@ -61,7 +61,7 @@ if __package__:
         resolve_assignments,
     )
     from .admin_report import report_text, send_admin_reports
-    from .event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes
+    from .event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes, source_sunday_for_event
     from .group_send import group_message_reference
     from .handlers import register, send_to_service_group
     from .logger import setup_loggers
@@ -80,6 +80,8 @@ if __package__:
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
+        person_label,
+        replacements_for_assignments,
         task_assignment_names,
         task_is_informational,
     )
@@ -88,10 +90,14 @@ if __package__:
     from .month_summary import send_due_month_summaries
     from .personal_reminders import personal_reminder_block_reason
     from .readiness import run_readiness_tick
-    from .schedule_plan import plan_events
+    from .schedule_plan import (
+        WEEKDAYS, _effective_plan_assignments, approved_range_week, plan_events,
+    )
     from .scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        group_reminder_occurrence,
+        group_reminder_period_offsets,
         in_reminder_period,
         is_reminder_event_date,
         reminder_occurrence,
@@ -133,7 +139,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         resolve_assignments,
     )
     from bot.admin_report import report_text, send_admin_reports
-    from bot.event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes
+    from bot.event_notes import EventNoteResolutionError, resolve_event_note, send_scheduled_event_notes, source_sunday_for_event
     from bot.group_send import group_message_reference
     from bot.assignment_fields import (
         AssignmentFields, AssignmentFieldResolutionError, resolve_assignment_fields,
@@ -155,6 +161,7 @@ else:  # pragma: no cover - поддержка запуска файла нап�
         format_informational_notes,
         format_task_assignments,
         format_task_responsibles,
+        person_label,
         task_assignment_names,
         task_is_informational,
     )
@@ -163,10 +170,14 @@ else:  # pragma: no cover - поддержка запуска файла нап�
     from bot.month_summary import send_due_month_summaries
     from bot.personal_reminders import personal_reminder_block_reason
     from bot.readiness import run_readiness_tick
-    from bot.schedule_plan import plan_events
+    from bot.schedule_plan import (
+        WEEKDAYS, _effective_plan_assignments, approved_range_week, plan_events,
+    )
     from bot.scheduler import (
         add_service_reminder_jobs,
         build_scheduler,
+        group_reminder_occurrence,
+        group_reminder_period_offsets,
         in_reminder_period,
         is_reminder_event_date,
         reminder_occurrence,
@@ -1217,8 +1228,113 @@ def _apply_event_replacements(events: list, registry) -> list:
     return result
 
 
+def _range_reminder_week(registry, service_id: str, reminder: dict,
+                         anchor: date) -> tuple | None:
+    """Найти неделю диапазона по дате, от которой считается напоминание."""
+    first = anchor - timedelta(days=6)
+    sunday = first + timedelta(days=(6 - first.weekday()) % 7)
+    matches = []
+    while sunday <= anchor + timedelta(days=6):
+        snapshot = approved_range_week(registry, service_id, sunday)
+        if snapshot is not None:
+            if (
+                (not reminder.get("task") or reminder["task"] == snapshot[1])
+                and sunday + timedelta(days=snapshot[0][0]) == anchor
+            ):
+                matches.append((sunday, snapshot))
+        sunday += timedelta(days=7)
+    if len(matches) > 1:
+        raise ReplacementResolutionError(
+            "Начало диапазонов двух недель совпало. Проверьте график."
+        )
+    return matches[0] if matches else None
+
+
+def _range_group_assignments(snapshot: tuple) -> dict:
+    merged: dict[str, dict] = {}
+    for tasks in snapshot[2].values():
+        for task, names in tasks.items():
+            item = merged.setdefault(task, {"names": [], "is_informational": False})
+            for name in names:
+                if name not in item["names"]:
+                    item["names"].append(name)
+    return merged
+
+
+def _range_group_assignment_text(
+    registry, service_id: str, sunday: date, snapshot: tuple,
+    contacts_by_name: dict, display_names: dict[str, str] | None = None,
+) -> str:
+    task = snapshot[1]
+    plan = registry.get_schedule_plan(service_id, sunday.strftime("%Y-%m"))
+    fixed = (
+        (plan or {}).get("approved_fixed_days", {})
+        .get(sunday.isoformat(), {}).get(task, {})
+    )
+    fixed_names_by_day: dict[date, set[str]] = {}
+    people_by_key = {
+        person["key"]: person for person in registry.readiness_people(service_id)
+    }
+    for key, offset in fixed.items():
+        person = people_by_key.get(key)
+        if person is not None and type(offset) is int:
+            fixed_names_by_day.setdefault(
+                sunday + timedelta(days=offset), set(),
+            ).add(person["name"])
+    for fixed_day, names in fixed_names_by_day.items():
+        for replacement in registry.list_replacements(
+            service_id, fixed_day.isoformat(), source_sunday=sunday.isoformat(),
+        ):
+            if replacement["task"] == task and replacement["old_name"] in names:
+                names.discard(replacement["old_name"])
+                names.add(replacement["new_name"])
+    start = sunday + timedelta(days=snapshot[0][0])
+    end = sunday + timedelta(days=snapshot[0][1])
+    range_label = (
+        f"{start:%d.%m} ({WEEKDAYS[start.weekday()]}) – "
+        f"{end:%d.%m} ({WEEKDAYS[end.weekday()]})"
+    )
+    lines = []
+    for event_date, tasks in sorted(snapshot[2].items()):
+        names = tasks.get(task, ())
+        if not names:
+            continue
+        for name in names:
+            is_fixed_day = name in fixed_names_by_day.get(event_date, set())
+            day_label = (
+                f"{event_date:%d.%m} ({WEEKDAYS[event_date.weekday()]})"
+                if is_fixed_day else range_label
+            )
+            label = person_label(
+                task, name, contacts_by_name, mark_unlinked=True,
+                display_names=display_names,
+            )
+            lines.append(f"• {label} — {day_label}")
+    return "\n".join(lines) or "⚪ Ответственные не указаны"
+
+
+def _range_report_assignments(registry, service_id: str, sunday: date) -> dict:
+    plan = registry.get_schedule_plan(service_id, sunday.strftime("%Y-%m"))
+    if plan is None or plan.get("approved") is None:
+        raise ValueError("Утверждённый график изменился.")
+    people = registry.readiness_people(service_id)
+    assignments = _effective_plan_assignments(
+        registry, plan, people, source_sunday=sunday.isoformat(),
+    )
+    return {
+        event_day.isoformat(): {
+            task: {"names": names, "is_informational": False}
+            for task, names in tasks.items() if names
+        }
+        for event_day, tasks in assignments.items() if tasks
+    }
+
+
 def _group_preview_state(registry, public_url: str, service_id: str,
-                         event_date: date) -> list:
+                         event_date: date,
+                         source_sunday: date | None = None) -> list | tuple:
+    if source_sunday is not None:
+        return approved_range_week(registry, service_id, source_sunday)
     return _approved_service_events(
         registry, public_url, event_date, event_date, service_ids={service_id},
     )
@@ -1244,13 +1360,42 @@ async def get_group_reminder_preview(
     if service is None:
         raise ValueError("Служение для напоминания не найдено.")
 
-    occurrence = reminder_occurrence(datetime.now(tz), reminder)
+    occurrence = group_reminder_occurrence(
+        datetime.now(tz), reminder, registry, service["id"],
+    )
     if occurrence is None:
         raise ValueError("Период напоминания завершён.")
-    event_date, send_date = occurrence
-    date_text = event_date.strftime("%d.%m.%Y")
+    event_date, send_date, source_sunday = occurrence
+    source_day = (
+        source_sunday if isinstance(source_sunday, date)
+        else date.fromisoformat(source_sunday)
+        if source_sunday is not None else None
+    )
+    range_snapshot = (
+        approved_range_week(
+            registry, service["id"], source_day,
+        )
+        if source_day is not None else None
+    )
+    if source_day is not None and range_snapshot is None:
+        raise ValueError("Утверждённый диапазон изменился. Откройте предпросмотр заново.")
+    display_date = event_date.strftime("%d.%m.%Y")
+    period_label = None
+    if range_snapshot is not None:
+        sunday = source_day
+        start = sunday + timedelta(days=range_snapshot[0][0])
+        end = sunday + timedelta(days=range_snapshot[0][1])
+        period_label = (
+            f"{start:%d.%m} ({WEEKDAYS[start.weekday()]}) – "
+            f"{end:%d.%m} ({WEEKDAYS[end.weekday()]})"
+        )
+        display_date = period_label
+        event_date = sunday
+        date_text = sunday.strftime("%d.%m.%Y")
+    else:
+        date_text = event_date.strftime("%d.%m.%Y")
     result = {
-        "date": date_text,
+        "date": display_date,
         "send_date": send_date.strftime("%d.%m.%Y"),
         "time": reminder["reminder_time"],
         "text": "",
@@ -1258,19 +1403,27 @@ async def get_group_reminder_preview(
         "error": None,
     }
     try:
-        assignments, event_found = await _load_service_task_assignments(
-            credentials,
-            shm_dir,
-            tz,
-            service["id"],
-            debug_logger,
-            only_date=event_date,
-            return_event_found=True,
-            services=registry.service_catalog(),
-            registry=registry,
-            backup_manager=backup_manager,
-            require_approved_plan=True,
-        )
+        if range_snapshot is not None:
+            assignments = _range_group_assignments(range_snapshot)
+            event_found = any(
+                task_assignment_names(info)
+                for info in assignments.values()
+                if not task_is_informational(info)
+            )
+        else:
+            assignments, event_found = await _load_service_task_assignments(
+                credentials,
+                shm_dir,
+                tz,
+                service["id"],
+                debug_logger,
+                only_date=event_date,
+                return_event_found=True,
+                services=registry.service_catalog(),
+                registry=registry,
+                backup_manager=backup_manager,
+                require_approved_plan=True,
+            )
     except ReplacementResolutionError as exc:
         debug_logger.warning("Не удалось определить неделю замены для предпросмотра")
         result["error"] = str(exc)
@@ -1289,6 +1442,7 @@ async def get_group_reminder_preview(
 
     if not any(
         not task_is_informational(task_info)
+        and (range_snapshot is None or task_assignment_names(task_info))
         for task_info in assignments.values()
     ):
         result["error"] = (
@@ -1311,9 +1465,12 @@ async def get_group_reminder_preview(
         (contact["task"], contact["name"]): contact for contact in contacts
     }
     result["event_date"] = event_date.isoformat()
+    result["source_sunday"] = source_day.isoformat() if source_day else None
+    result["period"] = period_label
     try:
         result["schedule_state"] = _group_preview_state(
             registry, credentials.yandex_public_url, service["id"], event_date,
+            source_day,
         )
     except ReplacementResolutionError as exc:
         debug_logger.warning("Не удалось определить неделю замены для предпросмотра")
@@ -1323,11 +1480,16 @@ async def get_group_reminder_preview(
         body if body is not None
         else registry.resolve_group_text(reminder, service)
     )
+    if range_snapshot is not None and template == DEFAULT_GROUP_TEMPLATE:
+        template = (
+            "Напоминание о служении «{service_name}»:\n{task_assignments}"
+        )
     try:
         field_values = resolve_assignment_fields(
             registry, service["id"], event_date, template,
             datetime.now(tz).date() if manual else send_date,
             reminder.get("task"),
+            **({"source_sunday": source_day.isoformat()} if source_day else {}),
         )
         result["assignment_state"] = field_values.state
         result["warnings"] = field_values.warnings
@@ -1335,11 +1497,19 @@ async def get_group_reminder_preview(
             template, reminder, service, assignments, contacts_by_name,
             date_text, registry.service_display_names(service["id"]),
             assignment_fields=field_values,
+            task_assignments_text=(
+                _range_group_assignment_text(
+                    registry, service["id"], source_day, range_snapshot,
+                    contacts_by_name, registry.service_display_names(service["id"]),
+                )
+                if range_snapshot is not None else None
+            ),
             event_notes=resolve_event_note(
                 registry, service["id"], event_date, reminder.get("task"),
                 template=template,
                 include_scheduled=False,
                 public_url=credentials.yandex_public_url if "{event_notes" in template else None,
+                **({"source_sunday": source_day.isoformat()} if source_day else {}),
             ),
         )
     except (AssignmentFieldResolutionError, ReplacementResolutionError) as exc:
@@ -1496,6 +1666,7 @@ def _render_group_reminder(
     *,
     event_notes: str = "",
     assignment_fields: AssignmentFields | None = None,
+    task_assignments_text: str | None = None,
 ) -> str:
     """Текст группового напоминания; для задачи — только её ответственные."""
     task = reminder.get("task") or ""
@@ -1507,10 +1678,14 @@ def _render_group_reminder(
         _TemplateValues(
             service_name=service["name"],
             sunday_date=date_text,
-            task_assignments=format_task_assignments(
-                scoped, contacts_by_name, mark_unlinked=True,
-                display_names=display_names,
-                service_id=service["id"],
+            task_assignments=(
+                task_assignments_text
+                if task_assignments_text is not None
+                else format_task_assignments(
+                    scoped, contacts_by_name, mark_unlinked=True,
+                    display_names=display_names,
+                    service_id=service["id"],
+                )
             ),
             informational_notes=format_informational_notes(assignments, service["id"]),
             event_notes=event_notes,
@@ -1626,11 +1801,39 @@ async def _process_service_reminder(
     event_date = (run_date or datetime.now(tz).date()) + timedelta(
         days=reminder["reminder_days"]
     )
+    try:
+        range_week = _range_reminder_week(registry, service_id, reminder, event_date)
+        if range_week is None and event_date.weekday() == 6:
+            snapshot = approved_range_week(registry, service_id, event_date)
+            if (
+                snapshot is not None and snapshot[0][0] != 0
+                and (not reminder.get("task") or reminder["task"] == snapshot[1])
+            ):
+                return
+        if range_week is None and reminder.get("task"):
+            source = source_sunday_for_event(
+                registry, service_id, event_date, reminder["task"]
+            )
+            if source and approved_range_week(
+                registry, service_id, date.fromisoformat(source)
+            ) is not None:
+                return
+    except (ValueError, sqlite3.Error, ReplacementResolutionError, EventNoteResolutionError) as exc:
+        debug_logger.exception("Не удалось определить неделю диапазона для напоминания")
+        await _notify_admin(
+            bot, credentials.admin_tg_id,
+            f"Напоминание «{service['name']}» не отправлено: {exc}",
+            debug_logger,
+        )
+        return
+    range_snapshot = range_week[1] if range_week is not None else None
+    if range_week is not None:
+        event_date = range_week[0]
     # Задание срабатывает каждый день; событие — в день, от которого
     # считается напоминание (решение 17, 5а): общее — воскресенье, задачи —
     # её день. Задача в другой день (разовый день человека: спевка в
     # воскресенье) — тоже, если в графике она на эту дату есть.
-    on_day = is_reminder_event_date(event_date, reminder)
+    on_day = range_week is not None or is_reminder_event_date(event_date, reminder)
     if not on_day and not reminder.get("task"):
         return
     # Период — по воскресенью недели. Разовый день: понедельник — после
@@ -1640,7 +1843,9 @@ async def _process_service_reminder(
         else event_date + timedelta(days=(6 - event_date.weekday()) % 7)
     )
     if not (
-        in_reminder_period(event_date, reminder) if on_day
+        in_reminder_period(
+            event_date, {**reminder, "task_day": None} if range_week else reminder
+        ) if on_day
         else in_reminder_period(week_sunday, {**reminder, "task_day": None})
     ):
         interaction_logger.info(
@@ -1652,8 +1857,9 @@ async def _process_service_reminder(
         approved_plan = _has_approved_schedule_for_event(
             registry, service_id, event_date
         )
-        approved_state = _approved_assignments_state(
-            registry, service_id, event_date
+        approved_state = (
+            approved_range_week(registry, service_id, event_date)
+            if range_week else _approved_assignments_state(registry, service_id, event_date)
         )
     except Exception:
         debug_logger.exception(
@@ -1678,24 +1884,34 @@ async def _process_service_reminder(
             bot, credentials, registry, service_id, event_date, debug_logger
         )
         return
+    if range_week is not None and approved_state != range_snapshot:
+        debug_logger.info("Диапазон графика изменился во время подготовки напоминания")
+        return
     schedule_issues: list[str] = []
-    raw_assignments: dict = {}
+    report_assignments: dict = {}
     try:
-        assignments, event_found = await _load_service_task_assignments(
-            credentials,
-            shm_dir,
-            tz,
-            service_id,
-            debug_logger,
-            only_date=event_date,
-            return_event_found=True,
-            services=registry.service_catalog(),
-            issues=schedule_issues,
-            registry=registry,
-            raw_out=raw_assignments,
-            backup_manager=backup_manager,
-            require_approved_plan=True,
-        )
+        if range_week:
+            assignments = _range_group_assignments(range_snapshot)
+            event_found = bool(assignments)
+            report_assignments = _range_report_assignments(
+                registry, service_id, event_date,
+            )
+        else:
+            assignments, event_found = await _load_service_task_assignments(
+                credentials,
+                shm_dir,
+                tz,
+                service_id,
+                debug_logger,
+                only_date=event_date,
+                return_event_found=True,
+                services=registry.service_catalog(),
+                issues=schedule_issues,
+                registry=registry,
+                raw_out=report_assignments,
+                backup_manager=backup_manager,
+                require_approved_plan=True,
+            )
     except Exception as exc:
         debug_logger.exception(
             "Не удалось подготовить уведомление служения %s на %s",
@@ -1795,10 +2011,15 @@ async def _process_service_reminder(
             )
     date_text = event_date.strftime("%d.%m.%Y")
     group_template = registry.resolve_group_text(reminder, service)
+    if range_week and group_template == DEFAULT_GROUP_TEMPLATE:
+        group_template = (
+            "Напоминание о служении «{service_name}»:\n{task_assignments}"
+        )
     try:
         field_values = resolve_assignment_fields(
             registry, service_id, event_date, group_template,
             datetime.now(tz).date(), reminder.get("task"),
+            **({"source_sunday": event_date.isoformat()} if range_week else {}),
         )
         for warning in field_values.warnings:
             debug_logger.warning("Поле группового напоминания: %s", warning)
@@ -1806,11 +2027,19 @@ async def _process_service_reminder(
             group_template, reminder, service, assignments, contacts_by_name,
             date_text, registry.service_display_names(service_id),
             assignment_fields=field_values,
+            task_assignments_text=(
+                _range_group_assignment_text(
+                    registry, service_id, event_date, range_snapshot,
+                    contacts_by_name, registry.service_display_names(service_id),
+                )
+                if range_week else None
+            ),
             event_notes=resolve_event_note(
                 registry, service_id, event_date, reminder.get("task"),
                 template=group_template,
                 include_scheduled=False,
                 public_url=credentials.yandex_public_url if "{event_notes" in group_template else None,
+                **({"source_sunday": event_date.isoformat()} if range_week else {}),
             ),
         )
     except (AttributeError, IndexError, KeyError, ValueError, sqlite3.Error) as exc:
@@ -1844,6 +2073,7 @@ async def _process_service_reminder(
 
     if not any(
         not task_is_informational(task_info)
+        and (not range_week or task_assignment_names(task_info))
         for task_info in assignments.values()
     ):
         await _notify_admin(
@@ -1888,14 +2118,16 @@ async def _process_service_reminder(
                 still_approved = _has_approved_schedule_for_event(
                     registry, service_id, event_date
                 )
-                same_assignments = approved_state == _approved_assignments_state(
-                    registry, service_id, event_date
+                same_assignments = approved_state == (
+                    approved_range_week(registry, service_id, event_date)
+                    if range_week else _approved_assignments_state(registry, service_id, event_date)
                 )
                 if field_values.state:
                     same_assignments = same_assignments and (
                         field_values.state == resolve_assignment_fields(
                             registry, service_id, event_date, group_template,
                             datetime.now(tz).date(), reminder.get("task"),
+                            **({"source_sunday": event_date.isoformat()} if range_week else {}),
                         ).state
                     )
             except Exception:
@@ -2070,17 +2302,47 @@ async def _process_service_reminder(
     ):
         # Отчёт отдельно от группового сообщения: недоставленный ранее
         # отчёт отправится при следующем запуске, не повторяя группу.
-        try:
-            await send_admin_reports(
-                bot, registry, service, event_date,
-                raw_assignments or assignments,
-                credentials.admin_tg_id, debug_logger, TELEGRAM_TEXT_LIMIT,
-            )
-        except Exception:  # noqa: BLE001
-            debug_logger.exception(
-                "Не удалось подготовить отчёт админам служения %s",
-                service_id,
-            )
+        if range_week:
+            try:
+                report_assignments = _range_report_assignments(
+                    registry, service_id, event_date,
+                )
+            except Exception:
+                debug_logger.exception(
+                    "Не удалось обновить назначения для отчёта служения %s",
+                    service_id,
+                )
+                await _notify_admin(
+                    bot, credentials.admin_tg_id,
+                    f"Не удалось обновить отчёт «{service['name']}» на "
+                    f"{event_date:%d.%m.%Y}. Проверьте замены и график.",
+                    debug_logger,
+                )
+                return
+        reports = (
+            [(event_date, report_assignments)] if range_week
+            else [(event_date, report_assignments or assignments)]
+        )
+        for report_day, report_assignments in reports:
+            try:
+                await send_admin_reports(
+                    bot, registry, service, report_day,
+                    report_assignments,
+                    credentials.admin_tg_id, debug_logger, TELEGRAM_TEXT_LIMIT,
+                    **({"source_sunday": event_date.isoformat()} if range_week else {}),
+                )
+            except Exception:  # noqa: BLE001
+                debug_logger.exception(
+                    "Не удалось подготовить отчёт админам служения %s",
+                    service_id,
+                )
+                if range_week:
+                    await _notify_admin(
+                        bot, credentials.admin_tg_id,
+                        f"Не удалось подготовить отчёт «{service['name']}» "
+                        f"на {report_day:%d.%m.%Y}. Проверьте график и отчёты.",
+                        debug_logger,
+                    )
 
 
 async def _expire_group_reminder_messages(
@@ -2311,19 +2573,107 @@ async def _process_user_reminder_schedule(
         body=schedule.get("body"),
     )
     try:
+        ambiguous_range_source = False
+        try:
+            range_source = source_sunday_for_event(
+                registry,
+                schedule["service_id"],
+                event_date,
+                schedule["task"],
+                telegram_id=schedule["actor_id"],
+            )
+        except EventNoteResolutionError:
+            range_source = None
+            ambiguous_range_source = True
+            debug_logger.warning(
+                "Не удалось однозначно определить неделю личного напоминания "
+                "%s; отправляется дата без подписи диапазона",
+                schedule_id,
+            )
+        range_snapshot = (
+            approved_range_week(
+                registry, schedule["service_id"],
+                date.fromisoformat(range_source),
+            )
+            if range_source else None
+        )
+        range_label = None
+        if range_snapshot is not None:
+            plan = registry.get_schedule_plan(
+                schedule["service_id"], range_source[:7],
+            )
+            fixed = (
+                (plan or {}).get("approved_fixed_days", {})
+                .get(range_source, {}).get(schedule["task"], {})
+            )
+            source_day = date.fromisoformat(range_source)
+            people = registry.readiness_people(schedule["service_id"])
+            by_key = {person["key"]: person for person in people}
+            fixed_keys = {
+                key for key, offset in fixed.items()
+                if source_day + timedelta(days=offset) == event_date
+            }
+            person_keys = {
+                person["key"] for person in people
+                if person.get("telegram_id") == schedule["actor_id"]
+                and person["name"] == schedule["name"]
+            }
+            is_fixed_assignment = bool(person_keys.intersection(fixed_keys))
+            if fixed_keys and not is_fixed_assignment:
+                fixed_names = [
+                    by_key.get(key, {}).get("name", key)
+                    for key in fixed_keys
+                ]
+                replacements = registry.list_replacements(
+                    schedule["service_id"], event_date.isoformat(),
+                    source_sunday=range_source,
+                )
+                replacements = replacements_for_assignments(
+                    {schedule["task"]: fixed_names}, replacements,
+                )
+                effective_fixed_names = apply_replacements(
+                    {schedule["task"]: fixed_names}, replacements,
+                ).get(schedule["task"], [])
+                replacement_ids = {
+                    item["new_name"]: item.get("telegram_id")
+                    for item in replacements
+                    if item["task"] == schedule["task"]
+                }
+                is_fixed_assignment = any(
+                    person["name"] in effective_fixed_names
+                    and person.get("telegram_id") == schedule["actor_id"]
+                    for person in people
+                ) or any(
+                    replacement_ids.get(name) == schedule["actor_id"]
+                    for name in effective_fixed_names
+                )
+            if not is_fixed_assignment:
+                start = source_day + timedelta(days=range_snapshot[0][0])
+                end = source_day + timedelta(days=range_snapshot[0][1])
+                range_label = (
+                    f"{start:%d.%m} ({WEEKDAYS[start.weekday()]}) – "
+                    f"{end:%d.%m} ({WEEKDAYS[end.weekday()]})"
+                )
+        visible_date = range_label or f"{event_date:%d.%m.%Y}"
         text = template.format_map(
             _TemplateValues(
                 name=display_name(schedule),
                 task=schedule["task"],
                 service_name=schedule["service_name"],
-                sunday_date=event_date.strftime("%d.%m.%Y"),
+                sunday_date=visible_date,
                 telegram_id=str(schedule["actor_id"]),
                 username=schedule["username"],
-                event_notes=resolve_event_note(
-                    registry, schedule["service_id"], event_date,
-                    schedule["task"],
-                    template=template,
-                    public_url=credentials.yandex_public_url if "{event_notes" in template else None,
+                event_notes=(
+                    ""
+                    if ambiguous_range_source
+                    else resolve_event_note(
+                        registry, schedule["service_id"], event_date,
+                        schedule["task"],
+                        template=template,
+                        public_url=credentials.yandex_public_url
+                        if "{event_notes" in template else None,
+                        **({"source_sunday": range_source} if range_source else {}),
+                    )
                 ),
             )
         )
@@ -2343,7 +2693,7 @@ async def _process_user_reminder_schedule(
     # текст напоминания свой.
     header = (
         f"🔔 {schedule['service_name']} · {schedule['task']} · "
-        f"{event_date:%d.%m.%Y}"
+        f"{visible_date}"
     )
     body_text = text.removeprefix("🔔").strip()
     text = f"{header}\n{body_text}"
@@ -2921,14 +3271,16 @@ async def _run_locked(args: CliArgs) -> None:
 
         context.prepare_test_previews = prepare_test_previews
         context.load_service_task_assignments = load_service_task_assignments
-        context.group_preview_state = lambda service_id, event_day: _group_preview_state(
+        context.group_preview_state = lambda service_id, event_day, source_sunday=None: _group_preview_state(
             service_registry, credentials.yandex_public_url, service_id,
             date.fromisoformat(event_day),
+            date.fromisoformat(source_sunday) if source_sunday else None,
         )
-        context.assignment_fields_state = lambda service_id, event_day, template, task: (
+        context.assignment_fields_state = lambda service_id, event_day, template, task, source_sunday=None: (
             resolve_assignment_fields(
                 service_registry, service_id, date.fromisoformat(event_day),
                 template, datetime.now(tz).date(), task,
+                **({"source_sunday": source_sunday} if source_sunday else {}),
             ).state
         )
         context.schedule_candidate_version = lambda: source_version(
@@ -3186,8 +3538,19 @@ async def _run_locked(args: CliArgs) -> None:
                 if service_registry is None or scheduler is None:
                     return
                 # Напоминания с завершённым периодом выключаются (этап 4.2).
+                period_end_offsets = {
+                    reminder["id"]: group_reminder_period_offsets(
+                        service_registry, reminder,
+                    )[1]
+                    for service in service_registry.list_services()
+                    for reminder in service_registry.list_group_reminders(
+                        service["id"],
+                    )
+                    if reminder["enabled"] and reminder.get("active_until")
+                }
                 expired = service_registry.disable_expired_group_reminders(
-                    datetime.now(tz).date()
+                    datetime.now(tz).date(),
+                    period_end_offsets=period_end_offsets,
                 )
                 if expired:
                     interaction_logger.info(

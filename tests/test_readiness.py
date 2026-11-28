@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from bot import readiness
 from bot.excel_parser import RosterMember
-from bot.service_registry import ServiceRegistry
+from bot.service_registry import DEFAULT_READINESS_INTRO, ServiceRegistry
 from bot.ui import plain_text, render_screen_chunks
 
 TZ = ZoneInfo("Europe/Moscow")
@@ -316,6 +316,167 @@ class ReadinessFlowTest(unittest.TestCase):
             "Алексей" in names for (day, _), names in summary.plan.slots.items()
             if day == date(2026, 11, 1)
         ))
+
+    def test_dates_only_single_explicit_and_implicit_task(self):
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_group_chat(1001, "office_cleaning", -1005556, enabled=True)
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Анна", ("Уборка в офисе",)),
+        ]})
+        for service_id, task in (("sound", "звук"),
+                                 ("office_cleaning", "Уборка в офисе")):
+            with self.subTest(service=service_id):
+                reverse = service_id == "office_cleaning"
+                self.registry.set_readiness_settings(
+                    1001, service_id, dates_only=True, reverse_poll=reverse,
+                )
+                bot = fake_bot()
+                bot.send_poll.return_value.poll.id = f"poll-{service_id}"
+                run = asyncio.run(readiness.launch_run(
+                    bot, self.registry, self.registry.get_service(service_id),
+                    2026, 11, datetime(2026, 10, 22, 20, 0, tzinfo=TZ),
+                    TZ, LOG, 4096,
+                ))
+                self.assertEqual(bot.send_poll.await_args.kwargs["options"], [
+                    "01.11", "08.11", "15.11", "22.11", "29.11",
+                    readiness.AVAILABLE_ALL_LABEL,
+                    readiness.phrase(
+                        self.registry.get_readiness_settings(service_id), "cant"
+                    ),
+                ])
+                self.assertNotIn(
+                    "Одна дата относится", bot.send_message.await_args.args[1]
+                )
+                self.assertEqual(run["options"][0]["tasks"], [task])
+                self.assertEqual(
+                    readiness.answer_dates([0], run["options"], reverse_poll=reverse),
+                    ["2026-11-01"],
+                )
+                self.registry.set_readiness_settings(
+                    1001, service_id, dates_only=False,
+                )
+                self.assertEqual(
+                    readiness.poll_options(self.registry, service_id, 2026, 11)[0]["label"],
+                    f"01.11 — {task}",
+                )
+                self.assertEqual(readiness.run_option_label(run, "2026-11-01"), "01.11")
+
+    def test_dates_only_single_task_keeps_personal_day(self):
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -3)
+        self.registry.set_readiness_settings(1001, "sound", dates_only=True)
+        options = readiness.poll_options(self.registry, "sound", 2026, 11)
+        self.assertEqual(options[0]["label"], "29.10")
+        self.assertEqual(
+            list(readiness.option_slots(options[0])),
+            [(date(2026, 11, 1), "звук")],
+        )
+        self.assertEqual(options[1]["label"], "01.11")
+        self.assertEqual(readiness.grouped_options_note(options), "")
+
+    def test_single_task_window_poll_keeps_week_and_personal_day(self):
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_service_member_day(1001, "sound", "Алексей", -5)
+        self.registry.set_readiness_settings(
+            1001, "sound", day_from=-3, day_to=1,
+        )
+        bot = fake_bot()
+        run = self.launch(bot)
+        self.assertEqual(bot.send_poll.await_args.kwargs["options"][0],
+                         "29.10 (чт) – 02.11 (пн)")
+        self.assertEqual(len(run["options"]), 5)
+        self.assertNotIn("Одна дата относится", bot.send_message.await_args.args[1])
+        selected = readiness.answer_dates([0], run["options"])
+        self.assertEqual(selected, ["2026-11-01"])
+        self.registry.record_readiness_answer(
+            run["poll_id"], 501, "alex", "Алексей", selected,
+        )
+        self.registry.set_readiness_settings(1001, "sound", day_from=-1, day_to=0)
+        summary = readiness.summarize(self.registry, run)
+        self.assertIn(("2026-11-01", "звук"), summary.range_slots)
+        self.assertIn(
+            "Алексей", summary.plan.slots[(date(2026, 11, 1), "звук")]
+        )
+        self.assertEqual(summary.plan.slot_dates[
+            (date(2026, 11, 1), "звук", "Алексей")
+        ], date(2026, 10, 27))
+
+    def test_office_cleaning_range_poll_uses_approved_intro_and_question(self):
+        self.registry.set_group_chat(
+            1001, "office_cleaning", -1005556, enabled=True,
+        )
+        self.registry.sync_service_rosters({"office_cleaning": [
+            RosterMember("Катя", ("Уборка в офисе",)),
+        ]})
+        self.registry.set_readiness_settings(
+            1001, "office_cleaning", day_from=-3, day_to=1,
+        )
+        bot = fake_bot()
+        asyncio.run(readiness.launch_run(
+            bot, self.registry, self.registry.get_service("office_cleaning"),
+            2026, 12, datetime(2026, 11, 26, 20, 0, tzinfo=TZ),
+            TZ, LOG, 4096,
+        ))
+
+        self.assertIn(
+            "<b>График уборки на декабрь 2026</b>\nОтметьте подходящие дни.",
+            bot.send_message.await_args.args[1],
+        )
+        self.assertEqual(
+            bot.send_poll.await_args.args[1],
+            "Выбери дни уборки в офисе",
+        )
+        self.assertEqual(
+            bot.send_poll.await_args.kwargs["options"][0],
+            "03.12 (чт) – 07.12 (пн)",
+        )
+
+    def test_office_cleaning_range_question_keeps_custom_and_reverse_templates(self):
+        service = {"id": "office_cleaning", "name": "Уборка в офисе"}
+        self.assertEqual(
+            readiness.question_text(
+                service, 2026, 12, "Свой вопрос", range_poll=True,
+            ),
+            "Свой вопрос",
+        )
+        self.assertEqual(
+            readiness.question_text(
+                service, 2026, 12, reverse_poll=True, range_poll=True,
+            ),
+            "Когда НЕ можешь служить в декабре?",
+        )
+        self.assertEqual(
+            readiness.question_text(
+                service, 2026, 12,
+                "Когда можешь служить в {month_in}?", range_poll=True,
+            ),
+            "Выбери дни уборки в офисе",
+        )
+        self.assertEqual(
+            readiness.intro_text(
+                service, [], 2026, 12,
+                datetime(2026, 11, 26, 20, 0, tzinfo=TZ), TZ,
+                DEFAULT_READINESS_INTRO, range_poll=True,
+            ),
+            "График уборки на декабрь 2026\nОтметьте подходящие дни.",
+        )
+
+    def test_reverse_window_answer_excludes_the_whole_week(self):
+        self.registry.set_service_task_enabled(1001, "sound", "сборка", False)
+        self.registry.set_readiness_settings(
+            1001, "sound", day_from=-3, day_to=1, reverse_poll=True,
+        )
+        run = self.launch(fake_bot())
+        self.registry.record_readiness_answer(
+            run["poll_id"], 501, "alex", "Алексей",
+            readiness.answer_dates([0], run["options"], reverse_poll=True),
+        )
+        summary = readiness.summarize(self.registry, run)
+        self.assertNotIn("2026-11-01", summary.available["Алексей"])
+        self.assertIn("2026-11-08", summary.available["Алексей"])
+        self.assertIn(
+            (date(2026, 10, 29), "звук"), summary.unavailable["Алексей"],
+        )
 
     def test_dates_only_respects_actual_task_and_personal_days(self):
         people = {"А": {"tasks": ["раньше", "позже"]}}

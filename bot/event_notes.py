@@ -7,7 +7,9 @@ import unicodedata
 from datetime import date, datetime, time, timedelta
 
 from .schedule_plan import task_moments
-from .presentation import format_informational_notes
+from .presentation import (
+    replacements_for_assignments, format_informational_notes,
+)
 from .group_send import send_to_service_group
 from .ui import plain_text
 
@@ -54,8 +56,14 @@ def validate_event_sunday(value: str | date) -> date:
     return result
 
 
-def source_sunday_for_event(registry, service_id: str, event_day: date,
-                            task: str | None = None) -> str | None:
+def source_sunday_for_event(
+    registry,
+    service_id: str,
+    event_day: date,
+    task: str | None = None,
+    *,
+    telegram_id: int | None = None,
+) -> str | None:
     """Find the approved Sunday whose snapshot places this task on event_day."""
     people = registry.readiness_people(service_id)
     by_key = {person["key"]: person for person in people}
@@ -77,14 +85,51 @@ def source_sunday_for_event(registry, service_id: str, event_day: date,
             "approved_slot_days": plan.get("approved_slot_days") or {},
         }
         for sunday, tasks in approved.items():
-            for name in tasks:
-                if task and name != task:
+            for task_name in tasks:
+                if task and task_name != task:
                     continue
-                moments = task_moments(
-                    published, by_key, sunday, name, approved=True
-                )
-                if any(moment == event_day for moment, _ in moments):
-                    matches.append(sunday)
+                assignments = []
+                for moment, key in task_moments(
+                    published, by_key, sunday, task_name, approved=True
+                ):
+                    if moment == event_day:
+                        assignments.append(
+                            (key, by_key.get(key, {}).get("name", key))
+                        )
+                if not assignments:
+                    continue
+                if telegram_id is not None:
+                    replacements = registry.list_replacements(
+                        service_id, event_day.isoformat(),
+                        source_sunday=sunday,
+                    )
+                    is_assigned = False
+                    for key, name in assignments:
+                        person = by_key.get(key, {})
+                        chain = replacements_for_assignments(
+                            {task_name: [name]}, replacements,
+                        )
+                        current_name = name
+                        current_id = person.get("telegram_id")
+                        for item in chain:
+                            if item["old_name"] != current_name:
+                                continue
+                            current_name = item["new_name"]
+                            current_id = item.get("telegram_id")
+                        if current_id is None:
+                            candidates = [
+                                member for member in people
+                                if member["name"] == current_name
+                                and task_name in member["tasks"]
+                            ]
+                            if len(candidates) == 1:
+                                current_id = candidates[0].get("telegram_id")
+                        if current_id == telegram_id:
+                            is_assigned = True
+                            break
+                    if not is_assigned:
+                        continue
+                matches.append(sunday)
     if len(set(matches)) > 1:
         raise EventNoteResolutionError(
             "На эту дату приходятся разные воскресные события. "
@@ -96,11 +141,14 @@ def source_sunday_for_event(registry, service_id: str, event_day: date,
 def resolve_event_note(registry, service_id: str, event_day: date,
                        task: str | None = None, *, template: str | None = None,
                        public_url: str | None = None,
-                       include_scheduled: bool = True) -> str:
+                       include_scheduled: bool = True,
+                       source_sunday: str | None = None) -> str:
     if template is not None and "{event_notes" not in template:
         return ""
-    source_sunday = source_sunday_for_event(
-        registry, service_id, event_day, task
+    source_sunday = (
+        validate_event_sunday(source_sunday).isoformat()
+        if source_sunday is not None
+        else source_sunday_for_event(registry, service_id, event_day, task)
     )
     if source_sunday is None:
         return ""
